@@ -66,6 +66,7 @@ changed by the workflow itself.
 
 ## Licensing
 
-Contributions are licensed under the MIT License and the project's contributor
-license agreement. The CLA check runs automatically on a contributor's first
-pull request.
+Contributions are licensed under the MIT License and the project's
+[Individual Contributor License Agreement](docs/CLA.md). The CLA check runs
+automatically on a contributor's first pull request; sign once by posting the
+comment the bot asks for, and it covers your future contributions here.
