@@ -34,8 +34,14 @@ Examples:
   hop rm codex old
 `
 
+// developmentVaultWarning is the one line an unreleased build prints when it is
+// pointed at the same ~/.hop a released hop uses.
+const developmentVaultWarning = "hop: development build using the real ~/.hop — set HOP_HOME to a sandbox to protect production data\n"
+
 // Run executes the CLI and returns a process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
+	warnWhenDevelopmentBuildUsesTheRealVault(stderr, version(), os.Getenv("HOP_HOME"))
+
 	err := execute(args, stdout, stderr)
 	if err == nil {
 		return 0
@@ -43,6 +49,17 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 	_, _ = fmt.Fprintf(stderr, "hop: %s\n", err)
 	return 2
+}
+
+// warnWhenDevelopmentBuildUsesTheRealVault nudges a developer running an
+// unreleased build without a sandbox. It stays on stderr so `hop ls --json`
+// consumers read the same stdout a released build gives them. The HOP_HOME test
+// matches defaultVault: any non-empty value already redirects the vault.
+func warnWhenDevelopmentBuildUsesTheRealVault(stderr io.Writer, runningVersion, hopHome string) {
+	if runningVersion != developmentVersion || hopHome != "" {
+		return
+	}
+	_, _ = io.WriteString(stderr, developmentVaultWarning)
 }
 
 func execute(args []string, stdout, stderr io.Writer) error {

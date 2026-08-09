@@ -2,12 +2,15 @@ package cli
 
 import (
 	"bytes"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestHelpShowsPlannedCommandSurface(t *testing.T) {
-	t.Parallel()
+	// Not parallel: HOP_HOME keeps the test binary, itself a development build,
+	// from printing the sandbox warning onto the stderr this test asserts on.
+	t.Setenv("HOP_HOME", t.TempDir())
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -113,6 +116,92 @@ func TestLoginRejectsUnknownProviderWithNextStep(t *testing.T) {
 	if got := stderr.String(); !strings.Contains(got, "use claude or codex") {
 		t.Fatalf("stderr = %q, want provider correction", got)
 	}
+}
+
+func TestOnlyDevelopmentBuildsWithoutASandboxWarn(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name           string
+		runningVersion string
+		hopHome        string
+		want           string
+	}{
+		{name: "working-tree build on the real vault", runningVersion: resolveVersion("", "(devel)"), hopHome: "", want: developmentVaultWarning},
+		{name: "working-tree build in a sandbox", runningVersion: resolveVersion("", "(devel)"), hopHome: "/tmp/hop-sandbox", want: ""},
+		{name: "stamped release build on the real vault", runningVersion: resolveVersion("1.4.0", "(devel)"), hopHome: "", want: ""},
+		{name: "go install build on the real vault", runningVersion: resolveVersion("", "v1.3.0"), hopHome: "", want: ""},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			var stderr bytes.Buffer
+			warnWhenDevelopmentBuildUsesTheRealVault(&stderr, testCase.runningVersion, testCase.hopHome)
+			if got := stderr.String(); got != testCase.want {
+				t.Errorf("stderr = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestRunWarnsOnceAndLeavesStdoutAlone(t *testing.T) {
+	sandboxHome(t)
+	t.Setenv("HOP_HOME", "")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if exitCode := Run([]string{"--version"}, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("Run() exit code = %d, want 0; stderr = %q", exitCode, stderr.String())
+	}
+
+	if got := strings.Count(stderr.String(), developmentVaultWarning); got != 1 {
+		t.Errorf("warning printed %d times, want 1; stderr = %q", got, stderr.String())
+	}
+	if got, want := stdout.String(), "hop "+version()+"\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestListJSONPrintsTheSameStdoutWithOrWithoutTheWarning(t *testing.T) {
+	home := sandboxHome(t)
+
+	t.Setenv("HOP_HOME", "")
+	var warnedStdout, warnedStderr bytes.Buffer
+	if exitCode := Run([]string{"ls", "--json"}, &warnedStdout, &warnedStderr); exitCode != 0 {
+		t.Fatalf("Run() exit code = %d, want 0; stderr = %q", exitCode, warnedStderr.String())
+	}
+
+	// The same vault, now named explicitly: only the warning may differ.
+	t.Setenv("HOP_HOME", filepath.Join(home, ".hop"))
+	var sandboxedStdout, sandboxedStderr bytes.Buffer
+	if exitCode := Run([]string{"ls", "--json"}, &sandboxedStdout, &sandboxedStderr); exitCode != 0 {
+		t.Fatalf("Run() exit code = %d, want 0; stderr = %q", exitCode, sandboxedStderr.String())
+	}
+
+	if warnedStdout.String() != sandboxedStdout.String() {
+		t.Errorf("stdout differs with the warning: %q vs %q", warnedStdout.String(), sandboxedStdout.String())
+	}
+	if got := warnedStderr.String(); got != developmentVaultWarning {
+		t.Errorf("stderr = %q, want the sandbox warning", got)
+	}
+	if got := sandboxedStderr.String(); got != "" {
+		t.Errorf("stderr = %q, want empty for a sandboxed run", got)
+	}
+}
+
+// sandboxHome points the home directory and every live credential path at
+// throwaway directories so a run with HOP_HOME unset still cannot reach a
+// developer's real ~/.hop, Keychain, or ~/.codex.
+func sandboxHome(t *testing.T) string {
+	t.Helper()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv(claudeCredentialsFileOverride, filepath.Join(t.TempDir(), "credentials.json"))
+	t.Setenv(claudeAccountEmailOverride, "sandbox@example.com")
+	t.Setenv(codexAuthFileOverride, filepath.Join(t.TempDir(), "auth.json"))
+	return home
 }
 
 func TestSwitchCommandsFailClearlyWhenAccountIsMissing(t *testing.T) {
