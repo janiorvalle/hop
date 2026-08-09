@@ -121,7 +121,7 @@ func TestKeychainWriteCommandRefusesValuesThatWouldSplitTheCommand(t *testing.T)
 	}
 }
 
-func TestClearLiveCredentialsDeletesThroughInteractiveModeUntilNothingRemains(t *testing.T) {
+func TestClearLiveCredentialsDeletesTheItemThenConfirmsNoneRemains(t *testing.T) {
 	t.Parallel()
 
 	security := &fakeSecurity{results: []error{nil, exitStatus(t, securityItemNotFound)}}
@@ -129,27 +129,43 @@ func TestClearLiveCredentialsDeletesThroughInteractiveModeUntilNothingRemains(t 
 		t.Fatalf("clearLiveCredentials() error = %v", err)
 	}
 	if len(security.calls) != 2 {
-		t.Fatalf("security calls = %d, want one delete plus the confirmation that nothing is left", len(security.calls))
+		t.Fatalf("security calls = %d, want one delete and one confirmation", len(security.calls))
 	}
-	for _, call := range security.calls {
-		if len(call.args) != 1 || call.args[0] != "-i" {
-			t.Fatalf("security args = %v, want interactive mode", call.args)
-		}
-		if call.input != `delete-generic-password -s "Claude Code-credentials"`+"\n" {
-			t.Fatalf("security input = %q, want the delete command on stdin", call.input)
-		}
+	deleteCall := security.calls[0]
+	if len(deleteCall.args) != 1 || deleteCall.args[0] != "-i" {
+		t.Fatalf("delete args = %v, want interactive mode", deleteCall.args)
+	}
+	if deleteCall.input != `delete-generic-password -s "Claude Code-credentials"`+"\n" {
+		t.Fatalf("delete input = %q, want the delete command on stdin", deleteCall.input)
+	}
+	confirmCall := security.calls[1]
+	want := []string{"find-generic-password", "-s", "Claude Code-credentials"}
+	if strings.Join(confirmCall.args, " ") != strings.Join(want, " ") {
+		t.Fatalf("confirmation args = %v, want %v without -w", confirmCall.args, want)
 	}
 }
 
 func TestClearLiveCredentialsTreatsAMissingItemAsCleared(t *testing.T) {
 	t.Parallel()
 
-	security := &fakeSecurity{results: []error{exitStatus(t, securityItemNotFound)}}
+	security := &fakeSecurity{results: []error{exitStatus(t, securityItemNotFound), exitStatus(t, securityItemNotFound)}}
 	if err := clearLiveCredentials(context.Background(), security); err != nil {
 		t.Fatalf("clearLiveCredentials() error = %v", err)
 	}
-	if len(security.calls) != 1 {
-		t.Fatalf("security calls = %d, want a single delete attempt", len(security.calls))
+}
+
+// Deleting every item that shares the service would destroy a login hop never
+// copied anywhere, so a leftover duplicate has to stop the enrollment instead.
+func TestClearLiveCredentialsRefusesToDeleteAnItemItHasNoCopyOf(t *testing.T) {
+	t.Parallel()
+
+	security := &fakeSecurity{results: []error{nil, nil}}
+	err := clearLiveCredentials(context.Background(), security)
+	if err == nil || !strings.Contains(err.Error(), "Keychain Access") {
+		t.Fatalf("clearLiveCredentials() error = %v, want a refusal that names the manual fix", err)
+	}
+	if len(security.calls) != 2 {
+		t.Fatalf("security calls = %d, want the delete to stop after the duplicate is seen", len(security.calls))
 	}
 }
 
@@ -161,18 +177,8 @@ func TestClearLiveCredentialsReportsAFailureItCannotExplainAway(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unlock Keychain and retry") {
 		t.Fatalf("clearLiveCredentials() error = %v, want a failure that tells the reader what to do", err)
 	}
-}
-
-func TestClearLiveCredentialsStopsWhenItemsNeverRunOut(t *testing.T) {
-	t.Parallel()
-
-	security := &fakeSecurity{}
-	err := clearLiveCredentials(context.Background(), security)
-	if err == nil || !strings.Contains(err.Error(), "Keychain Access") {
-		t.Fatalf("clearLiveCredentials() error = %v, want a bounded failure that names the manual fix", err)
-	}
-	if len(security.calls) != keychainDeleteAttempts {
-		t.Fatalf("security calls = %d, want %d", len(security.calls), keychainDeleteAttempts)
+	if len(security.calls) != 1 {
+		t.Fatalf("security calls = %d, want nothing after a delete hop could not explain", len(security.calls))
 	}
 }
 

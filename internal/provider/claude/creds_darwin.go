@@ -25,11 +25,6 @@ const securityCommandLimit = 4096
 // security(1) exits with 44 when no Keychain item matches the search.
 const securityItemNotFound = 44
 
-// A Keychain can hold several items sharing one service, and a single leftover
-// still looks like a login to the Claude CLI. Deletion therefore repeats until
-// security reports nothing left, bounded so a surprise cannot loop forever.
-const keychainDeleteAttempts = 10
-
 // securityCommander runs macOS's security(1) tool. Tests inject a fake so the
 // commands hop builds can be asserted without touching a Keychain.
 type securityCommander interface {
@@ -104,17 +99,34 @@ func clearLiveCredentials(ctx context.Context, security securityCommander) error
 	if err != nil {
 		return err
 	}
-	for range keychainDeleteAttempts {
-		_, err := security.Run(ctx, command, "-i")
-		if err == nil {
-			continue
-		}
-		if securityExitCode(err) == securityItemNotFound {
-			return nil
-		}
+	// Exactly one delete, because a Keychain search returns the same first match
+	// to every tool: this removes the item ReadLiveCredentials handed to the
+	// caller to stash, and nothing hop has no copy of.
+	if _, err := security.Run(ctx, command, "-i"); err != nil && securityExitCode(err) != securityItemNotFound {
 		return fmt.Errorf("clear the %q Keychain item so Claude opens a fresh browser login; unlock Keychain and retry: %w", keychainService, err)
 	}
-	return fmt.Errorf("clear the %q Keychain item so Claude opens a fresh browser login; more than %d items use that service, remove the extras in Keychain Access and retry", keychainService, keychainDeleteAttempts)
+	remaining, err := keychainItemExists(ctx, security)
+	if err != nil {
+		return err
+	}
+	if remaining {
+		return fmt.Errorf("clear the %q Keychain item so Claude opens a fresh browser login; a second item still uses that service and hop holds no copy of it, so open Keychain Access, remove or rename the duplicate, and retry", keychainService)
+	}
+	return nil
+}
+
+// keychainItemExists reports whether any item still uses the service. It asks
+// for the item's attributes rather than its password, which keeps the check
+// away from the access controls that guard the secret itself.
+func keychainItemExists(ctx context.Context, security securityCommander) (bool, error) {
+	_, err := security.Run(ctx, "", "find-generic-password", "-s", keychainService)
+	if err == nil {
+		return true, nil
+	}
+	if securityExitCode(err) == securityItemNotFound {
+		return false, nil
+	}
+	return false, fmt.Errorf("confirm the %q Keychain item is gone before Claude's browser login opens; unlock Keychain and retry: %w", keychainService, err)
 }
 
 // keychainWriteCommand builds the security(1) interactive-mode command that
