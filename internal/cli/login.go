@@ -43,6 +43,7 @@ type loginRunner interface {
 type claudeLiveStore interface {
 	Read(context.Context) (claude.Credentials, error)
 	Write(context.Context, claude.Credentials) error
+	Clear(context.Context) error
 }
 
 type loginManager struct {
@@ -272,8 +273,11 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 			returnErr = errors.Join(returnErr, fmt.Errorf("restore active Claude account %q after enrollment failed; stop using Claude and restore its slot before continuing: %w", activeAccount, restoreErr))
 		}
 	}()
-	if err := manager.runner.Run(ctx, loginCommand{Name: "claude", Args: []string{"auth", "logout"}, Stdin: stdin, Stdout: manager.stdout, Stderr: manager.stderr}); err != nil {
-		return fmt.Errorf("claude logout did not finish; the previous login will be restored, then retry during the quiet window: %w", err)
+	// The live login is cleared locally rather than with 'claude auth logout',
+	// which revokes the grant server-side and would kill the copy just stashed
+	// into the active account's slot.
+	if err := manager.claudeLive.Clear(ctx); err != nil {
+		return fmt.Errorf("clear the live Claude login so its browser sign-in opens for account %q; the previous login will be restored, then retry during the quiet window: %w", accountName, err)
 	}
 	if err := manager.runner.Run(ctx, loginCommand{Name: "claude", Args: []string{"auth", "login"}, Stdin: stdin, Stdout: manager.stdout, Stderr: manager.stderr}); err != nil {
 		return fmt.Errorf("claude login did not finish; the previous login will be restored, then retry 'hop login claude %s': %w", accountName, err)
@@ -387,7 +391,7 @@ func (manager loginManager) beginClaudeStaging(activeAccount string) error {
 		return fmt.Errorf("another Claude enrollment transaction exists at %s; rerun hop to recover it before starting a new login", path)
 	}
 	if err != nil {
-		return fmt.Errorf("record how to restore active Claude account %q before logout; the live login was not changed, check %s permissions and retry: %w", activeAccount, manager.vault.Root(), err)
+		return fmt.Errorf("record how to restore active Claude account %q before its live login is cleared; the live login was not changed, check %s permissions and retry: %w", activeAccount, manager.vault.Root(), err)
 	}
 	contents, encodeErr := json.Marshal(claudeStagingRecord{ActiveAccount: activeAccount, ProcessID: os.Getpid(), CreatedAt: time.Now().UTC()})
 	if encodeErr == nil {
@@ -403,7 +407,7 @@ func (manager loginManager) beginClaudeStaging(activeAccount string) error {
 	}
 	if encodeErr != nil {
 		_ = os.Remove(path)
-		return fmt.Errorf("record how to restore active Claude account %q before logout; the live login was not changed, retry: %w", activeAccount, encodeErr)
+		return fmt.Errorf("record how to restore active Claude account %q before its live login is cleared; the live login was not changed, retry: %w", activeAccount, encodeErr)
 	}
 	return nil
 }
@@ -755,4 +759,8 @@ func (systemClaudeLiveStore) Read(ctx context.Context) (claude.Credentials, erro
 
 func (systemClaudeLiveStore) Write(ctx context.Context, credentials claude.Credentials) error {
 	return claude.WriteLiveCredentials(ctx, credentials)
+}
+
+func (systemClaudeLiveStore) Clear(ctx context.Context) error {
+	return claude.ClearLiveCredentials(ctx)
 }

@@ -549,6 +549,7 @@ func (store *memoryStateStore) Save(value state.State) error {
 type fakeClaudeKeychain struct {
 	credentials claude.Credentials
 	writes      []claude.Credentials
+	clears      int
 	failWrites  int
 }
 
@@ -563,6 +564,12 @@ func (store *fakeClaudeKeychain) Write(_ context.Context, credentials claude.Cre
 		return errors.New("fake Keychain write failed")
 	}
 	store.credentials = credentials
+	return nil
+}
+
+func (store *fakeClaudeKeychain) Clear(context.Context) error {
+	store.clears++
+	store.credentials = claude.Credentials{}
 	return nil
 }
 

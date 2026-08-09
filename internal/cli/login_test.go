@@ -69,13 +69,30 @@ type fakeClaudeLiveStore struct {
 	credentials claude.Credentials
 	reads       int
 	writes      []claude.Credentials
+	clears      int
 	writeErr    error
+	clearErr    error
 	blockWrite  bool
+	// onClear observes the world at the moment the live login is cleared, so a
+	// test can prove what was already stashed before the credentials went away.
+	onClear func()
 }
 
 func (store *fakeClaudeLiveStore) Read(context.Context) (claude.Credentials, error) {
 	store.reads++
 	return store.credentials, nil
+}
+
+func (store *fakeClaudeLiveStore) Clear(context.Context) error {
+	store.clears++
+	if store.onClear != nil {
+		store.onClear()
+	}
+	if store.clearErr != nil {
+		return store.clearErr
+	}
+	store.credentials = claude.Credentials{}
+	return nil
 }
 
 func (store *fakeClaudeLiveStore) Write(ctx context.Context, credentials claude.Credentials) error {
@@ -468,9 +485,12 @@ func TestLoginClaudeStagesNewAccountAndRestoresActiveLogin(t *testing.T) {
 	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
-	wantCommands := []string{"claude auth logout", "claude auth login"}
+	wantCommands := []string{"claude auth login"}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("commands = %v, want %v", commands, wantCommands)
+	}
+	if live.clears != 1 {
+		t.Fatalf("live clears = %d, want 1 before the browser sign-in", live.clears)
 	}
 	if live.credentials.RefreshToken != original.RefreshToken || len(live.writes) != 1 {
 		t.Fatalf("live account restored = %t, writes = %d; want true, 1", live.credentials.RefreshToken == original.RefreshToken, len(live.writes))
@@ -485,6 +505,114 @@ func TestLoginClaudeStagesNewAccountAndRestoresActiveLogin(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "restored active account \"work\"") {
 		t.Fatalf("stdout = %q, want restoration receipt", stdout.String())
+	}
+}
+
+// The first live enrollment ran 'claude auth logout', which revoked the grant
+// on Anthropic's side and killed the copy hop had just stashed into the active
+// account's slot. Staging must clear the live login locally instead, and only
+// once that stash is on disk.
+func TestLoginClaudeStagingClearsLiveLoginInsteadOfLoggingOut(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
+	enrolled := claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}
+	live := &fakeClaudeLiveStore{credentials: original}
+	var steps []string
+	live.onClear = func() {
+		steps = append(steps, "clear live login")
+		stashPath, err := accountVault.CredentialsPath("claude", "work")
+		if err != nil {
+			t.Errorf("CredentialsPath() error = %v", err)
+			return
+		}
+		stashed, err := (claude.FileStore{Path: stashPath}).Read()
+		if err != nil || stashed.RefreshToken != original.RefreshToken {
+			t.Errorf("stashed refresh token when the live login was cleared = %q, error = %v; want %q saved first", stashed.RefreshToken, err, original.RefreshToken)
+		}
+	}
+	emailCalls := 0
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			steps = append(steps, command.Name+" "+strings.Join(command.Args, " "))
+			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
+				live.credentials = enrolled
+			}
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		getenv: func(name string) string {
+			if name == claudeLiveLoginApproval {
+				return "approved"
+			}
+			return ""
+		},
+		claudeEmail: func(context.Context) (string, error) {
+			emailCalls++
+			if emailCalls == 1 {
+				return "work@example.com", nil
+			}
+			return "personal@example.com", nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	for _, step := range steps {
+		if strings.Contains(step, "logout") {
+			t.Fatalf("staging ran %q; logging out revokes the stashed account on Anthropic's side", step)
+		}
+	}
+	wantSteps := []string{"clear live login", "claude auth login"}
+	if !reflect.DeepEqual(steps, wantSteps) {
+		t.Fatalf("staging steps = %v, want %v", steps, wantSteps)
+	}
+	if live.credentials.RefreshToken != original.RefreshToken {
+		t.Fatalf("restored refresh token = %q, want %q", live.credentials.RefreshToken, original.RefreshToken)
+	}
+}
+
+func TestLoginClaudeRestoresActiveAccountWhenClearingTheLiveLoginFails(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
+	live := &fakeClaudeLiveStore{credentials: original, clearErr: errors.New("keychain locked")}
+	var commands []string
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			commands = append(commands, command.Name+" "+strings.Join(command.Args, " "))
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		getenv: func(name string) string {
+			if name == claudeLiveLoginApproval {
+				return "approved"
+			}
+			return ""
+		},
+		claudeEmail: func(context.Context) (string, error) { return "work@example.com", nil },
+	}
+
+	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "clear the live Claude login") {
+		t.Fatalf("Login() error = %v, want the failure to name the live login it could not clear", err)
+	}
+	if len(commands) != 0 {
+		t.Fatalf("commands = %v, want none once the live login could not be cleared", commands)
+	}
+	if len(live.writes) != 1 || live.writes[0].RefreshToken != original.RefreshToken {
+		t.Fatalf("live writes = %+v, want the active account restored once", live.writes)
 	}
 }
 
