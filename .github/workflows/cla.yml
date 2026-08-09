@@ -36,6 +36,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           path-to-signatures: signatures/version1/cla.json
-          path-to-document: https://github.com/janiorvalle/hop/blob/main/CONTRIBUTING.md
+          path-to-document: https://github.com/janiorvalle/hop/blob/main/docs/CLA.md
           branch: signatures
-          allowlist: dependabot[bot],*[bot]
+          # The repository owner holds the copyright already; a CLA to oneself is meaningless.
+          allowlist: janiorvalle,dependabot[bot],*[bot]
