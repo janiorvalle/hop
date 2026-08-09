@@ -483,6 +483,60 @@ func TestSwitchRefusesToCopyBackAChangedLiveIdentity(t *testing.T) {
 	})
 }
 
+// hop's own switch makes the Claude CLI's cached email stale: the Keychain
+// holds the account hop just installed while 'claude auth status' still reports
+// the one hop switched away from. The return leg must key on the credentials.
+func TestSwitchConfirmsClaudeIdentityFromCredentialsWhenStatusEmailIsStale(t *testing.T) {
+	t.Run("stale status email", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work1", claudeCredentials("work1"))
+		writeClaudeSlot(t, manager.vault, "work2", claudeCredentials("work2"))
+		writeClaudeSlotEmail(t, manager.vault, "work1", "work1@example.test")
+		writeClaudeSlotEmail(t, manager.vault, "work2", "work2@example.test")
+		stateStore.value.SetActive("claude", "work2")
+		claudeLive.credentials = claudeCredentials("work2")
+		emailReads := 0
+		manager.claudeEmail = func(context.Context) (string, error) {
+			emailReads++
+			return "work1@example.test", nil
+		}
+
+		if err := manager.Switch(context.Background(), "claude", "work1"); err != nil {
+			t.Fatalf("Switch() error = %v, want the return leg to complete", err)
+		}
+		if emailReads != 0 {
+			t.Fatalf("claude auth status reads = %d, want 0 once the live credentials identify the active slot", emailReads)
+		}
+		if claudeLive.credentials.AccessToken != "work1-access" {
+			t.Fatalf("live Claude access token = %q, want work1-access", claudeLive.credentials.AccessToken)
+		}
+		assertClaudeSlot(t, manager.vault, "work2", "work2")
+		if active, found := stateStore.value.Active("claude"); !found || active != "work1" {
+			t.Fatalf("active Claude account = %q, %t; want work1, true", active, found)
+		}
+	})
+
+	t.Run("different identity", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work1", claudeCredentials("work1"))
+		writeClaudeSlot(t, manager.vault, "work2", claudeCredentials("work2"))
+		writeClaudeSlotEmail(t, manager.vault, "work1", "work1@example.test")
+		writeClaudeSlotEmail(t, manager.vault, "work2", "work2@example.test")
+		stateStore.value.SetActive("claude", "work2")
+		claudeLive.credentials = claudeCredentials("stranger")
+		manager.claudeEmail = func(context.Context) (string, error) { return "stranger@example.test", nil }
+
+		err := manager.Switch(context.Background(), "claude", "work1")
+		if err == nil || !strings.Contains(err.Error(), "stranger@example.test") {
+			t.Fatalf("Switch() error = %v, want a refusal naming the live identity", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work2", "work2")
+		if len(claudeLive.writes) != 0 {
+			t.Fatalf("live Claude writes = %d, want 0", len(claudeLive.writes))
+		}
+	})
+}
+
 func TestMultiProviderSwitchRollsBackLiveCredentialsWhenInstallFails(t *testing.T) {
 	manager, stateStore, claudeLive, codexLive, _ := newSwitchTestManager(t)
 	writeClaudeSlot(t, manager.vault, "old", claudeCredentials("claude-old"))
@@ -1170,6 +1224,17 @@ func writeClaudeSlot(t *testing.T, accountVault vault.Vault, accountName string,
 		t.Fatal(err)
 	}
 	if err := writeManagedSlotMetadata(filepath.Dir(path), "owner@example.test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeClaudeSlotEmail(t *testing.T, accountVault vault.Vault, accountName, email string) {
+	t.Helper()
+	slotPath, err := accountVault.SlotPath("claude", accountName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManagedSlotMetadata(slotPath, email); err != nil {
 		t.Fatal(err)
 	}
 }

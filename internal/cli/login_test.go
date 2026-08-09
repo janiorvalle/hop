@@ -508,6 +508,56 @@ func TestLoginClaudeStagesNewAccountAndRestoresActiveLogin(t *testing.T) {
 	}
 }
 
+// Right after hop's own switch the Claude CLI still reports the email of the
+// account hop switched away from, while the live Keychain already holds the
+// active slot's tokens. Enrollment must key on those tokens, and must not
+// stamp the stale email onto the healthy slot it copies back.
+func TestLoginClaudeStagesNewAccountWhenStatusEmailIsStale(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	original := claude.Credentials{AccessToken: "seed", RefreshToken: "seed-refresh"}
+	live := &fakeClaudeLiveStore{credentials: original}
+	emailReads := 0
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
+				live.credentials = claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}
+			}
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		getenv: func(string) string { return "approved" },
+		claudeEmail: func(context.Context) (string, error) {
+			emailReads++
+			if emailReads == 1 {
+				return "stale@example.com", nil
+			}
+			return "personal@example.com", nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v, want enrollment to trust the recorded credentials", err)
+	}
+	workPath, _ := accountVault.CredentialsPath("claude", "work")
+	if metadata := readSlotMetadata(t, filepath.Dir(workPath)); metadata.Email != "work@example.com" {
+		t.Fatalf("active slot email = %q, want the recorded work@example.com kept", metadata.Email)
+	}
+	newPath, _ := accountVault.CredentialsPath("claude", "personal")
+	credentials, err := (claude.FileStore{Path: newPath}).Read()
+	if err != nil || credentials.RefreshToken != "new-refresh" {
+		t.Fatalf("new slot refresh token = %q, error = %v; want new-refresh", credentials.RefreshToken, err)
+	}
+	if live.credentials.RefreshToken != original.RefreshToken {
+		t.Fatalf("restored refresh token = %q, want %q", live.credentials.RefreshToken, original.RefreshToken)
+	}
+}
+
 // The first live enrollment ran 'claude auth logout', which revoked the grant
 // on Anthropic's side and killed the copy hop had just stashed into the active
 // account's slot. Staging must clear the live login locally instead, and only
@@ -777,6 +827,36 @@ func TestLoginClaudeCanExplicitlyConfirmCurrentActiveSlot(t *testing.T) {
 	}
 	if len(live.writes) != 0 {
 		t.Fatalf("live writes = %d, want 0", len(live.writes))
+	}
+}
+
+func TestLoginClaudeConfirmationKeepsTheRecordedEmailWhenStatusEmailIsStale(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "seed", RefreshToken: "seed-refresh"}}
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("runner called while confirming active account")
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		getenv: func(string) string { return "" },
+		claudeEmail: func(context.Context) (string, error) {
+			return "stale@example.com", nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "claude", "work", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	workPath, _ := accountVault.CredentialsPath("claude", "work")
+	if metadata := readSlotMetadata(t, filepath.Dir(workPath)); metadata.Email != "work@example.com" {
+		t.Fatalf("confirmed slot email = %q, want the recorded work@example.com kept", metadata.Email)
 	}
 }
 

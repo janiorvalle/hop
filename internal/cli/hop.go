@@ -569,7 +569,24 @@ func (manager switchManager) requireProviderDirectory(providerName string) error
 	return nil
 }
 
+// confirmActiveClaudeIdentity asks the recorded credentials first and the
+// `claude auth status` email second. The Claude CLI serves that email from its
+// own config cache (~/.claude.json), which hop never touches, so the cache
+// still names the previous account until the CLI refreshes it — right after
+// hop's own install or copy-back the live tokens are the target account's
+// while the email is still the account hop switched away from. Tokens are the
+// only oracle that is fresh at that moment; the email answers the case tokens
+// cannot, where the live login rotated outside hop.
 func (manager switchManager) confirmActiveClaudeIdentity(ctx context.Context, current string, liveCredentials claude.Credentials) error {
+	credentialsPath, err := manager.vault.CredentialsPath("claude", current)
+	if err != nil {
+		return err
+	}
+	recorded, credentialsErr := (claude.FileStore{Path: credentialsPath}).Read()
+	if credentialsErr == nil && recorded.AccessToken == liveCredentials.AccessToken && recorded.RefreshToken == liveCredentials.RefreshToken {
+		return nil
+	}
+
 	slotPath, err := manager.vault.SlotPath("claude", current)
 	if err != nil {
 		return err
@@ -591,17 +608,8 @@ func (manager switchManager) confirmActiveClaudeIdentity(ctx context.Context, cu
 			return fmt.Errorf("live Claude is signed in as %s, but active account %q is recorded as %s; run 'hop login claude <account>' to preserve the live login or restore account %q with 'hop claude %s', then retry", liveEmail, current, metadata.Email, current, current)
 		}
 	}
-
-	credentialsPath, err := manager.vault.CredentialsPath("claude", current)
-	if err != nil {
-		return err
-	}
-	recorded, err := (claude.FileStore{Path: credentialsPath}).Read()
-	if err != nil {
-		return fmt.Errorf("verify the recorded Claude account %q before copy-back; repair its slot or run 'hop login claude %s', then retry: %w", current, current, err)
-	}
-	if recorded.AccessToken == liveCredentials.AccessToken && recorded.RefreshToken == liveCredentials.RefreshToken {
-		return nil
+	if credentialsErr != nil {
+		return fmt.Errorf("verify the recorded Claude account %q before copy-back; repair its slot or run 'hop login claude %s', then retry: %w", current, current, credentialsErr)
 	}
 	if metadataErr != nil && !errors.Is(metadataErr, os.ErrNotExist) {
 		return fmt.Errorf("verify the recorded Claude account %q before copy-back; check %s permissions and retry: %w", current, filepath.Join(slotPath, slotMetadataFilename), metadataErr)
