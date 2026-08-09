@@ -73,6 +73,61 @@ func TestCredentialFetcherImplementsSharedContract(t *testing.T) {
 	}
 }
 
+func TestFetchProfileIdentifiesTheBearerTokenOwner(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", request.Method)
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer live-access" {
+			t.Errorf("Authorization = %q, want live bearer token", got)
+		}
+		if got := request.Header.Get("anthropic-beta"); got != betaHeaderValue {
+			t.Errorf("anthropic-beta = %q, want %q", got, betaHeaderValue)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"account":{"uuid":"account-uuid","email_address":"owner@example.com"},"organization":{"uuid":"shared-org"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	profile, err := New(Config{ProfileURL: server.URL}).FetchProfile(context.Background(), Credentials{AccessToken: "live-access"})
+	if err != nil {
+		t.Fatalf("FetchProfile() error = %v", err)
+	}
+	if profile.AccountUUID != "account-uuid" || profile.Email != "owner@example.com" {
+		t.Fatalf("FetchProfile() = %#v, want the account identity", profile)
+	}
+}
+
+func TestFetchProfileReturnsARecoverableErrorForAnUnusableResponse(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{name: "invalid token", statusCode: http.StatusUnauthorized, body: `{"error":{"details":{"error_code":"token_invalid"}}}`},
+		{name: "missing identity", statusCode: http.StatusOK, body: `{"account":{}}`},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.statusCode)
+				_, _ = io.WriteString(writer, testCase.body)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{ProfileURL: server.URL}).FetchProfile(context.Background(), Credentials{AccessToken: "live-access"})
+			if !errors.Is(err, ErrProfile) {
+				t.Fatalf("FetchProfile() error = %v, want ErrProfile", err)
+			}
+		})
+	}
+}
+
 func TestRefreshRotatesAndPersistsTokens(t *testing.T) {
 	t.Parallel()
 
@@ -187,6 +242,18 @@ func TestNeedsRefreshUsesSkew(t *testing.T) {
 	}
 	if credentials.NeedsRefresh(now, 3*time.Minute) {
 		t.Fatal("NeedsRefresh() = true, want false outside skew")
+	}
+}
+
+func TestCredentialsHasScopeMatchesAnExactGrant(t *testing.T) {
+	t.Parallel()
+
+	credentials := Credentials{Scopes: []string{"org:create_api_key", "user:profile"}}
+	if !credentials.HasScope("user:profile") {
+		t.Fatal("HasScope(user:profile) = false, want true")
+	}
+	if credentials.HasScope("profile") {
+		t.Fatal("HasScope(profile) = true, want an exact-scope match")
 	}
 }
 

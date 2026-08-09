@@ -33,6 +33,12 @@ type conditionalClaudeLiveStore interface {
 	ClearIfMatches(context.Context, claude.Credentials) error
 }
 
+type claudeLiveDependencies struct {
+	store   claudeLiveStore
+	email   func(context.Context) (string, error)
+	profile func(context.Context, claude.Credentials) (claude.Profile, error)
+}
+
 type activeStateStore interface {
 	Load() (state.State, error)
 	Save(state.State) error
@@ -41,11 +47,12 @@ type activeStateStore interface {
 type fileActiveStateStore struct{ root string }
 
 type switchManager struct {
-	vault       vault.Vault
-	state       activeStateStore
-	claudeLive  claudeLiveStore
-	codexLive   codexLiveStore
-	claudeEmail func(context.Context) (string, error)
+	vault         vault.Vault
+	state         activeStateStore
+	claudeLive    claudeLiveStore
+	codexLive     codexLiveStore
+	claudeEmail   func(context.Context) (string, error)
+	claudeProfile func(context.Context, claude.Credentials) (claude.Profile, error)
 	// claudeTarget and codexTarget describe where live credentials are written
 	// ("system" or a file path); recovery refuses a transaction recorded
 	// against different targets so a sandbox switch can never restore into the
@@ -79,6 +86,15 @@ type switchTransactionStep struct {
 	Target         string `json:"target"`
 	HadActiveState bool   `json:"had_active_state"`
 	LiveWasAbsent  bool   `json:"live_was_absent,omitempty"`
+}
+
+type confirmedClaudeRotation struct {
+	accountName     string
+	slotPath        string
+	credentialsPath string
+	metadata        slotMetadata
+	profile         claude.Profile
+	liveCredentials claude.Credentials
 }
 
 func switchAccount(ctx context.Context, providerName, accountName string, stdout io.Writer) error {
@@ -141,7 +157,7 @@ func defaultSwitchManager(stdout io.Writer) (switchManager, error) {
 	if err != nil {
 		return switchManager{}, err
 	}
-	claudeLive, claudeEmail := defaultClaudeSwitchStore()
+	claudeDependencies := defaultClaudeLiveDependencies()
 	claudeTarget, err := defaultClaudeTarget()
 	if err != nil {
 		return switchManager{}, err
@@ -151,14 +167,15 @@ func defaultSwitchManager(stdout io.Writer) (switchManager, error) {
 		return switchManager{}, err
 	}
 	return switchManager{
-		vault:        accountVault,
-		state:        fileActiveStateStore{root: accountVault.Root()},
-		claudeLive:   claudeLive,
-		codexLive:    codexLive,
-		claudeEmail:  claudeEmail,
-		claudeTarget: claudeTarget,
-		codexTarget:  codexTarget,
-		stdout:       stdout,
+		vault:         accountVault,
+		state:         fileActiveStateStore{root: accountVault.Root()},
+		claudeLive:    claudeDependencies.store,
+		codexLive:     codexLive,
+		claudeEmail:   claudeDependencies.email,
+		claudeProfile: claudeDependencies.profile,
+		claudeTarget:  claudeTarget,
+		codexTarget:   codexTarget,
+		stdout:        stdout,
 	}, nil
 }
 
@@ -173,17 +190,24 @@ func defaultClaudeTarget() (string, error) {
 	return claude.LiveCredentialsTarget()
 }
 
-func defaultClaudeSwitchStore() (claudeLiveStore, func(context.Context) (string, error)) {
+func defaultClaudeLiveDependencies() claudeLiveDependencies {
 	if path := strings.TrimSpace(os.Getenv(claudeCredentialsFileOverride)); path != "" {
-		return claudeFileLiveStore{store: claude.LiveFile{Path: path}}, func(context.Context) (string, error) {
-			email := strings.TrimSpace(os.Getenv(claudeAccountEmailOverride))
-			if email == "" {
-				return "", fmt.Errorf("%s is required with %s so hop can verify which account owns the sandbox credentials", claudeAccountEmailOverride, claudeCredentialsFileOverride)
-			}
-			return email, nil
+		return claudeLiveDependencies{
+			store: claudeFileLiveStore{store: claude.LiveFile{Path: path}},
+			email: func(context.Context) (string, error) {
+				email := strings.TrimSpace(os.Getenv(claudeAccountEmailOverride))
+				if email == "" {
+					return "", fmt.Errorf("%s is required with %s so hop can verify which account owns the sandbox credentials", claudeAccountEmailOverride, claudeCredentialsFileOverride)
+				}
+				return email, nil
+			},
 		}
 	}
-	return systemClaudeLiveStore{}, claudeAccountEmail
+	return claudeLiveDependencies{
+		store:   systemClaudeLiveStore{},
+		email:   claudeAccountEmail,
+		profile: claude.New(claude.Config{}).FetchProfile,
+	}
 }
 
 func defaultCodexSwitchStore() (codexLiveStore, string, error) {
@@ -569,14 +593,8 @@ func (manager switchManager) requireProviderDirectory(providerName string) error
 	return nil
 }
 
-// confirmActiveClaudeIdentity asks the recorded credentials first and the
-// `claude auth status` email second. The Claude CLI serves that email from its
-// own config cache (~/.claude.json), which hop never touches, so the cache
-// still names the previous account until the CLI refreshes it — right after
-// hop's own install or copy-back the live tokens are the target account's
-// while the email is still the account hop switched away from. Tokens are the
-// only oracle that is fresh at that moment; the email answers the case tokens
-// cannot, where the live login rotated outside hop.
+// confirmActiveClaudeIdentity asks the recorded credentials first, the live
+// bearer token's profile second, and Claude's cache-backed status email last.
 func (manager switchManager) confirmActiveClaudeIdentity(ctx context.Context, current string, liveCredentials claude.Credentials) error {
 	credentialsPath, err := manager.vault.CredentialsPath("claude", current)
 	if err != nil {
@@ -592,10 +610,36 @@ func (manager switchManager) confirmActiveClaudeIdentity(ctx context.Context, cu
 		return err
 	}
 	contents, metadataErr := os.ReadFile(filepath.Join(slotPath, slotMetadataFilename))
+	var metadata slotMetadata
 	if metadataErr == nil {
-		var metadata slotMetadata
 		if err := json.Unmarshal(contents, &metadata); err != nil {
 			return fmt.Errorf("verify the recorded Claude account %q before copy-back; repair %s or run 'hop login claude %s', then retry: %w", current, filepath.Join(slotPath, slotMetadataFilename), current, err)
+		}
+		if manager.claudeProfile != nil && liveCredentials.HasScope("user:profile") {
+			profile, profileErr := manager.claudeProfile(ctx, liveCredentials)
+			if profileErr != nil && ctx.Err() != nil {
+				return fmt.Errorf("claude account switch stopped before the live identity was confirmed: %w", ctx.Err())
+			}
+			if profileErr == nil {
+				matches, comparable := claudeProfileMatches(metadata, profile)
+				if comparable && !matches {
+					return claudeIdentityMismatchError(current, metadata, profile)
+				}
+				if matches {
+					confirmedRotation := confirmedClaudeRotation{
+						accountName:     current,
+						slotPath:        slotPath,
+						credentialsPath: credentialsPath,
+						metadata:        metadata,
+						profile:         profile,
+						liveCredentials: liveCredentials,
+					}
+					if err := recordConfirmedClaudeRotation(confirmedRotation); err != nil {
+						return err
+					}
+					return nil
+				}
+			}
 		}
 		if strings.TrimSpace(metadata.Email) != "" {
 			liveEmail, err := manager.claudeEmail(ctx)
@@ -615,6 +659,40 @@ func (manager switchManager) confirmActiveClaudeIdentity(ctx context.Context, cu
 		return fmt.Errorf("verify the recorded Claude account %q before copy-back; check %s permissions and retry: %w", current, filepath.Join(slotPath, slotMetadataFilename), metadataErr)
 	}
 	return fmt.Errorf("active Claude account %q has no recorded email and its live credentials no longer match; run 'hop login claude %s' to explicitly adopt the current login, then retry", current, current)
+}
+
+func claudeProfileMatches(metadata slotMetadata, profile claude.Profile) (bool, bool) {
+	if metadata.AccountUUID != "" {
+		return metadata.AccountUUID == profile.AccountUUID, true
+	}
+	if metadata.Email != "" {
+		return strings.EqualFold(strings.TrimSpace(metadata.Email), profile.Email), true
+	}
+	return false, false
+}
+
+func recordConfirmedClaudeRotation(rotation confirmedClaudeRotation) error {
+	if rotation.metadata.AccountUUID == "" {
+		rotation.metadata.AccountUUID = rotation.profile.AccountUUID
+		if err := writeSlotMetadata(rotation.slotPath, rotation.metadata); err != nil {
+			return fmt.Errorf("record the confirmed Claude account UUID for %q; the live login was left unchanged, check the slot permissions and retry: %w", rotation.accountName, err)
+		}
+	}
+	if err := (claude.FileStore{Path: rotation.credentialsPath}).Write(rotation.liveCredentials); err != nil {
+		return fmt.Errorf("save the confirmed rotated Claude credentials for account %q; the live login was left unchanged, check the slot permissions and retry: %w", rotation.accountName, err)
+	}
+	return nil
+}
+
+func claudeIdentityMismatchError(current string, metadata slotMetadata, profile claude.Profile) error {
+	return fmt.Errorf("live Claude is signed in as %s, but active account %q is recorded as %s; run 'hop login claude <account>' to preserve the live login or restore account %q with 'hop claude %s', then retry", profile.Email, current, recordedClaudeIdentity(metadata), current, current)
+}
+
+func recordedClaudeIdentity(metadata slotMetadata) string {
+	if strings.TrimSpace(metadata.Email) != "" {
+		return metadata.Email
+	}
+	return metadata.AccountUUID
 }
 
 func (manager switchManager) findCodexSlotByAccountID(accountID string) (string, error) {

@@ -31,6 +31,7 @@ const (
 type slotMetadata struct {
 	RefreshPolicy string `json:"refresh_policy"`
 	Email         string `json:"email,omitempty"`
+	AccountUUID   string `json:"account_uuid,omitempty"`
 }
 
 type account struct {
@@ -87,7 +88,7 @@ func defaultCatalog() (catalog, error) {
 	if err != nil {
 		return nil, err
 	}
-	claudeLive, _ := defaultClaudeSwitchStore()
+	claudeDependencies := defaultClaudeLiveDependencies()
 	codexLive, _, err := defaultCodexSwitchStore()
 	if err != nil {
 		return nil, err
@@ -98,7 +99,7 @@ func defaultCatalog() (catalog, error) {
 		claudeAdapter: claude.New(claude.Config{}),
 		codexAdapter:  codex.New(codex.Config{}),
 		now:           time.Now,
-		claudeLive:    claudeLive,
+		claudeLive:    claudeDependencies.store,
 		codexLive:     codexLive,
 	}, nil
 }
@@ -206,14 +207,22 @@ func slotAllowsRefresh(slotPath string) (bool, error) {
 	return true, nil
 }
 
-func writeManagedSlotMetadata(slotPath, email string) error {
+func writeManagedSlotMetadata(slotPath string, identity claude.Profile) error {
+	return writeSlotMetadata(slotPath, slotMetadata{
+		RefreshPolicy: managedRefreshPolicy,
+		Email:         identity.Email,
+		AccountUUID:   identity.AccountUUID,
+	})
+}
+
+func writeSlotMetadata(slotPath string, metadata slotMetadata) error {
 	if err := os.MkdirAll(slotPath, 0o700); err != nil {
 		return fmt.Errorf("create account slot %s: %w", slotPath, err)
 	}
 	if err := os.Chmod(slotPath, 0o700); err != nil {
 		return fmt.Errorf("secure account slot %s: %w", slotPath, err)
 	}
-	contents, err := json.MarshalIndent(slotMetadata{RefreshPolicy: managedRefreshPolicy, Email: email}, "", "  ")
+	contents, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode slot metadata: %w", err)
 	}

@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	defaultUsageURL = "https://api.anthropic.com/api/oauth/usage"
-	defaultTokenURL = "https://platform.claude.com/v1/oauth/token"
+	defaultUsageURL   = "https://api.anthropic.com/api/oauth/usage"
+	defaultProfileURL = "https://api.anthropic.com/api/oauth/profile"
+	defaultTokenURL   = "https://platform.claude.com/v1/oauth/token"
 	// The public Claude Code OAuth client ID that community tooling uses. It
 	// is not a secret and not issued to hop; Anthropic can change it at any
 	// time, which is why Config.ClientID can override it.
@@ -28,6 +29,7 @@ const (
 
 var (
 	ErrCredentials = errors.New("claude credentials are invalid")
+	ErrProfile     = errors.New("claude profile request failed")
 	ErrRefresh     = errors.New("claude token refresh failed")
 	ErrUsage       = errors.New("claude usage request failed")
 )
@@ -39,7 +41,14 @@ type Credentials struct {
 	ExpiresAt             int64    `json:"expiresAt"`
 	RefreshTokenExpiresAt int64    `json:"refreshTokenExpiresAt"`
 	SubscriptionType      string   `json:"subscriptionType,omitempty"`
+	RateLimitTier         string   `json:"rateLimitTier,omitempty"`
 	Scopes                []string `json:"scopes,omitempty"`
+}
+
+// Profile identifies the Claude account that owns an OAuth access token.
+type Profile struct {
+	AccountUUID string
+	Email       string
 }
 
 // Store reads and writes credentials in a hop-owned account slot.
@@ -52,6 +61,7 @@ type Store interface {
 type Config struct {
 	HTTPClient *http.Client
 	UsageURL   string
+	ProfileURL string
 	TokenURL   string
 	ClientID   string
 	Now        func() time.Time
@@ -59,11 +69,12 @@ type Config struct {
 
 // Adapter talks to the Claude OAuth and usage endpoints.
 type Adapter struct {
-	client   *http.Client
-	usageURL string
-	tokenURL string
-	clientID string
-	now      func() time.Time
+	client     *http.Client
+	usageURL   string
+	profileURL string
+	tokenURL   string
+	clientID   string
+	now        func() time.Time
 }
 
 type credentialFetcher struct {
@@ -83,6 +94,10 @@ func New(config Config) Adapter {
 	if usageURL == "" {
 		usageURL = defaultUsageURL
 	}
+	profileURL := config.ProfileURL
+	if profileURL == "" {
+		profileURL = defaultProfileURL
+	}
 	tokenURL := config.TokenURL
 	if tokenURL == "" {
 		tokenURL = defaultTokenURL
@@ -95,7 +110,7 @@ func New(config Config) Adapter {
 	if now == nil {
 		now = time.Now
 	}
-	return Adapter{client: client, usageURL: usageURL, tokenURL: tokenURL, clientID: clientID, now: now}
+	return Adapter{client: client, usageURL: usageURL, profileURL: profileURL, tokenURL: tokenURL, clientID: clientID, now: now}
 }
 
 // Fetcher binds credentials to the shared account fetcher contract.
@@ -138,6 +153,43 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 		return provider.Usage{}, err
 	}
 	return usage, nil
+}
+
+// FetchProfile returns the account that owns the supplied live access token.
+func (adapter Adapter) FetchProfile(ctx context.Context, credentials Credentials) (Profile, error) {
+	if strings.TrimSpace(credentials.AccessToken) == "" {
+		return Profile{}, fmt.Errorf("access token is missing; run 'hop login claude <account>': %w", ErrCredentials)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, adapter.profileURL, nil)
+	if err != nil {
+		return Profile{}, fmt.Errorf("build Claude profile request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
+	request.Header.Set("anthropic-beta", betaHeaderValue)
+
+	response, err := adapter.client.Do(request)
+	if err != nil {
+		return Profile{}, fmt.Errorf("reach Claude profile endpoint; check the network and retry: %w: %w", err, ErrProfile)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return Profile{}, fmt.Errorf("claude profile returned HTTP %d; refresh the live Claude login and retry: %w", response.StatusCode, ErrProfile)
+	}
+
+	var responseProfile profileResponse
+	decoder := json.NewDecoder(io.LimitReader(response.Body, responseLimit))
+	if err := decoder.Decode(&responseProfile); err != nil {
+		return Profile{}, fmt.Errorf("decode Claude profile response; retry the command: %w: %w", err, ErrProfile)
+	}
+	profile := Profile{
+		AccountUUID: strings.TrimSpace(responseProfile.Account.UUID),
+		Email:       strings.TrimSpace(responseProfile.Account.Email),
+	}
+	if profile.AccountUUID == "" || profile.Email == "" {
+		return Profile{}, fmt.Errorf("claude profile omitted account.uuid or account.email; retry with a refreshed Claude login: %w", ErrProfile)
+	}
+	return profile, nil
 }
 
 // Refresh rotates OAuth tokens in a hop-owned store. Never pass a live credential store.
@@ -200,6 +252,16 @@ func (credentials Credentials) NeedsRefresh(now time.Time, skew time.Duration) b
 	return credentials.ExpiresAt <= now.Add(skew).UnixMilli()
 }
 
+// HasScope reports whether Anthropic granted a named OAuth scope.
+func (credentials Credentials) HasScope(scope string) bool {
+	for _, granted := range credentials.Scopes {
+		if strings.TrimSpace(granted) == scope {
+			return true
+		}
+	}
+	return false
+}
+
 type refreshRequest struct {
 	GrantType    string `json:"grant_type"`
 	RefreshToken string `json:"refresh_token"`
@@ -211,6 +273,13 @@ type refreshResponse struct {
 	RefreshToken          string `json:"refresh_token"`
 	ExpiresIn             int64  `json:"expires_in"`
 	RefreshTokenExpiresIn int64  `json:"refresh_token_expires_in"`
+}
+
+type profileResponse struct {
+	Account struct {
+		UUID  string `json:"uuid"`
+		Email string `json:"email_address"`
+	} `json:"account"`
 }
 
 type usageResponse struct {
