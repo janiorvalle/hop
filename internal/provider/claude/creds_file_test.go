@@ -1,9 +1,11 @@
 package claude
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,5 +141,37 @@ func TestLiveFileWritePreservesParentDirectoryPermissions(t *testing.T) {
 	}
 	if _, err := live.Read(); err != nil {
 		t.Fatalf("Read() error = %v", err)
+	}
+}
+
+func TestLiveFileClearIfMatchesPreservesUnexpectedCredentials(t *testing.T) {
+	live := LiveFile{Path: filepath.Join(t.TempDir(), ".credentials.json")}
+	unexpected := Credentials{AccessToken: "new", RefreshToken: "new-refresh", Scopes: []string{"user:profile"}}
+	if err := live.Write(unexpected); err != nil {
+		t.Fatal(err)
+	}
+
+	err := live.ClearIfMatches(Credentials{AccessToken: "old", RefreshToken: "old-refresh"})
+	if err == nil || !strings.Contains(err.Error(), "preserved the unexpected login") {
+		t.Fatalf("ClearIfMatches() error = %v, want unexpected-login refusal", err)
+	}
+	written, readErr := live.Read()
+	if readErr != nil || written.AccessToken != unexpected.AccessToken || written.RefreshToken != unexpected.RefreshToken {
+		t.Fatalf("live credentials = %+v, %v; want unexpected credentials preserved", written, readErr)
+	}
+}
+
+func TestLiveFileClearIfMatchesRemovesExpectedCredentials(t *testing.T) {
+	live := LiveFile{Path: filepath.Join(t.TempDir(), ".credentials.json")}
+	expected := Credentials{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"user:profile"}}
+	if err := live.Write(expected); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := live.ClearIfMatches(expected); err != nil {
+		t.Fatalf("ClearIfMatches() error = %v", err)
+	}
+	if _, err := os.Stat(live.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("live credentials still exist: %v", err)
 	}
 }

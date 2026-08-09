@@ -764,3 +764,7 @@ func (systemClaudeLiveStore) Write(ctx context.Context, credentials claude.Crede
 func (systemClaudeLiveStore) Clear(ctx context.Context) error {
 	return claude.ClearLiveCredentials(ctx)
 }
+
+func (systemClaudeLiveStore) ClearIfMatches(ctx context.Context, expected claude.Credentials) error {
+	return claude.ClearLiveCredentialsIfMatches(ctx, expected)
+}
