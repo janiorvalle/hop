@@ -298,8 +298,16 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if newEmailErr != nil {
 		return fmt.Errorf("read the newly logged-in Claude account email before enrollment; the previous login will be restored, run 'claude auth status --json' to fix the login, then retry: %w", newEmailErr)
 	}
-	if newEmail != "" && activeSlotEmail != "" && strings.EqualFold(newEmail, activeSlotEmail) {
-		return fmt.Errorf("claude login returned the already-active identity %s; the previous login will be restored, retry and choose the account for slot %q", activeSlotEmail, accountName)
+	// The slot's recorded email names the active identity, and for a slot hop
+	// enrolled without one the status email read before the sign-in is all
+	// there is. Without that fallback, signing back into the active identity
+	// would enroll it a second time under another name.
+	activeIdentity := activeSlotEmail
+	if activeIdentity == "" {
+		activeIdentity = activeEmail
+	}
+	if newEmail != "" && activeIdentity != "" && strings.EqualFold(newEmail, activeIdentity) {
+		return fmt.Errorf("claude login returned the already-active identity %s; the previous login will be restored, retry and choose the account for slot %q", activeIdentity, accountName)
 	}
 	if duplicateAccount, err := manager.duplicateClaudeAccount(accountName, newEmail, newCredentials); err != nil {
 		return err

@@ -569,6 +569,7 @@ func TestLoginClaudeLeavesAnEmailLessActiveSlotUnlabeledWhenStatusEmailIsStale(t
 		t.Fatalf("write email-less metadata: %v", err)
 	}
 	live := &fakeClaudeLiveStore{credentials: original}
+	emailReads := 0
 	manager := loginManager{
 		vault:      accountVault,
 		claudeLive: live,
@@ -578,10 +579,16 @@ func TestLoginClaudeLeavesAnEmailLessActiveSlotUnlabeledWhenStatusEmailIsStale(t
 			}
 			return nil
 		}),
-		stdout:      io.Discard,
-		stderr:      io.Discard,
-		getenv:      func(string) string { return "approved" },
-		claudeEmail: func(context.Context) (string, error) { return "stale@example.com", nil },
+		stdout: io.Discard,
+		stderr: io.Discard,
+		getenv: func(string) string { return "approved" },
+		claudeEmail: func(context.Context) (string, error) {
+			emailReads++
+			if emailReads == 1 {
+				return "stale@example.com", nil
+			}
+			return "personal@example.com", nil
+		},
 	}
 
 	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
@@ -589,6 +596,48 @@ func TestLoginClaudeLeavesAnEmailLessActiveSlotUnlabeledWhenStatusEmailIsStale(t
 	}
 	if metadata := readSlotMetadata(t, filepath.Dir(workPath)); metadata.Email != "" {
 		t.Fatalf("active slot email = %q, want the slot left unlabeled rather than named by the status cache", metadata.Email)
+	}
+}
+
+// An unlabeled active slot still has one name for its identity: the status
+// email read before the browser sign-in. Signing back into that identity must
+// be refused rather than enrolled under a second account name.
+func TestLoginClaudeRejectsReturningToAnEmailLessActiveIdentity(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	original := claude.Credentials{AccessToken: "seed", RefreshToken: "seed-refresh"}
+	workPath, _ := accountVault.CredentialsPath("claude", "work")
+	if err := writeManagedSlotMetadata(filepath.Dir(workPath), ""); err != nil {
+		t.Fatalf("write email-less metadata: %v", err)
+	}
+	live := &fakeClaudeLiveStore{credentials: original}
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
+				live.credentials = claude.Credentials{AccessToken: "fresh", RefreshToken: "fresh-refresh"}
+			}
+			return nil
+		}),
+		stdout:      io.Discard,
+		stderr:      io.Discard,
+		getenv:      func(string) string { return "approved" },
+		claudeEmail: func(context.Context) (string, error) { return "work@example.com", nil },
+	}
+
+	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "already-active identity") {
+		t.Fatalf("Login() error = %v, want duplicate-identity guidance", err)
+	}
+	duplicateSlot, _ := accountVault.SlotPath("claude", "duplicate")
+	if _, statErr := os.Stat(duplicateSlot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("duplicate identity slot exists: %v", statErr)
+	}
+	if live.credentials.RefreshToken != original.RefreshToken {
+		t.Fatalf("active login restored = false, got refresh token %q", live.credentials.RefreshToken)
 	}
 }
 
