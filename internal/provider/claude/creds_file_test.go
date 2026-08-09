@@ -21,6 +21,7 @@ func TestFileStoreRoundTripUsesClaudeCredentialShape(t *testing.T) {
 		ExpiresAt:             1000,
 		RefreshTokenExpiresAt: 2000,
 		SubscriptionType:      "pro",
+		RateLimitTier:         "default_claude_max_20x",
 		Scopes:                []string{"user:profile"},
 	}
 	if err := store.Write(want); err != nil {
@@ -30,7 +31,7 @@ func TestFileStoreRoundTripUsesClaudeCredentialShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)
 	}
-	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken || got.SubscriptionType != want.SubscriptionType {
+	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken || got.SubscriptionType != want.SubscriptionType || got.RateLimitTier != want.RateLimitTier {
 		t.Errorf("Read() = %+v, want credential fields preserved", got)
 	}
 

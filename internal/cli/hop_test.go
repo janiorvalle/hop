@@ -495,6 +495,11 @@ func TestSwitchConfirmsClaudeIdentityFromCredentialsWhenStatusEmailIsStale(t *te
 		writeClaudeSlotEmail(t, manager.vault, "work2", "work2@example.test")
 		stateStore.value.SetActive("claude", "work2")
 		claudeLive.credentials = claudeCredentials("work2")
+		claudeLive.credentials.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			t.Fatal("live profile read when the recorded credential copy already matched")
+			return claude.Profile{}, nil
+		}
 		emailReads := 0
 		manager.claudeEmail = func(context.Context) (string, error) {
 			emailReads++
@@ -516,18 +521,136 @@ func TestSwitchConfirmsClaudeIdentityFromCredentialsWhenStatusEmailIsStale(t *te
 		}
 	})
 
+	t.Run("live token rotation", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work1", claudeCredentials("work1"))
+		writeClaudeSlot(t, manager.vault, "work2", claudeCredentials("work2"))
+		writeClaudeSlotEmail(t, manager.vault, "work1", "work1@example.test")
+		writeClaudeSlotIdentity(t, manager.vault, "work2", claude.Profile{AccountUUID: "work2-uuid", Email: "work2@example.test"})
+		stateStore.value.SetActive("claude", "work2")
+		claudeLive.credentials = claudeCredentials("work2-rotated")
+		claudeLive.credentials.Scopes = []string{"user:profile"}
+		profileReads := 0
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			profileReads++
+			return claude.Profile{AccountUUID: "work2-uuid", Email: "work2@example.test"}, nil
+		}
+		emailReads := 0
+		manager.claudeEmail = func(context.Context) (string, error) {
+			emailReads++
+			return "work1@example.test", nil
+		}
+
+		if err := manager.Switch(context.Background(), "claude", "work1"); err != nil {
+			t.Fatalf("Switch() error = %v, want a live profile to confirm the rotated work2 login", err)
+		}
+		if profileReads != 1 || emailReads != 0 {
+			t.Fatalf("profile reads = %d, status email reads = %d; want 1, 0", profileReads, emailReads)
+		}
+		assertClaudeSlot(t, manager.vault, "work2", "work2-rotated")
+	})
+
+	t.Run("legacy slot backfill", func(t *testing.T) {
+		manager, _, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		rotated.Scopes = []string{"user:profile"}
+		claudeLive.credentials = rotated
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{AccountUUID: "work-uuid", Email: "work@example.test"}, nil
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			t.Fatal("cached Claude email read after the live profile confirmed the legacy slot")
+			return "", nil
+		}
+
+		if err := manager.confirmActiveClaudeIdentity(context.Background(), "work", rotated); err != nil {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work", "work-rotated")
+		slotPath, _ := manager.vault.SlotPath("claude", "work")
+		if metadata := readSlotMetadata(t, slotPath); metadata.AccountUUID != "work-uuid" {
+			t.Fatalf("account UUID = %q, want work-uuid backfilled", metadata.AccountUUID)
+		}
+	})
+
+	t.Run("profile failure falls back without eager re-record", func(t *testing.T) {
+		manager, _, _, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		rotated.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, errors.New("network unavailable")
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			return "work@example.test", nil
+		}
+
+		if err := manager.confirmActiveClaudeIdentity(context.Background(), "work", rotated); err != nil {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v, want cached-email fallback", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work", "work")
+	})
+
+	t.Run("profile cancellation stops confirmation", func(t *testing.T) {
+		manager, _, _, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		rotated.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(ctx context.Context, _ claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, ctx.Err()
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			t.Fatal("cached email read after profile cancellation")
+			return "", nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := manager.confirmActiveClaudeIdentity(ctx, "work", rotated)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v, want context cancellation", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work", "work")
+	})
+
+	t.Run("missing profile scope falls back", func(t *testing.T) {
+		manager, _, _, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			t.Fatal("live profile read without the user:profile scope")
+			return claude.Profile{}, nil
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			return "work@example.test", nil
+		}
+
+		if err := manager.confirmActiveClaudeIdentity(context.Background(), "work", rotated); err != nil {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v, want cached-email fallback", err)
+		}
+	})
+
 	t.Run("different identity", func(t *testing.T) {
 		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
 		writeClaudeSlot(t, manager.vault, "work1", claudeCredentials("work1"))
 		writeClaudeSlot(t, manager.vault, "work2", claudeCredentials("work2"))
 		writeClaudeSlotEmail(t, manager.vault, "work1", "work1@example.test")
-		writeClaudeSlotEmail(t, manager.vault, "work2", "work2@example.test")
+		writeClaudeSlotIdentity(t, manager.vault, "work2", claude.Profile{AccountUUID: "work2-uuid", Email: "work2@example.test"})
 		stateStore.value.SetActive("claude", "work2")
 		claudeLive.credentials = claudeCredentials("stranger")
-		manager.claudeEmail = func(context.Context) (string, error) { return "stranger@example.test", nil }
+		claudeLive.credentials.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{AccountUUID: "stranger-uuid", Email: "fresh-stranger@example.test"}, nil
+		}
+		manager.claudeEmail = func(context.Context) (string, error) { return "cached@example.test", nil }
 
 		err := manager.Switch(context.Background(), "claude", "work1")
-		if err == nil || !strings.Contains(err.Error(), "stranger@example.test") {
+		if err == nil || !strings.Contains(err.Error(), "fresh-stranger@example.test") {
 			t.Fatalf("Switch() error = %v, want a refusal naming the live identity", err)
 		}
 		assertClaudeSlot(t, manager.vault, "work2", "work2")
@@ -691,7 +814,7 @@ func TestSwitchRecoveryPreservesHumanRepairedClaudeLogin(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := writeManagedSlotMetadata(slotPath, email); err != nil {
+				if err := writeManagedSlotMetadata(slotPath, claude.Profile{Email: email}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1194,6 +1317,9 @@ func newSwitchTestManager(t *testing.T) (switchManager, *memoryStateStore, *fake
 		claudeEmail: func(context.Context) (string, error) {
 			return "owner@example.test", nil
 		},
+		claudeProfile: func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, errors.New("profile unavailable")
+		},
 		stdout: output,
 	}, stateStore, claudeLive, codexLive, output
 }
@@ -1223,18 +1349,22 @@ func writeClaudeSlot(t *testing.T, accountVault vault.Vault, accountName string,
 	if err := (claude.FileStore{Path: path}).Write(credentials); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeManagedSlotMetadata(filepath.Dir(path), "owner@example.test"); err != nil {
+	if err := writeManagedSlotMetadata(filepath.Dir(path), claude.Profile{Email: "owner@example.test"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func writeClaudeSlotEmail(t *testing.T, accountVault vault.Vault, accountName, email string) {
+	writeClaudeSlotIdentity(t, accountVault, accountName, claude.Profile{Email: email})
+}
+
+func writeClaudeSlotIdentity(t *testing.T, accountVault vault.Vault, accountName string, identity claude.Profile) {
 	t.Helper()
 	slotPath, err := accountVault.SlotPath("claude", accountName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeManagedSlotMetadata(slotPath, email); err != nil {
+	if err := writeManagedSlotMetadata(slotPath, identity); err != nil {
 		t.Fatal(err)
 	}
 }

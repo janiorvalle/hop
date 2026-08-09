@@ -55,6 +55,7 @@ type loginManager struct {
 	getenv        func(string) string
 	codexEmail    func(context.Context, codex.Credentials) (string, error)
 	claudeEmail   func(context.Context) (string, error)
+	claudeProfile func(context.Context, claude.Credentials) (claude.Profile, error)
 	restoreWait   time.Duration
 	sandboxClaude bool
 }
@@ -85,11 +86,11 @@ func loginAccount(ctx context.Context, providerName, accountName string, stdin i
 	if err != nil {
 		return err
 	}
-	claudeLive, claudeEmail := defaultClaudeSwitchStore()
+	claudeDependencies := defaultClaudeLiveDependencies()
 	manager := loginManager{
 		vault:      accountVault,
 		runner:     systemLoginRunner{},
-		claudeLive: claudeLive,
+		claudeLive: claudeDependencies.store,
 		stdout:     stdout,
 		stderr:     stderr,
 		getenv:     os.Getenv,
@@ -97,7 +98,8 @@ func loginAccount(ctx context.Context, providerName, accountName string, stdin i
 			usage, err := codex.New(codex.Config{}).FetchUsage(ctx, credentials)
 			return usage.Email, err
 		},
-		claudeEmail:   claudeEmail,
+		claudeEmail:   claudeDependencies.email,
+		claudeProfile: claudeDependencies.profile,
 		sandboxClaude: strings.TrimSpace(os.Getenv(claudeCredentialsFileOverride)) != "",
 	}
 	return manager.Login(ctx, providerName, accountName, stdin)
@@ -202,12 +204,16 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 		if emailErr != nil {
 			return fmt.Errorf("read the current Claude account email before enrollment; run 'claude auth status --json' to fix the login, then retry: %w", emailErr)
 		}
-		if duplicateAccount, err := manager.duplicateClaudeAccount(accountName, email, credentials); err != nil {
+		identity, err := manager.resolveClaudeIdentity(ctx, credentials, email)
+		if err != nil {
+			return fmt.Errorf("claude enrollment stopped before account %q was saved: %w", accountName, err)
+		}
+		if duplicateAccount, err := manager.duplicateClaudeAccount(accountName, identity, credentials); err != nil {
 			return err
 		} else if duplicateAccount != "" {
 			return fmt.Errorf("claude identity is already enrolled as account %q; use that account or remove it before assigning a new name", duplicateAccount)
 		}
-		if err := manager.installClaudeSlot(accountName, reservation.path, email, credentials); err != nil {
+		if err := manager.installClaudeSlot(accountName, reservation.path, identity, credentials); err != nil {
 			return err
 		}
 		releaseState, err := acquireStateLock(ctx, manager.vault.Root())
@@ -230,7 +236,7 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 		if err := reservation.Commit(); err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(manager.stdout, "Enrolled the current live Claude login as account %q%s.\n", accountName, emailSuffix(email))
+		_, err = fmt.Fprintf(manager.stdout, "Enrolled the current live Claude login as account %q%s.\n", accountName, emailSuffix(identity.Email))
 		return err
 	}
 	if accountName == activeAccount {
@@ -250,7 +256,7 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if activeEmailErr != nil {
 		return fmt.Errorf("confirm the live Claude account before staging; run 'claude auth status --json' to fix the login, then retry: %w", activeEmailErr)
 	}
-	activeSlotEmail, err := manager.confirmedActiveClaudeEmail(activeAccount, activeEmail, originalCredentials)
+	activeSlotEmail, err := manager.confirmedActiveClaudeEmail(ctx, activeAccount, activeEmail, originalCredentials)
 	if err != nil {
 		return err
 	}
@@ -301,6 +307,11 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if newEmailErr != nil {
 		return fmt.Errorf("read the newly logged-in Claude account email before enrollment; the previous login will be restored, run 'claude auth status --json' to fix the login, then retry: %w", newEmailErr)
 	}
+	newIdentity, err := manager.resolveClaudeIdentity(ctx, newCredentials, newEmail)
+	if err != nil {
+		return fmt.Errorf("claude enrollment stopped before account %q was saved; the previous login will be restored: %w", accountName, err)
+	}
+	newEmail = newIdentity.Email
 	// The slot's recorded email names the active identity, and for a slot hop
 	// enrolled without one the status email read before the sign-in is all
 	// there is. Without that fallback, signing back into the active identity
@@ -312,12 +323,12 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if newEmail != "" && activeIdentity != "" && strings.EqualFold(newEmail, activeIdentity) {
 		return fmt.Errorf("claude login returned the already-active identity %s; the previous login will be restored, retry and choose the account for slot %q", activeIdentity, accountName)
 	}
-	if duplicateAccount, err := manager.duplicateClaudeAccount(accountName, newEmail, newCredentials); err != nil {
+	if duplicateAccount, err := manager.duplicateClaudeAccount(accountName, newIdentity, newCredentials); err != nil {
 		return err
 	} else if duplicateAccount != "" {
 		return fmt.Errorf("claude identity is already enrolled as account %q; the previous login will be restored, use that account or remove it before assigning a new name", duplicateAccount)
 	}
-	if err := manager.installClaudeSlot(accountName, reservation.path, newEmail, newCredentials); err != nil {
+	if err := manager.installClaudeSlot(accountName, reservation.path, newIdentity, newCredentials); err != nil {
 		return err
 	}
 	if err := reservation.Commit(); err != nil {
@@ -356,7 +367,7 @@ func (manager loginManager) duplicateCodexAccount(newAccount string, credentials
 	return "", nil
 }
 
-func (manager loginManager) duplicateClaudeAccount(newAccount, email string, credentials claude.Credentials) (string, error) {
+func (manager loginManager) duplicateClaudeAccount(newAccount string, identity claude.Profile, credentials claude.Credentials) (string, error) {
 	providerPath := filepath.Join(manager.vault.Root(), "claude")
 	entries, err := os.ReadDir(providerPath)
 	if err != nil {
@@ -375,7 +386,10 @@ func (manager loginManager) duplicateClaudeAccount(newAccount, email string, cre
 		if metadataErr != nil {
 			return "", fmt.Errorf("check whether Claude account %q has this identity; repair or remove its metadata before retrying: %w", entry.Name(), metadataErr)
 		}
-		if email != "" && metadata.Email != "" && strings.EqualFold(email, metadata.Email) {
+		if identity.AccountUUID != "" && metadata.AccountUUID == identity.AccountUUID {
+			return entry.Name(), nil
+		}
+		if identity.Email != "" && metadata.Email != "" && strings.EqualFold(identity.Email, metadata.Email) {
 			return entry.Name(), nil
 		}
 		path, _ := manager.vault.CredentialsPath("claude", entry.Name())
@@ -388,6 +402,32 @@ func (manager loginManager) duplicateClaudeAccount(newAccount, email string, cre
 		}
 	}
 	return "", nil
+}
+
+func (manager loginManager) resolveClaudeIdentity(ctx context.Context, credentials claude.Credentials, fallbackEmail string) (claude.Profile, error) {
+	identity := claude.Profile{Email: strings.TrimSpace(fallbackEmail)}
+	profile, found, err := manager.freshClaudeProfile(ctx, credentials)
+	if err != nil {
+		return claude.Profile{}, err
+	}
+	if found {
+		return profile, nil
+	}
+	return identity, nil
+}
+
+func (manager loginManager) freshClaudeProfile(ctx context.Context, credentials claude.Credentials) (claude.Profile, bool, error) {
+	if manager.claudeProfile == nil || !credentials.HasScope("user:profile") {
+		return claude.Profile{}, false, nil
+	}
+	profile, err := manager.claudeProfile(ctx, credentials)
+	if err != nil {
+		if ctx.Err() != nil {
+			return claude.Profile{}, false, ctx.Err()
+		}
+		return claude.Profile{}, false, nil
+	}
+	return profile, true, nil
 }
 
 func (manager loginManager) restoreClaudeLogin(ctx context.Context, credentials claude.Credentials) error {
@@ -493,13 +533,22 @@ func (manager loginManager) confirmActiveClaudeSlot(ctx context.Context, account
 	// account changed and its recorded email outranks `claude auth status`,
 	// whose cached email still names the previous account right after a hop
 	// switch. Stamping that stale email here would poison a healthy slot.
-	if recordedEmail, recorded := manager.recordedClaudeSlotEmail(accountName, credentials); recorded && recordedEmail != "" {
-		email = recordedEmail
+	identity, err := manager.resolveClaudeIdentity(ctx, credentials, email)
+	if err != nil {
+		return fmt.Errorf("claude confirmation stopped before account %q was saved: %w", accountName, err)
 	}
-	if err := manager.saveClaudeSlot(accountName, email, credentials); err != nil {
+	if recordedIdentity, recorded := manager.recordedClaudeSlotIdentity(accountName, credentials); recorded {
+		if recordedIdentity.Email != "" && identity.AccountUUID == "" {
+			identity.Email = recordedIdentity.Email
+		}
+		if identity.AccountUUID == "" {
+			identity.AccountUUID = recordedIdentity.AccountUUID
+		}
+	}
+	if err := manager.saveClaudeSlot(accountName, identity, credentials); err != nil {
 		return fmt.Errorf("confirm the current live Claude login as account %q; the live login was not changed: %w", accountName, err)
 	}
-	_, err = fmt.Fprintf(manager.stdout, "Confirmed the current live Claude login as account %q%s.\n", accountName, emailSuffix(email))
+	_, err = fmt.Fprintf(manager.stdout, "Confirmed the current live Claude login as account %q%s.\n", accountName, emailSuffix(identity.Email))
 	return err
 }
 
@@ -513,13 +562,13 @@ func (manager loginManager) confirmActiveClaudeSlot(ctx context.Context, account
 // recorded email is the fresher of the two and is what the copy-back keeps.
 // The email answers only the case tokens cannot: a live login that rotated
 // outside hop.
-func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail string, liveCredentials claude.Credentials) (string, error) {
-	if recordedEmail, recorded := manager.recordedClaudeSlotEmail(accountName, liveCredentials); recorded {
+func (manager loginManager) confirmedActiveClaudeEmail(ctx context.Context, accountName, liveEmail string, liveCredentials claude.Credentials) (string, error) {
+	if recordedIdentity, recorded := manager.recordedClaudeSlotIdentity(accountName, liveCredentials); recorded {
 		// The recorded email answers even when hop enrolled the slot without
 		// one: the credentials already proved the identity, so filling the gap
 		// from the status cache would relabel a healthy slot with whichever
 		// account that cache still names.
-		return recordedEmail, nil
+		return recordedIdentity.Email, nil
 	}
 	slotPath, err := manager.vault.SlotPath("claude", accountName)
 	if err != nil {
@@ -533,6 +582,30 @@ func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail st
 	if err := json.Unmarshal(contents, &metadata); err != nil {
 		return "", fmt.Errorf("confirm which login belongs to active Claude account %q; run 'hop login claude %s' first to repair its metadata: %w", accountName, accountName, err)
 	}
+	profile, found, err := manager.freshClaudeProfile(ctx, liveCredentials)
+	if err != nil {
+		return "", fmt.Errorf("claude account confirmation stopped before enrollment could continue: %w", err)
+	}
+	if found {
+		matches, comparable := claudeProfileMatches(metadata, profile)
+		if comparable && !matches {
+			return "", fmt.Errorf("live Claude is signed in as %s, but hop state names %q as %s; restore the recorded account or run 'hop login claude %s' to explicitly adopt the current live login before adding another account", profile.Email, accountName, recordedClaudeIdentity(metadata), accountName)
+		}
+		if matches {
+			rotation := confirmedClaudeRotation{
+				accountName:     accountName,
+				slotPath:        slotPath,
+				credentialsPath: filepath.Join(slotPath, vault.CredentialsFilename),
+				metadata:        metadata,
+				profile:         profile,
+				liveCredentials: liveCredentials,
+			}
+			if err := recordConfirmedClaudeRotation(rotation); err != nil {
+				return "", err
+			}
+			return profile.Email, nil
+		}
+	}
 	if metadata.Email != "" && liveEmail != "" {
 		if strings.EqualFold(metadata.Email, liveEmail) {
 			return liveEmail, nil
@@ -545,9 +618,9 @@ func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail st
 	return "", fmt.Errorf("claude auth status did not provide an email and the live credentials no longer match active account %q; run 'hop login claude %s' to explicitly confirm the current live login, then retry the new account", accountName, accountName)
 }
 
-// recordedClaudeSlotEmail reports whether the slot hop recorded for
-// accountName holds exactly the live credentials, and with it the email
-// recorded there (empty when hop enrolled that slot without one).
+// recordedClaudeSlotIdentity reports whether the slot hop recorded for
+// accountName holds exactly the live credentials, and with it the account
+// identity recorded there.
 //
 // Only a slot hop enrolled — one whose metadata records the managed refresh
 // policy — can match. Slots are default-deny: one seeded by hand stays
@@ -555,27 +628,27 @@ func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail st
 // must not let a caller adopt it and promote it to managed; the caller keeps
 // its explicit-adoption error instead. Callers that explain a non-match read
 // the slot themselves so the failure keeps its repair instructions.
-func (manager loginManager) recordedClaudeSlotEmail(accountName string, liveCredentials claude.Credentials) (string, bool) {
+func (manager loginManager) recordedClaudeSlotIdentity(accountName string, liveCredentials claude.Credentials) (claude.Profile, bool) {
 	slotPath, err := manager.vault.SlotPath("claude", accountName)
 	if err != nil {
-		return "", false
+		return claude.Profile{}, false
 	}
 	recorded, err := (claude.FileStore{Path: filepath.Join(slotPath, vault.CredentialsFilename)}).Read()
 	if err != nil {
-		return "", false
+		return claude.Profile{}, false
 	}
 	if recorded.AccessToken != liveCredentials.AccessToken || recorded.RefreshToken != liveCredentials.RefreshToken {
-		return "", false
+		return claude.Profile{}, false
 	}
 	contents, err := os.ReadFile(filepath.Join(slotPath, slotMetadataFilename))
 	if err != nil {
-		return "", false
+		return claude.Profile{}, false
 	}
 	var metadata slotMetadata
 	if err := json.Unmarshal(contents, &metadata); err != nil || metadata.RefreshPolicy != managedRefreshPolicy {
-		return "", false
+		return claude.Profile{}, false
 	}
-	return strings.TrimSpace(metadata.Email), true
+	return claude.Profile{AccountUUID: strings.TrimSpace(metadata.AccountUUID), Email: strings.TrimSpace(metadata.Email)}, true
 }
 
 func acquireClaudeLoginLock(ctx context.Context, root string) (func(), error) {
@@ -706,13 +779,17 @@ func inspectSlotReservation(slotPath string) (bool, bool, error) {
 	return true, processIsRunning(record.ProcessID), nil
 }
 
-func (manager loginManager) installClaudeSlot(accountName, slotPath, email string, credentials claude.Credentials) error {
-	return manager.installSlot("claude", accountName, slotPath, email, func(credentialsPath string) error {
+func (manager loginManager) installClaudeSlot(accountName, slotPath string, identity claude.Profile, credentials claude.Credentials) error {
+	return manager.installSlot("claude", accountName, slotPath, slotMetadata{
+		RefreshPolicy: managedRefreshPolicy,
+		Email:         identity.Email,
+		AccountUUID:   identity.AccountUUID,
+	}, func(credentialsPath string) error {
 		return (claude.FileStore{Path: credentialsPath}).Write(credentials)
 	})
 }
 
-func (manager loginManager) saveClaudeSlot(accountName, email string, credentials claude.Credentials) error {
+func (manager loginManager) saveClaudeSlot(accountName string, identity claude.Profile, credentials claude.Credentials) error {
 	if err := manager.saveClaudeCredentials(accountName, credentials); err != nil {
 		return err
 	}
@@ -720,7 +797,7 @@ func (manager loginManager) saveClaudeSlot(accountName, email string, credential
 	if err != nil {
 		return err
 	}
-	return writeManagedSlotMetadata(filepath.Dir(credentialsPath), email)
+	return writeManagedSlotMetadata(filepath.Dir(credentialsPath), identity)
 }
 
 func (manager loginManager) saveClaudeCredentials(accountName string, credentials claude.Credentials) error {
@@ -732,17 +809,17 @@ func (manager loginManager) saveClaudeCredentials(accountName string, credential
 }
 
 func (manager loginManager) installCodexSlot(accountName, slotPath string, credentials codex.Credentials, email string) error {
-	return manager.installSlot("codex", accountName, slotPath, email, func(credentialsPath string) error {
+	return manager.installSlot("codex", accountName, slotPath, slotMetadata{RefreshPolicy: managedRefreshPolicy, Email: email}, func(credentialsPath string) error {
 		return (codex.FileStore{Path: credentialsPath}).Write(credentials)
 	})
 }
 
-func (manager loginManager) installSlot(providerName, accountName, slotPath, email string, writeCredentials func(string) error) error {
+func (manager loginManager) installSlot(providerName, accountName, slotPath string, metadata slotMetadata, writeCredentials func(string) error) error {
 	credentialsPath := filepath.Join(slotPath, vault.CredentialsFilename)
 	if err := writeCredentials(credentialsPath); err != nil {
 		return fmt.Errorf("save %s account %q credentials; the incomplete slot was removed, retry login: %w", providerName, accountName, err)
 	}
-	if err := writeManagedSlotMetadata(slotPath, email); err != nil {
+	if err := writeSlotMetadata(slotPath, metadata); err != nil {
 		return fmt.Errorf("save %s account %q metadata; the incomplete slot was removed, retry login: %w", providerName, accountName, err)
 	}
 	return nil
