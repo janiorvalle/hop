@@ -18,6 +18,7 @@ import (
 	"github.com/janiorvalle/hop/internal/provider/codex"
 	"github.com/janiorvalle/hop/internal/state"
 	"github.com/janiorvalle/hop/internal/vault"
+	"golang.org/x/term"
 )
 
 const claudeLiveLoginApproval = "HOP_CLAUDE_LIVE_LOGIN"
@@ -56,6 +57,7 @@ type loginManager struct {
 	codexEmail    func(context.Context, codex.Credentials) (string, error)
 	claudeEmail   func(context.Context) (string, error)
 	claudeProfile func(context.Context, claude.Credentials) (claude.Profile, error)
+	stdinIsTTY    func(io.Reader) bool
 	restoreWait   time.Duration
 	sandboxClaude bool
 }
@@ -100,6 +102,7 @@ func loginAccount(ctx context.Context, providerName, accountName string, stdin i
 		},
 		claudeEmail:   claudeDependencies.email,
 		claudeProfile: claudeDependencies.profile,
+		stdinIsTTY:    readerIsTerminal,
 		sandboxClaude: strings.TrimSpace(os.Getenv(claudeCredentialsFileOverride)) != "",
 	}
 	return manager.Login(ctx, providerName, accountName, stdin)
@@ -245,8 +248,9 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if manager.sandboxClaude {
 		return fmt.Errorf("cannot add another Claude account while %s is set because Claude's browser login would use the real Keychain; unset the override for a user-approved live login, or test loginManager with an injected fake runner", claudeCredentialsFileOverride)
 	}
-	if manager.getenv(claudeLiveLoginApproval) != "approved" {
-		return fmt.Errorf("claude enrollment temporarily replaces the live Keychain login and needs a quiet window; stop Claude agents, then rerun with %s=approved hop login claude %s", claudeLiveLoginApproval, accountName)
+	stdin, err = manager.confirmClaudeLiveLogin(ctx, stdin, accountName)
+	if err != nil {
+		return err
 	}
 	originalCredentials, err := manager.claudeLive.Read(ctx)
 	if err != nil {
@@ -340,6 +344,76 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	restored = true
 	_, err = fmt.Fprintf(manager.stdout, "Enrolled Claude account %q%s and restored active account %q.\n", accountName, emailSuffix(newEmail), activeAccount)
 	return err
+}
+
+func (manager loginManager) confirmClaudeLiveLogin(ctx context.Context, stdin io.Reader, accountName string) (io.Reader, error) {
+	if manager.getenv != nil && manager.getenv(claudeLiveLoginApproval) == "approved" {
+		return stdin, nil
+	}
+	stdinIsTTY := manager.stdinIsTTY
+	if stdinIsTTY == nil {
+		stdinIsTTY = readerIsTerminal
+	}
+	if !stdinIsTTY(stdin) {
+		return stdin, claudeLiveLoginRefusal(accountName)
+	}
+
+	if _, err := fmt.Fprintln(manager.stderr, "The live Claude login will be briefly replaced during browser sign-in. Stop running Claude sessions first."); err != nil {
+		return stdin, fmt.Errorf("show the Claude enrollment warning; check the terminal and retry: %w", err)
+	}
+	if _, err := fmt.Fprint(manager.stderr, "Proceed? [y/N] "); err != nil {
+		return stdin, fmt.Errorf("show the Claude enrollment prompt; check the terminal and retry: %w", err)
+	}
+	type confirmationResult struct {
+		approved bool
+		err      error
+	}
+	result := make(chan confirmationResult, 1)
+	go func() {
+		approved, err := readClaudeConfirmation(stdin)
+		result <- confirmationResult{approved: approved, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return stdin, fmt.Errorf("claude enrollment confirmation canceled; rerun 'hop login claude %s' when you are ready: %w", accountName, ctx.Err())
+	case confirmation := <-result:
+		if confirmation.err == nil && confirmation.approved {
+			return stdin, nil
+		}
+		return stdin, claudeLiveLoginRefusal(accountName)
+	}
+}
+
+func readClaudeConfirmation(reader io.Reader) (bool, error) {
+	isYes := true
+	hasAnswer := false
+	var nextByte [1]byte
+	for {
+		if _, err := io.ReadFull(reader, nextByte[:]); err != nil {
+			return false, err
+		}
+		switch nextByte[0] {
+		case '\n':
+			return isYes && hasAnswer, nil
+		case 'y', 'Y':
+			if hasAnswer {
+				isYes = false
+			}
+			hasAnswer = true
+		case ' ', '\t', '\r':
+		default:
+			isYes = false
+		}
+	}
+}
+
+func readerIsTerminal(reader io.Reader) bool {
+	inputFile, ok := reader.(*os.File)
+	return ok && term.IsTerminal(int(inputFile.Fd()))
+}
+
+func claudeLiveLoginRefusal(accountName string) error {
+	return fmt.Errorf("claude enrollment temporarily replaces the live Keychain login and needs a quiet window; stop Claude agents, then rerun with %s=approved hop login claude %s", claudeLiveLoginApproval, accountName)
 }
 
 func (manager loginManager) duplicateCodexAccount(newAccount string, credentials codex.Credentials) (string, error) {

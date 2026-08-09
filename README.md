@@ -51,7 +51,8 @@ What hop never does:
   enrolls it and takes custody of its refresh token.
 - **Never starts a Claude browser login behind your back.** Adding a second
   Claude account has to borrow the live login while the browser flow runs, so
-  hop refuses until you stop your Claude sessions and rerun with
+  hop asks you to stop your Claude sessions and confirm before it proceeds.
+  Non-interactive automation can confirm with
   `HOP_CLAUDE_LIVE_LOGIN=approved`.
 - **Never restores a sandboxed switch into your real credentials.** If a
   switch is interrupted, recovery refuses any transaction that was recorded

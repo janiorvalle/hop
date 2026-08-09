@@ -516,6 +516,133 @@ func TestLoginClaudeRequiresExplicitQuietWindowBeforeLiveMutation(t *testing.T) 
 	}
 }
 
+func TestConfirmClaudeLiveLoginFromTTY(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		input       string
+		wantAllowed bool
+		wantRest    string
+	}{
+		{name: "lowercase y", input: "y\nbrowser input\n", wantAllowed: true, wantRest: "browser input\n"},
+		{name: "uppercase Y", input: "Y\nbrowser input\n", wantAllowed: true, wantRest: "browser input\n"},
+		{name: "no", input: "n\n"},
+		{name: "empty", input: "\n"},
+		{name: "EOF", input: "y"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			stdin := strings.NewReader(test.input)
+			var stderr bytes.Buffer
+			manager := loginManager{
+				stderr:     &stderr,
+				getenv:     func(string) string { return "" },
+				stdinIsTTY: func(io.Reader) bool { return true },
+			}
+			remainingStdin, err := manager.confirmClaudeLiveLogin(context.Background(), stdin, "personal")
+			if test.wantAllowed && err != nil {
+				t.Fatalf("confirmClaudeLiveLogin() error = %v, want confirmation accepted", err)
+			}
+			if !test.wantAllowed && (err == nil || !strings.Contains(err.Error(), "stop Claude agents")) {
+				t.Fatalf("confirmClaudeLiveLogin() error = %v, want quiet-window refusal", err)
+			}
+			if prompt := stderr.String(); !strings.Contains(prompt, "live Claude login will be briefly replaced") || !strings.Contains(prompt, "Proceed? [y/N]") {
+				t.Fatalf("stderr = %q, want warning and confirmation prompt", prompt)
+			}
+			if !test.wantAllowed {
+				return
+			}
+			if remainingStdin != stdin {
+				t.Fatal("confirmClaudeLiveLogin() did not preserve the original TTY reader")
+			}
+			gotRest, readErr := io.ReadAll(remainingStdin)
+			if readErr != nil {
+				t.Fatalf("ReadAll(remainingStdin) error = %v", readErr)
+			}
+			if string(gotRest) != test.wantRest {
+				t.Fatalf("remaining stdin = %q, want %q", gotRest, test.wantRest)
+			}
+		})
+	}
+}
+
+func TestConfirmClaudeLiveLoginNonTTYRequiresAutomationOverride(t *testing.T) {
+	t.Parallel()
+
+	stdin := strings.NewReader("browser input\n")
+	var stderr bytes.Buffer
+	manager := loginManager{
+		stderr:     &stderr,
+		getenv:     func(string) string { return "" },
+		stdinIsTTY: func(io.Reader) bool { return false },
+	}
+	remainingStdin, err := manager.confirmClaudeLiveLogin(context.Background(), stdin, "personal")
+	if err == nil || !strings.Contains(err.Error(), "HOP_CLAUDE_LIVE_LOGIN=approved") {
+		t.Fatalf("confirmClaudeLiveLogin() error = %v, want automation override guidance", err)
+	}
+	if remainingStdin != stdin {
+		t.Fatal("confirmClaudeLiveLogin() replaced non-TTY stdin")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want no prompt for non-TTY stdin", stderr.String())
+	}
+}
+
+func TestConfirmClaudeLiveLoginOverrideSkipsTTYPrompt(t *testing.T) {
+	t.Parallel()
+
+	stdin := strings.NewReader("browser input\n")
+	var stderr bytes.Buffer
+	manager := loginManager{
+		stderr: &stderr,
+		getenv: func(name string) string {
+			if name == claudeLiveLoginApproval {
+				return "approved"
+			}
+			return ""
+		},
+		stdinIsTTY: func(io.Reader) bool {
+			t.Fatal("TTY detection called after automation override")
+			return false
+		},
+	}
+	remainingStdin, err := manager.confirmClaudeLiveLogin(context.Background(), stdin, "personal")
+	if err != nil {
+		t.Fatalf("confirmClaudeLiveLogin() error = %v, want override accepted", err)
+	}
+	if remainingStdin != stdin {
+		t.Fatal("confirmClaudeLiveLogin() replaced stdin after override")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want override to skip prompt", stderr.String())
+	}
+}
+
+func TestConfirmClaudeLiveLoginStopsWhenContextIsCanceled(t *testing.T) {
+	t.Parallel()
+
+	stdin, stdinWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = stdinWriter.Close()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager := loginManager{
+		stderr:     io.Discard,
+		getenv:     func(string) string { return "" },
+		stdinIsTTY: func(io.Reader) bool { return true },
+	}
+
+	_, err := manager.confirmClaudeLiveLogin(ctx, stdin, "personal")
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "rerun 'hop login claude personal'") {
+		t.Fatalf("confirmClaudeLiveLogin() error = %v, want cancellation guidance", err)
+	}
+}
+
 func TestLoginClaudeStagesNewAccountAndRestoresActiveLogin(t *testing.T) {
 	t.Parallel()
 
