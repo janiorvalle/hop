@@ -4,8 +4,10 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -19,16 +21,22 @@ type recordedSecurityCall struct {
 type fakeSecurity struct {
 	calls   []recordedSecurityCall
 	results []error
+	outputs [][]byte
 }
 
 func (security *fakeSecurity) Run(_ context.Context, input string, args ...string) ([]byte, error) {
 	security.calls = append(security.calls, recordedSecurityCall{input: input, args: args})
+	var output []byte
+	if len(security.outputs) > 0 {
+		output = security.outputs[0]
+		security.outputs = security.outputs[1:]
+	}
 	if len(security.results) == 0 {
-		return nil, nil
+		return output, nil
 	}
 	result := security.results[0]
 	security.results = security.results[1:]
-	return nil, result
+	return output, result
 }
 
 // exitStatus produces the error a finished process yields, so the not-found
@@ -195,5 +203,26 @@ func TestReadLiveCredentialsAsksSecurityForTheItemOnly(t *testing.T) {
 	}
 	if security.calls[0].input != "" {
 		t.Fatalf("security input = %q, want nothing on stdin for a read", security.calls[0].input)
+	}
+}
+
+func TestReadLiveCredentialsReportsMissingKeychainItemAsAbsent(t *testing.T) {
+	security := &fakeSecurity{results: []error{exitStatus(t, securityItemNotFound)}}
+	_, err := readLiveCredentials(context.Background(), security)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("readLiveCredentials() error = %v, want missing credentials", err)
+	}
+}
+
+func TestClearLiveCredentialsIfMatchesRefusesNonConditionalKeychainDelete(t *testing.T) {
+	credentials := Credentials{AccessToken: "access", RefreshToken: "refresh"}
+	contents, err := json.Marshal(credentialEnvelope{OAuth: credentials})
+	if err != nil {
+		t.Fatal(err)
+	}
+	security := &fakeSecurity{outputs: [][]byte{contents}}
+	err = clearLiveCredentialsIfMatches(context.Background(), security, credentials)
+	if err == nil || !strings.Contains(err.Error(), "cannot delete it conditionally") {
+		t.Fatalf("ClearLiveCredentialsIfMatches() error = %v, want safe manual-logout guidance", err)
 	}
 }

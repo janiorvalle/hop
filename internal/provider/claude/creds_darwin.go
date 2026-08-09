@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
@@ -56,9 +57,33 @@ func ClearLiveCredentials(ctx context.Context) error {
 	return clearLiveCredentials(ctx, systemSecurity{})
 }
 
+// ClearLiveCredentialsIfMatches refuses to turn a read-then-delete into a
+// compare-and-delete promise Keychain cannot provide. The user can remove the
+// item explicitly, after which retrying hop completes recovery from absence.
+func ClearLiveCredentialsIfMatches(ctx context.Context, expected Credentials) error {
+	return clearLiveCredentialsIfMatches(ctx, systemSecurity{}, expected)
+}
+
+func clearLiveCredentialsIfMatches(ctx context.Context, security securityCommander, expected Credentials) error {
+	live, err := readLiveCredentials(ctx, security)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if live.AccessToken != expected.AccessToken || live.RefreshToken != expected.RefreshToken {
+		return fmt.Errorf("the live Claude Keychain item changed before hop could restore its previous absence; hop left the unexpected login untouched")
+	}
+	return fmt.Errorf("the Claude Keychain item still contains the target login, but Keychain cannot delete it conditionally; run 'claude auth logout', then retry hop to finish restoring the previous absence")
+}
+
 func readLiveCredentials(ctx context.Context, security securityCommander) (Credentials, error) {
 	contents, err := security.Run(ctx, "", "find-generic-password", "-s", keychainService, "-w")
 	if err != nil {
+		if securityExitCode(err) == securityItemNotFound {
+			err = errors.Join(os.ErrNotExist, err)
+		}
 		return Credentials{}, fmt.Errorf("read the %q Keychain item; unlock Keychain or run 'claude /login': %w", keychainService, err)
 	}
 	return parseCredentials([]byte(strings.TrimSpace(string(contents))))

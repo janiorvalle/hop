@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+
+	"github.com/janiorvalle/hop/internal/provider/livefile"
 )
 
 const recoveryPattern = ".credentials-recovery-*.json"
@@ -60,6 +63,20 @@ func (live LiveFile) Clear() error {
 		return fmt.Errorf("clear live Claude credentials at %s; fix its permissions and retry: %w", live.Path, err)
 	}
 	return nil
+}
+
+// ClearIfMatches removes only the credential object hop previously installed.
+// A replacement written concurrently remains at the live path.
+func (live LiveFile) ClearIfMatches(expected Credentials) error {
+	return livefile.ClearIfMatches(live.Path, "live Claude credentials", func(quarantine string) (bool, error) {
+		actual, err := (LiveFile{Path: quarantine}).Read()
+		return actual.AccessToken == expected.AccessToken &&
+			actual.RefreshToken == expected.RefreshToken &&
+			actual.ExpiresAt == expected.ExpiresAt &&
+			actual.RefreshTokenExpiresAt == expected.RefreshTokenExpiresAt &&
+			actual.SubscriptionType == expected.SubscriptionType &&
+			slices.Equal(actual.Scopes, expected.Scopes), err
+	})
 }
 
 func replaceFileInExistingDirectory(path string, contents []byte, description string) error {

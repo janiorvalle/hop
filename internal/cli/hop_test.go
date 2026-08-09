@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,14 +143,280 @@ func TestFirstCodexSwitchRefusesToDiscardAnUnenrolledLiveAccount(t *testing.T) {
 	}
 }
 
+func TestFreshCodexInstallationRequiresProviderDirectoryThenSwitchesFromAbsence(t *testing.T) {
+	hopHome := t.TempDir()
+	providerHome := t.TempDir()
+	providerDirectory := filepath.Join(providerHome, ".codex")
+	livePath := filepath.Join(providerDirectory, "auth.json")
+	t.Setenv("HOP_HOME", hopHome)
+	t.Setenv("HOME", providerHome)
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv(codexAuthFileOverride, "")
+
+	accountVault, err := vault.New(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	login := loginManager{
+		vault: accountVault,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codexCredentials("work"))
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.test", nil
+		},
+	}
+	if err := login.Login(context.Background(), "codex", "work", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+
+	var stderr bytes.Buffer
+	if exitCode := Run([]string{"codex", "work"}, io.Discard, &stderr); exitCode == 0 {
+		t.Fatal("Run(codex work) succeeded before Codex created its directory")
+	}
+	if got := stderr.String(); !strings.Contains(got, "Codex has never run") || !strings.Contains(got, "codex --version") || !strings.Contains(got, "private (0700) permissions") {
+		t.Fatalf("stderr = %q, want run-Codex-once guidance", got)
+	}
+	if _, err := os.Stat(providerDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider directory was created by hop: %v", err)
+	}
+
+	if err := os.Mkdir(providerDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	stderr.Reset()
+	if exitCode := Run([]string{"codex", "work"}, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("Run(codex work) exit code = %d, want 0; stderr = %q", exitCode, stderr.String())
+	}
+	written, err := (codex.LiveFile{Path: livePath}).Read()
+	if err != nil || written.AccountID != codexCredentials("work").AccountID {
+		t.Fatalf("live Codex credentials = %+v, error = %v; want enrolled work account", written, err)
+	}
+	activeState, err := state.Load(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active, found := activeState.Active("codex"); !found || active != "work" {
+		t.Fatalf("active Codex account = %q, %t; want work, true", active, found)
+	}
+	accountCatalog, err := defaultCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := accountCatalog.Accounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].Name != "work" || !accounts[0].Active {
+		t.Fatalf("glance catalog accounts = %+v, want active Codex work account", accounts)
+	}
+}
+
+func TestFreshClaudeFileInstallationRequiresProviderDirectoryThenSwitchesFromAbsence(t *testing.T) {
+	hopHome := t.TempDir()
+	providerDirectory := filepath.Join(t.TempDir(), ".claude")
+	livePath := filepath.Join(providerDirectory, ".credentials.json")
+	t.Setenv("HOP_HOME", hopHome)
+	t.Setenv(claudeCredentialsFileOverride, livePath)
+	t.Setenv(claudeAccountEmailOverride, "owner@example.test")
+
+	accountVault, err := vault.New(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSlot(t, accountVault, "work", claudeCredentials("work"))
+
+	var stderr bytes.Buffer
+	if exitCode := Run([]string{"claude", "work"}, io.Discard, &stderr); exitCode == 0 {
+		t.Fatal("Run(claude work) succeeded before Claude created its directory")
+	}
+	if got := stderr.String(); !strings.Contains(got, "Claude has never run") || !strings.Contains(got, "claude doctor") || !strings.Contains(got, "private (0700) permissions") {
+		t.Fatalf("stderr = %q, want run-Claude-once guidance", got)
+	}
+	if _, err := os.Stat(providerDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider directory was created by hop: %v", err)
+	}
+
+	if err := os.Mkdir(providerDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if exitCode := Run([]string{"claude", "work"}, io.Discard, &stderr); exitCode != 0 {
+		t.Fatalf("Run(claude work) exit code = %d, want 0; stderr = %q", exitCode, stderr.String())
+	}
+	written, err := (claude.LiveFile{Path: livePath}).Read()
+	if err != nil || written.AccessToken != claudeCredentials("work").AccessToken {
+		t.Fatalf("live Claude credentials = %+v, error = %v; want enrolled work account", written, err)
+	}
+}
+
+func TestSwitchMissingCodexLiveFileRollsBackToAbsence(t *testing.T) {
+	manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	codexLive.readErr = os.ErrNotExist
+	stateStore.failSaves = 1
+
+	err := manager.Switch(context.Background(), "codex", "work")
+	if err == nil || !strings.Contains(err.Error(), "previous live credentials were restored") {
+		t.Fatalf("Switch() error = %v, want rollback confirmation", err)
+	}
+	if codexLive.clears != 1 {
+		t.Fatalf("Codex live clears = %d, want 1", codexLive.clears)
+	}
+	if !errors.Is(codexLive.readErr, os.ErrNotExist) {
+		t.Fatalf("Codex live read error = %v, want absent credentials after rollback", codexLive.readErr)
+	}
+	if _, found := stateStore.value.Active("codex"); found {
+		t.Fatal("Codex active state was recorded after rollback")
+	}
+}
+
+func TestSwitchMissingLiveFileRestoresPreexistingActiveStateOnFailure(t *testing.T) {
+	manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "old", codexCredentials("old"))
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	stateStore.value.SetActive("codex", "old")
+	codexLive.readErr = os.ErrNotExist
+	stateStore.failSaves = 1
+
+	err := manager.Switch(context.Background(), "codex", "work")
+	if err == nil || !strings.Contains(err.Error(), "previous live credentials were restored") {
+		t.Fatalf("Switch() error = %v, want rollback confirmation", err)
+	}
+	if active, found := stateStore.value.Active("codex"); !found || active != "old" {
+		t.Fatalf("active Codex account = %q, %t; want restored old, true", active, found)
+	}
+}
+
+func TestSwitchMissingClaudeLiveCredentialsRollsBackToAbsence(t *testing.T) {
+	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+	writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+	claudeLive.readErr = os.ErrNotExist
+	stateStore.failSaves = 1
+
+	err := manager.Switch(context.Background(), "claude", "work")
+	if err == nil || !strings.Contains(err.Error(), "previous live credentials were restored") {
+		t.Fatalf("Switch() error = %v, want rollback confirmation", err)
+	}
+	if claudeLive.clears != 1 {
+		t.Fatalf("Claude live clears = %d, want 1", claudeLive.clears)
+	}
+	if !errors.Is(claudeLive.readErr, os.ErrNotExist) {
+		t.Fatalf("Claude live read error = %v, want absent credentials after rollback", claudeLive.readErr)
+	}
+}
+
+func TestSwitchRefusesCorruptLiveFileWithoutOverwritingIt(t *testing.T) {
+	hopHome := t.TempDir()
+	providerDirectory := t.TempDir()
+	livePath := filepath.Join(providerDirectory, "auth.json")
+	t.Setenv("HOP_HOME", hopHome)
+	t.Setenv(codexAuthFileOverride, livePath)
+	accountVault, err := vault.New(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCodexSlot(t, accountVault, "work", codexCredentials("work"))
+	corrupt := []byte("{not-json\n")
+	if err := os.WriteFile(livePath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	if exitCode := Run([]string{"codex", "work"}, io.Discard, &stderr); exitCode == 0 {
+		t.Fatal("Run(codex work) overwrote corrupt live credentials")
+	}
+	if !strings.Contains(stderr.String(), "read the current live Codex credentials before switching") {
+		t.Fatalf("stderr = %q, want corrupt-live-file refusal", stderr.String())
+	}
+	assertFileContents(t, livePath, string(corrupt))
+	activeState, err := state.Load(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := activeState.Active("codex"); found {
+		t.Fatal("Codex active state changed after corrupt-live-file refusal")
+	}
+}
+
+func TestRecoverInterruptedSwitchRestoresMissingCodexLiveFile(t *testing.T) {
+	manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	codexLive.credentials = codexCredentials("work")
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:      "codex",
+		Target:        "work",
+		LiveWasAbsent: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := manager.recoverInterruptedSwitch(context.Background())
+	if err != nil || !recovered {
+		t.Fatalf("recoverInterruptedSwitch() = %t, %v; want true, nil", recovered, err)
+	}
+	if codexLive.clears != 1 || !errors.Is(codexLive.readErr, os.ErrNotExist) {
+		t.Fatalf("Codex live clear state = %d, %v; want one clear and missing credentials", codexLive.clears, codexLive.readErr)
+	}
+	if _, found := stateStore.value.Active("codex"); found {
+		t.Fatal("Codex active state remains after recovery to absence")
+	}
+}
+
+func TestRecoverInterruptedAbsentSwitchPreservesUnexpectedLiveLogin(t *testing.T) {
+	manager, _, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	codexLive.credentials = codexCredentials("new-login")
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:      "codex",
+		Target:        "work",
+		LiveWasAbsent: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := manager.recoverInterruptedSwitch(context.Background())
+	if err == nil || recovered || !strings.Contains(err.Error(), "left the unexpected login untouched") {
+		t.Fatalf("recoverInterruptedSwitch() = %t, %v; want a refusal that preserves the unexpected login", recovered, err)
+	}
+	if codexLive.clears != 0 || codexLive.credentials.AccountID != codexCredentials("new-login").AccountID {
+		t.Fatalf("unexpected live login changed: clears = %d, credentials = %+v", codexLive.clears, codexLive.credentials)
+	}
+	if _, statErr := os.Stat(manager.transactionPath()); statErr != nil {
+		t.Fatalf("transaction was removed after refused recovery: %v", statErr)
+	}
+}
+
+func TestSwitchTransactionAllowsMissingPreviousAccountOnlyForAbsentLiveCredentials(t *testing.T) {
+	absentPrevious := switchTransaction{Steps: []switchTransactionStep{{Provider: "codex", Target: "work", LiveWasAbsent: true}}}
+	if err := validateSwitchTransaction(absentPrevious); err != nil {
+		t.Fatalf("validateSwitchTransaction(absent previous) error = %v", err)
+	}
+
+	inconsistent := switchTransaction{Steps: []switchTransactionStep{{Provider: "codex", Target: "work", HadActiveState: true, LiveWasAbsent: true}}}
+	if err := validateSwitchTransaction(inconsistent); err == nil || !strings.Contains(err.Error(), "absent live credential") {
+		t.Fatalf("validateSwitchTransaction(inconsistent) error = %v, want invalid active previous state", err)
+	}
+
+	missingMarker := switchTransaction{Steps: []switchTransactionStep{{Provider: "codex", Target: "work"}}}
+	if err := validateSwitchTransaction(missingMarker); err == nil || !strings.Contains(err.Error(), "absent live credential") {
+		t.Fatalf("validateSwitchTransaction(missing marker) error = %v, want absent-live marker requirement", err)
+	}
+}
+
 func TestSwitchRejectsMissingAndUnusableTargetsWithoutChangingLiveCredentials(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		manager, _, claudeLive, _, _ := newSwitchTestManager(t)
 		claudeLive.credentials = claudeCredentials("live")
 
 		err := manager.Switch(context.Background(), "claude", "missing")
-		if err == nil || !strings.Contains(err.Error(), "hop login claude missing") {
-			t.Fatalf("Switch() error = %v, want login next step", err)
+		if err == nil || !strings.HasPrefix(err.Error(), "did you mean 'hop login claude missing'?") {
+			t.Fatalf("Switch() error = %v, want did-you-mean login next step", err)
 		}
 		if len(claudeLive.writes) != 0 {
 			t.Fatalf("live writes = %d, want 0", len(claudeLive.writes))
@@ -551,10 +818,11 @@ type fakeClaudeKeychain struct {
 	writes      []claude.Credentials
 	clears      int
 	failWrites  int
+	readErr     error
 }
 
 func (store *fakeClaudeKeychain) Read(context.Context) (claude.Credentials, error) {
-	return store.credentials, nil
+	return store.credentials, store.readErr
 }
 
 func (store *fakeClaudeKeychain) Write(_ context.Context, credentials claude.Credentials) error {
@@ -564,23 +832,40 @@ func (store *fakeClaudeKeychain) Write(_ context.Context, credentials claude.Cre
 		return errors.New("fake Keychain write failed")
 	}
 	store.credentials = credentials
+	store.readErr = nil
 	return nil
 }
 
 func (store *fakeClaudeKeychain) Clear(context.Context) error {
 	store.clears++
 	store.credentials = claude.Credentials{}
+	store.readErr = os.ErrNotExist
 	return nil
+}
+
+func (store *fakeClaudeKeychain) ClearIfMatches(_ context.Context, expected claude.Credentials) error {
+	if errors.Is(store.readErr, os.ErrNotExist) {
+		return nil
+	}
+	if store.readErr != nil {
+		return store.readErr
+	}
+	if store.credentials.AccessToken != expected.AccessToken || store.credentials.RefreshToken != expected.RefreshToken {
+		return errors.New("live Claude credentials changed; hop left the unexpected login untouched")
+	}
+	return store.Clear(context.Background())
 }
 
 type fakeCodexLiveStore struct {
 	credentials codex.Credentials
 	writes      []codex.Credentials
+	clears      int
 	failWrites  int
+	readErr     error
 }
 
 func (store *fakeCodexLiveStore) Read() (codex.Credentials, error) {
-	return store.credentials, nil
+	return store.credentials, store.readErr
 }
 
 func (store *fakeCodexLiveStore) Write(credentials codex.Credentials) error {
@@ -590,6 +875,23 @@ func (store *fakeCodexLiveStore) Write(credentials codex.Credentials) error {
 		return errors.New("fake auth.json write failed")
 	}
 	store.credentials = credentials
+	store.readErr = nil
+	return nil
+}
+
+func (store *fakeCodexLiveStore) ClearIfMatches(expected codex.Credentials) error {
+	if errors.Is(store.readErr, os.ErrNotExist) {
+		return nil
+	}
+	if store.readErr != nil {
+		return store.readErr
+	}
+	if store.credentials != expected {
+		return errors.New("live Codex credentials changed; hop left the unexpected login untouched")
+	}
+	store.clears++
+	store.credentials = codex.Credentials{}
+	store.readErr = os.ErrNotExist
 	return nil
 }
 
