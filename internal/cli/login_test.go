@@ -558,6 +558,47 @@ func TestLoginClaudeStagesNewAccountWhenStatusEmailIsStale(t *testing.T) {
 	}
 }
 
+// Slots are default-deny: an account seeded by hand stays read-only until
+// 'hop login' takes custody of it. Matching tokens must not let staging adopt
+// one, or the stale cached email would be stamped onto a slot hop never
+// enrolled.
+func TestLoginClaudeRefusesToAdoptHandSeededActiveSlotOnMatchingTokens(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	activeState := state.New()
+	activeState.SetActive("claude", "seeded")
+	if err := activeState.Save(accountVault.Root()); err != nil {
+		t.Fatalf("state.Save() error = %v", err)
+	}
+	seeded := claude.Credentials{AccessToken: "seeded", RefreshToken: "seeded-refresh"}
+	credentialsPath, _ := accountVault.CredentialsPath("claude", "seeded")
+	if err := (claude.FileStore{Path: credentialsPath}).Write(seeded); err != nil {
+		t.Fatalf("seed Claude slot: %v", err)
+	}
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: &fakeClaudeLiveStore{credentials: seeded},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("runner called for a hand-seeded active slot")
+			return nil
+		}),
+		stdout:      io.Discard,
+		stderr:      io.Discard,
+		getenv:      func(string) string { return "approved" },
+		claudeEmail: func(context.Context) (string, error) { return "stale@example.com", nil },
+	}
+
+	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "explicitly adopt the current live login") {
+		t.Fatalf("Login() error = %v, want the explicit-adoption instruction", err)
+	}
+	metadataPath := filepath.Join(filepath.Dir(credentialsPath), slotMetadataFilename)
+	if _, statErr := os.Stat(metadataPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("hand-seeded slot metadata = %v, want the slot left unmanaged", statErr)
+	}
+}
+
 // The first live enrollment ran 'claude auth logout', which revoked the grant
 // on Anthropic's side and killed the copy hop had just stashed into the active
 // account's slot. Staging must clear the live login locally instead, and only

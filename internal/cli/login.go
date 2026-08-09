@@ -482,7 +482,7 @@ func (manager loginManager) confirmActiveClaudeSlot(ctx context.Context, account
 	// account changed and its recorded email outranks `claude auth status`,
 	// whose cached email still names the previous account right after a hop
 	// switch. Stamping that stale email here would poison a healthy slot.
-	if recordedEmail, matched := manager.matchedClaudeSlotEmail(accountName, credentials); matched && recordedEmail != "" {
+	if recordedEmail, recorded := manager.recordedClaudeSlotEmail(accountName, credentials); recorded && recordedEmail != "" {
 		email = recordedEmail
 	}
 	if err := manager.saveClaudeSlot(accountName, email, credentials); err != nil {
@@ -503,7 +503,7 @@ func (manager loginManager) confirmActiveClaudeSlot(ctx context.Context, account
 // The email answers only the case tokens cannot: a live login that rotated
 // outside hop.
 func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail string, liveCredentials claude.Credentials) (string, error) {
-	if recordedEmail, matched := manager.matchedClaudeSlotEmail(accountName, liveCredentials); matched {
+	if recordedEmail, recorded := manager.recordedClaudeSlotEmail(accountName, liveCredentials); recorded {
 		if recordedEmail != "" {
 			return recordedEmail, nil
 		}
@@ -533,12 +533,16 @@ func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail st
 	return "", fmt.Errorf("claude auth status did not provide an email and the live credentials no longer match active account %q; run 'hop login claude %s' to explicitly confirm the current live login, then retry the new account", accountName, accountName)
 }
 
-// matchedClaudeSlotEmail reports whether the slot recorded for accountName
-// holds exactly the live credentials, and with it the email hop recorded for
-// that slot (empty when the slot has no readable metadata). Callers that need
-// to explain a non-match read the slot themselves so the failure keeps its
-// repair instructions.
-func (manager loginManager) matchedClaudeSlotEmail(accountName string, liveCredentials claude.Credentials) (string, bool) {
+// recordedClaudeSlotEmail reports whether the slot hop recorded for
+// accountName holds exactly the live credentials, and with it the email
+// recorded there (empty when hop enrolled that slot without one).
+//
+// A slot with no readable metadata is never a match. Slots are default-deny:
+// one seeded by hand stays read-only until 'hop login' takes custody of it, so
+// matching tokens alone must not let a caller adopt it — the caller keeps its
+// explicit-adoption error instead. Callers that explain a non-match read the
+// slot themselves so the failure keeps its repair instructions.
+func (manager loginManager) recordedClaudeSlotEmail(accountName string, liveCredentials claude.Credentials) (string, bool) {
 	slotPath, err := manager.vault.SlotPath("claude", accountName)
 	if err != nil {
 		return "", false
@@ -552,11 +556,11 @@ func (manager loginManager) matchedClaudeSlotEmail(accountName string, liveCrede
 	}
 	contents, err := os.ReadFile(filepath.Join(slotPath, slotMetadataFilename))
 	if err != nil {
-		return "", true
+		return "", false
 	}
 	var metadata slotMetadata
 	if err := json.Unmarshal(contents, &metadata); err != nil {
-		return "", true
+		return "", false
 	}
 	return strings.TrimSpace(metadata.Email), true
 }
