@@ -223,6 +223,14 @@ func TestClearLiveCredentialsIfMatchesRefusesNonConditionalKeychainDelete(t *tes
 	security := &fakeSecurity{outputs: [][]byte{contents}}
 	err = clearLiveCredentialsIfMatches(context.Background(), security, credentials)
 	if err == nil || !strings.Contains(err.Error(), "cannot delete it conditionally") {
-		t.Fatalf("ClearLiveCredentialsIfMatches() error = %v, want safe manual-logout guidance", err)
+		t.Fatalf("ClearLiveCredentialsIfMatches() error = %v, want the non-conditional Keychain refusal", err)
+	}
+	if !strings.Contains(err.Error(), "security delete-generic-password -s \""+keychainService+"\"") {
+		t.Fatalf("ClearLiveCredentialsIfMatches() error = %v, want the local Keychain deletion step", err)
+	}
+	// Signing out revokes the OAuth grant server-side, which would destroy the
+	// copies hop stashed for every other slot.
+	if strings.Contains(err.Error(), "auth logout") {
+		t.Fatalf("ClearLiveCredentialsIfMatches() error = %v, want no sign-out recommendation", err)
 	}
 }

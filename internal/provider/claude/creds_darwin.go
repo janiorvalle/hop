@@ -75,7 +75,10 @@ func clearLiveCredentialsIfMatches(ctx context.Context, security securityCommand
 	if live.AccessToken != expected.AccessToken || live.RefreshToken != expected.RefreshToken {
 		return fmt.Errorf("the live Claude Keychain item changed before hop could restore its previous absence; hop left the unexpected login untouched")
 	}
-	return fmt.Errorf("the Claude Keychain item still contains the target login, but Keychain cannot delete it conditionally; run 'claude auth logout', then retry hop to finish restoring the previous absence")
+	// Deleting the item locally leaves the OAuth grant intact, so the copies hop
+	// stashed for other slots keep working; signing out of Claude would revoke it
+	// server-side and force every slot to enroll again.
+	return fmt.Errorf("the Claude Keychain item still contains the target login, but Keychain cannot delete it conditionally; delete the item yourself without signing out of Claude — open Keychain Access and delete the %q item, or run 'security delete-generic-password -s %q' — then retry hop to finish restoring the previous absence", keychainService, keychainService)
 }
 
 func readLiveCredentials(ctx context.Context, security securityCommander) (Credentials, error) {
