@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func TestFetchGlanceRunsAccountsInParallelAndIsolatesErrors(t *testing.T) {
 	}
 	catalog := staticCatalog{
 		{Provider: provider.Claude, Name: "work", Active: true, Fetcher: blocking(provider.Usage{Provider: provider.Claude, Windows: []provider.Window{}}, nil)},
-		{Provider: provider.Codex, Name: "broken", Fetcher: blocking(provider.Usage{}, errors.New("token expired"))},
+		{Provider: provider.Codex, Name: "broken", Fetcher: blocking(provider.Usage{}, errors.New("token expired; refresh the account token and retry"))},
 	}
 	type response struct {
 		document glanceDocument
@@ -81,8 +82,41 @@ func TestFetchGlanceRunsAccountsInParallelAndIsolatesErrors(t *testing.T) {
 		t.Errorf("first account = %+v, want successful work", result.document.Accounts[0])
 	}
 	problem := result.document.Accounts[1].Error
-	if problem == nil || problem.Code != "USAGE_UNAVAILABLE" || problem.Action != "Run 'hop login codex broken', then retry." {
+	if problem == nil || problem.Code != "USAGE_UNAVAILABLE" || problem.Action != "token expired; refresh the account token and retry" {
 		t.Fatalf("broken account problem = %+v", problem)
+	}
+}
+
+func TestShowAccountsIncludesUnderlyingUsageError(t *testing.T) {
+	t.Parallel()
+
+	catalog := staticCatalog{{
+		Provider: provider.Claude,
+		Name:     "work2",
+		Fetcher: fetchFunc(func(context.Context) (provider.Usage, error) {
+			return provider.Usage{}, errors.New("Claude usage returned HTTP 429; wait and retry")
+		}),
+	}}
+	for _, asJSON := range []bool{false, true} {
+		var output bytes.Buffer
+		if err := showAccountsFrom(context.Background(), &output, asJSON, catalog, time.Now()); err != nil {
+			t.Fatalf("showAccountsFrom(asJSON=%t) error = %v", asJSON, err)
+		}
+		if !bytes.Contains(output.Bytes(), []byte("Claude usage returned HTTP 429; wait and retry")) {
+			t.Fatalf("showAccountsFrom(asJSON=%t) output omitted cause: %s", asJSON, output.String())
+		}
+		if bytes.Contains(output.Bytes(), []byte("hop login")) {
+			t.Fatalf("showAccountsFrom(asJSON=%t) output gave unrelated login advice: %s", asJSON, output.String())
+		}
+	}
+}
+
+func TestShowAccountsSubstitutesTheFailedAccountInRecoveryCommands(t *testing.T) {
+	t.Parallel()
+
+	problem := usageProblem(account{Provider: provider.Claude, Name: "work2"}, errors.New("access token is missing; run 'hop login claude <account>'"))
+	if strings.Contains(problem.Action, "<account>") || !strings.Contains(problem.Action, "hop login claude work2") {
+		t.Fatalf("usage problem action = %q, want runnable work2 command", problem.Action)
 	}
 }
 
@@ -164,6 +198,32 @@ func TestShowAccountsJSONHasStableSchemaAndEmptyArrays(t *testing.T) {
 	}
 	if _, ok := account["limits"].([]any); !ok {
 		t.Fatalf("limits = %#v, want JSON array", account["limits"])
+	}
+}
+
+func TestShowAccountsJSONOmitsMissingResets(t *testing.T) {
+	t.Parallel()
+
+	catalog := staticCatalog{{
+		Provider: provider.Claude,
+		Name:     "idle",
+		Fetcher: fetchFunc(func(context.Context) (provider.Usage, error) {
+			return provider.Usage{
+				Provider: provider.Claude,
+				Windows:  []provider.Window{{Kind: provider.FiveHour, UsedPercent: 0}},
+				Limits:   []provider.Limit{{Kind: "session", Group: "session", UsedPercent: 0}},
+			}, nil
+		}),
+	}}
+	var output bytes.Buffer
+	if err := showAccountsFrom(context.Background(), &output, true, catalog, time.Now()); err != nil {
+		t.Fatalf("showAccountsFrom() error = %v", err)
+	}
+	if bytes.Contains(output.Bytes(), []byte(`"resets_at"`)) {
+		t.Fatalf("JSON exposed absent reset fields: %s", output.String())
+	}
+	if bytes.Contains(output.Bytes(), []byte("0001-01-01")) {
+		t.Fatalf("JSON exposed a year-one reset: %s", output.String())
 	}
 }
 
