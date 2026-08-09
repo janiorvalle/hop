@@ -537,11 +537,12 @@ func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail st
 // accountName holds exactly the live credentials, and with it the email
 // recorded there (empty when hop enrolled that slot without one).
 //
-// A slot with no readable metadata is never a match. Slots are default-deny:
-// one seeded by hand stays read-only until 'hop login' takes custody of it, so
-// matching tokens alone must not let a caller adopt it — the caller keeps its
-// explicit-adoption error instead. Callers that explain a non-match read the
-// slot themselves so the failure keeps its repair instructions.
+// Only a slot hop enrolled — one whose metadata records the managed refresh
+// policy — can match. Slots are default-deny: one seeded by hand stays
+// read-only until 'hop login' takes custody of it, so matching tokens alone
+// must not let a caller adopt it and promote it to managed; the caller keeps
+// its explicit-adoption error instead. Callers that explain a non-match read
+// the slot themselves so the failure keeps its repair instructions.
 func (manager loginManager) recordedClaudeSlotEmail(accountName string, liveCredentials claude.Credentials) (string, bool) {
 	slotPath, err := manager.vault.SlotPath("claude", accountName)
 	if err != nil {
@@ -559,7 +560,7 @@ func (manager loginManager) recordedClaudeSlotEmail(accountName string, liveCred
 		return "", false
 	}
 	var metadata slotMetadata
-	if err := json.Unmarshal(contents, &metadata); err != nil {
+	if err := json.Unmarshal(contents, &metadata); err != nil || metadata.RefreshPolicy != managedRefreshPolicy {
 		return "", false
 	}
 	return strings.TrimSpace(metadata.Email), true

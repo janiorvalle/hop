@@ -565,37 +565,62 @@ func TestLoginClaudeStagesNewAccountWhenStatusEmailIsStale(t *testing.T) {
 func TestLoginClaudeRefusesToAdoptHandSeededActiveSlotOnMatchingTokens(t *testing.T) {
 	t.Parallel()
 
-	accountVault := newTestVault(t)
-	activeState := state.New()
-	activeState.SetActive("claude", "seeded")
-	if err := activeState.Save(accountVault.Root()); err != nil {
-		t.Fatalf("state.Save() error = %v", err)
+	testCases := []struct {
+		name     string
+		metadata string
+	}{
+		{name: "no metadata"},
+		{name: "unmanaged metadata", metadata: `{"refresh_policy":"read-only","email":"seeded@example.com"}`},
 	}
-	seeded := claude.Credentials{AccessToken: "seeded", RefreshToken: "seeded-refresh"}
-	credentialsPath, _ := accountVault.CredentialsPath("claude", "seeded")
-	if err := (claude.FileStore{Path: credentialsPath}).Write(seeded); err != nil {
-		t.Fatalf("seed Claude slot: %v", err)
-	}
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: &fakeClaudeLiveStore{credentials: seeded},
-		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
-			t.Fatal("runner called for a hand-seeded active slot")
-			return nil
-		}),
-		stdout:      io.Discard,
-		stderr:      io.Discard,
-		getenv:      func(string) string { return "approved" },
-		claudeEmail: func(context.Context) (string, error) { return "stale@example.com", nil },
-	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "explicitly adopt the current live login") {
-		t.Fatalf("Login() error = %v, want the explicit-adoption instruction", err)
-	}
-	metadataPath := filepath.Join(filepath.Dir(credentialsPath), slotMetadataFilename)
-	if _, statErr := os.Stat(metadataPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("hand-seeded slot metadata = %v, want the slot left unmanaged", statErr)
+			accountVault := newTestVault(t)
+			activeState := state.New()
+			activeState.SetActive("claude", "seeded")
+			if err := activeState.Save(accountVault.Root()); err != nil {
+				t.Fatalf("state.Save() error = %v", err)
+			}
+			seeded := claude.Credentials{AccessToken: "seeded", RefreshToken: "seeded-refresh"}
+			credentialsPath, _ := accountVault.CredentialsPath("claude", "seeded")
+			if err := (claude.FileStore{Path: credentialsPath}).Write(seeded); err != nil {
+				t.Fatalf("seed Claude slot: %v", err)
+			}
+			metadataPath := filepath.Join(filepath.Dir(credentialsPath), slotMetadataFilename)
+			if testCase.metadata != "" {
+				if err := os.WriteFile(metadataPath, []byte(testCase.metadata), 0o600); err != nil {
+					t.Fatalf("seed slot metadata: %v", err)
+				}
+			}
+			manager := loginManager{
+				vault:      accountVault,
+				claudeLive: &fakeClaudeLiveStore{credentials: seeded},
+				runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+					t.Fatal("runner called for a hand-seeded active slot")
+					return nil
+				}),
+				stdout:      io.Discard,
+				stderr:      io.Discard,
+				getenv:      func(string) string { return "approved" },
+				claudeEmail: func(context.Context) (string, error) { return "stale@example.com", nil },
+			}
+
+			err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+			if err == nil || !strings.Contains(err.Error(), "adopt the current live login") {
+				t.Fatalf("Login() error = %v, want the explicit-adoption instruction", err)
+			}
+			contents, readErr := os.ReadFile(metadataPath)
+			if testCase.metadata == "" {
+				if !errors.Is(readErr, os.ErrNotExist) {
+					t.Fatalf("hand-seeded slot metadata = %q, %v; want the slot left unmanaged", contents, readErr)
+				}
+				return
+			}
+			if readErr != nil || string(contents) != testCase.metadata {
+				t.Fatalf("hand-seeded slot metadata = %q, %v; want it left as seeded", contents, readErr)
+			}
+		})
 	}
 }
 
