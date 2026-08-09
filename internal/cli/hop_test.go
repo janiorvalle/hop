@@ -568,6 +568,214 @@ func TestSwitchRecoversInterruptedInstallBeforeCopyingBackAgain(t *testing.T) {
 	}
 }
 
+func TestSwitchRecoveryPreservesHumanRepairedCodexLogin(t *testing.T) {
+	testCases := []struct {
+		name          string
+		accountID     string
+		activeAccount string
+	}{
+		{name: "different identity", accountID: "repaired-account"},
+		{name: "rotated target identity", accountID: "work-account", activeAccount: "work"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+			writeCodexSlot(t, manager.vault, "old", codexCredentials("old"))
+			writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+			stateStore.value.SetActive("codex", "old")
+			codexLive.credentials = codexCredentials("repaired")
+			codexLive.credentials.AccountID = testCase.accountID
+			transaction := switchTransaction{Steps: []switchTransactionStep{{
+				Provider:       "codex",
+				Previous:       "old",
+				Target:         "work",
+				HadActiveState: true,
+			}}}
+			if err := manager.writeSwitchTransaction(transaction); err != nil {
+				t.Fatal(err)
+			}
+
+			recovered, err := manager.recoverInterruptedSwitch(context.Background())
+			if err != nil {
+				t.Fatalf("recoverInterruptedSwitch() error = %v", err)
+			}
+			if !recovered {
+				t.Fatal("recoverInterruptedSwitch() recovered = false, want true")
+			}
+			if codexLive.credentials.AccessToken != "repaired-access" {
+				t.Fatalf("live Codex access token = %q, want repaired-access", codexLive.credentials.AccessToken)
+			}
+			if len(codexLive.writes) != 0 {
+				t.Fatalf("live Codex writes = %d, want 0 for a repaired login", len(codexLive.writes))
+			}
+			activeAccount, isActive := stateStore.value.Active("codex")
+			if activeAccount != testCase.activeAccount || isActive != (testCase.activeAccount != "") {
+				t.Fatalf("active Codex account = %q, %v; want %q", activeAccount, isActive, testCase.activeAccount)
+			}
+		})
+	}
+}
+
+func TestSwitchRecoveryPreservesHumanRepairedClaudeLogin(t *testing.T) {
+	testCases := []struct {
+		name          string
+		email         string
+		activeAccount string
+	}{
+		{name: "different identity", email: "repaired@example.test"},
+		{name: "rotated previous identity", email: "old@example.test", activeAccount: "old"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+			writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
+			writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+			for accountName, email := range map[string]string{
+				"old":  "old@example.test",
+				"work": "work@example.test",
+			} {
+				slotPath, err := manager.vault.SlotPath("claude", accountName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := writeManagedSlotMetadata(slotPath, email); err != nil {
+					t.Fatal(err)
+				}
+			}
+			manager.claudeEmail = func(context.Context) (string, error) {
+				return testCase.email, nil
+			}
+			stateStore.value.SetActive("claude", "old")
+			claudeLive.credentials = claudeCredentials("repaired")
+			transaction := switchTransaction{Steps: []switchTransactionStep{{
+				Provider:       "claude",
+				Previous:       "old",
+				Target:         "work",
+				HadActiveState: true,
+			}}}
+			if err := manager.writeSwitchTransaction(transaction); err != nil {
+				t.Fatal(err)
+			}
+
+			recovered, err := manager.recoverInterruptedSwitch(context.Background())
+			if err != nil {
+				t.Fatalf("recoverInterruptedSwitch() error = %v", err)
+			}
+			if !recovered {
+				t.Fatal("recoverInterruptedSwitch() recovered = false, want true")
+			}
+			if claudeLive.credentials.AccessToken != "repaired-access" {
+				t.Fatalf("live Claude access token = %q, want repaired-access", claudeLive.credentials.AccessToken)
+			}
+			if len(claudeLive.writes) != 0 {
+				t.Fatalf("live Claude writes = %d, want 0 for a repaired login", len(claudeLive.writes))
+			}
+			activeAccount, isActive := stateStore.value.Active("claude")
+			if activeAccount != testCase.activeAccount || isActive != (testCase.activeAccount != "") {
+				t.Fatalf("active Claude account = %q, %v; want %q", activeAccount, isActive, testCase.activeAccount)
+			}
+		})
+	}
+}
+
+func TestSwitchRecoveryLeavesLiveCredentialsUntouchedWhenTargetSlotIsUnreadable(t *testing.T) {
+	t.Run("Claude", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		stateStore.value.SetActive("claude", "old")
+		claudeLive.credentials = claudeCredentials("repaired")
+		writeUnreadableTransactionTarget(t, manager, "claude")
+
+		_, err := manager.recoverInterruptedSwitch(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "live credentials were left unchanged") {
+			t.Fatalf("recoverInterruptedSwitch() error = %v, want unchanged-live guidance", err)
+		}
+		if claudeLive.credentials.AccessToken != "repaired-access" || len(claudeLive.writes) != 0 {
+			t.Fatalf("live Claude = %#v with %d writes, want repaired credentials with no writes", claudeLive.credentials, len(claudeLive.writes))
+		}
+	})
+
+	t.Run("Codex", func(t *testing.T) {
+		manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+		writeCodexSlot(t, manager.vault, "old", codexCredentials("old"))
+		writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+		stateStore.value.SetActive("codex", "old")
+		codexLive.credentials = codexCredentials("repaired")
+		writeUnreadableTransactionTarget(t, manager, "codex")
+
+		_, err := manager.recoverInterruptedSwitch(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "live credentials were left unchanged") {
+			t.Fatalf("recoverInterruptedSwitch() error = %v, want unchanged-live guidance", err)
+		}
+		if codexLive.credentials.AccessToken != "repaired-access" || len(codexLive.writes) != 0 {
+			t.Fatalf("live Codex = %#v with %d writes, want repaired credentials with no writes", codexLive.credentials, len(codexLive.writes))
+		}
+	})
+}
+
+func writeUnreadableTransactionTarget(t *testing.T, manager switchManager, providerName string) {
+	t.Helper()
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:       providerName,
+		Previous:       "old",
+		Target:         "work",
+		HadActiveState: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+	credentialsPath, err := manager.vault.CredentialsPath(providerName, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentialsPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSwitchRecoveryReclaimsInterruptedRefreshLocks(t *testing.T) {
+	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+	writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
+	writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+	writeClaudeSlot(t, manager.vault, "other", claudeCredentials("other"))
+	stateStore.value.SetActive("claude", "old")
+	claudeLive.credentials = claudeCredentials("work")
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:       "claude",
+		Previous:       "old",
+		Target:         "work",
+		HadActiveState: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(slotPath, ".refresh.lock"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Switch(ctx, "claude", "other"); err != nil {
+		t.Fatalf("Switch() error = %v, want interrupted locks reclaimed immediately", err)
+	}
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(slotPath, ".refresh.lock")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s refresh lock still exists: %v", accountName, err)
+		}
+	}
+}
+
 func TestSwitchRecoveryKeepsCommittedTarget(t *testing.T) {
 	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
 	writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
@@ -586,8 +794,19 @@ func TestSwitchRecoveryKeepsCommittedTarget(t *testing.T) {
 	if err := manager.writeSwitchTransaction(transaction); err != nil {
 		t.Fatal(err)
 	}
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(slotPath, ".refresh.lock"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	if err := manager.Switch(context.Background(), "claude", "work"); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Switch(ctx, "claude", "work"); err != nil {
 		t.Fatalf("Switch() error = %v", err)
 	}
 
@@ -595,6 +814,15 @@ func TestSwitchRecoveryKeepsCommittedTarget(t *testing.T) {
 		t.Fatalf("live Claude access token = %q, want committed target", claudeLive.credentials.AccessToken)
 	}
 	assertClaudeSlot(t, manager.vault, "old", "old")
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(slotPath, ".refresh.lock")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s refresh lock still exists: %v", accountName, err)
+		}
+	}
 }
 
 func TestGlanceRecoversInterruptedSwitchBeforeReadingState(t *testing.T) {

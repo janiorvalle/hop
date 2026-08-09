@@ -647,6 +647,12 @@ func (manager switchManager) recoverInterruptedSwitch(ctx context.Context) (bool
 	if err != nil {
 		return false, err
 	}
+	if err := manager.confirmTransactionLiveTargets(transaction); err != nil {
+		return false, err
+	}
+	if err := manager.reclaimInterruptedRefreshLocks(transaction); err != nil {
+		return false, err
+	}
 	if transaction.Committed {
 		if !transactionMatchesState(transaction, activeState) {
 			return false, fmt.Errorf("finish the committed account switch recorded in %s; active-account state no longer matches its targets, restore the live credentials manually before removing the transaction file", manager.transactionPath())
@@ -657,10 +663,7 @@ func (manager switchManager) recoverInterruptedSwitch(ctx context.Context) (bool
 		return false, nil
 	}
 
-	if err := manager.confirmTransactionLiveTargets(transaction); err != nil {
-		return false, err
-	}
-
+	preservedAccounts := make(map[string]string)
 	for _, step := range transaction.Steps {
 		if step.LiveWasAbsent {
 			if err := manager.restoreAbsentLiveCredentials(ctx, step); err != nil {
@@ -672,10 +675,17 @@ func (manager switchManager) recoverInterruptedSwitch(ctx context.Context) (bool
 		if err != nil {
 			return false, fmt.Errorf("recover the interrupted %s switch; repair the previous account slot %q before retrying: %w", step.Provider, step.Previous, err)
 		}
+		preservedAccount, preserveLive, err := manager.repairedLiveAccount(ctx, step)
+		if err != nil {
+			return false, err
+		}
+		if preserveLive {
+			preservedAccounts[step.Provider] = preservedAccount
+		}
 		switch step.Provider {
 		case "claude":
 			credentials, err := (claude.FileStore{Path: credentialsPath}).Read()
-			if err == nil {
+			if err == nil && !preserveLive {
 				err = manager.claudeLive.Write(ctx, credentials)
 			}
 			if err != nil {
@@ -683,7 +693,7 @@ func (manager switchManager) recoverInterruptedSwitch(ctx context.Context) (bool
 			}
 		case "codex":
 			credentials, err := (codex.FileStore{Path: credentialsPath}).Read()
-			if err == nil {
+			if err == nil && !preserveLive {
 				err = manager.codexLive.Write(credentials)
 			}
 			if err != nil {
@@ -695,6 +705,13 @@ func (manager switchManager) recoverInterruptedSwitch(ctx context.Context) (bool
 	}
 
 	restoredState := previousState(activeState, transaction)
+	for providerName, accountName := range preservedAccounts {
+		if accountName == "" {
+			delete(restoredState.ActiveAccounts, providerName)
+			continue
+		}
+		restoredState.SetActive(providerName, accountName)
+	}
 	if err := manager.state.Save(restoredState); err != nil {
 		return false, fmt.Errorf("recover the interrupted account switch after restoring live credentials; retry hop to restore active-account state: %w", err)
 	}
@@ -721,6 +738,84 @@ func (manager switchManager) restoreAbsentLiveCredentials(ctx context.Context, s
 		return fmt.Errorf("read target account %q before changing the live Codex login; repair its slot and retry: %w", step.Target, err)
 	}
 	return manager.clearCodexLiveIfMatches(installed)
+}
+
+func (manager switchManager) repairedLiveAccount(ctx context.Context, step switchTransactionStep) (string, bool, error) {
+	accounts := uniqueAccounts(step.Previous, step.Target)
+	switch step.Provider {
+	case "claude":
+		liveCredentials, err := manager.claudeLive.Read(ctx)
+		if err != nil {
+			return "", false, nil
+		}
+		for _, accountName := range accounts {
+			credentialsPath, err := manager.vault.CredentialsPath("claude", accountName)
+			if err != nil {
+				return "", false, recoverySlotInspectionError(step.Provider, accountName, err)
+			}
+			recorded, err := (claude.FileStore{Path: credentialsPath}).Read()
+			if err != nil {
+				return "", false, recoverySlotInspectionError(step.Provider, accountName, err)
+			}
+			if recorded.AccessToken == liveCredentials.AccessToken && recorded.RefreshToken == liveCredentials.RefreshToken {
+				return "", false, nil
+			}
+		}
+		for _, accountName := range accounts {
+			if manager.confirmActiveClaudeIdentity(ctx, accountName, liveCredentials) == nil {
+				return accountName, true, nil
+			}
+		}
+		return "", true, nil
+	case "codex":
+		liveCredentials, err := manager.codexLive.Read()
+		if err != nil || strings.TrimSpace(liveCredentials.AccountID) == "" {
+			return "", false, nil
+		}
+		matchedAccount := ""
+		for _, accountName := range accounts {
+			credentialsPath, err := manager.vault.CredentialsPath("codex", accountName)
+			if err != nil {
+				return "", false, recoverySlotInspectionError(step.Provider, accountName, err)
+			}
+			recorded, err := (codex.FileStore{Path: credentialsPath}).Read()
+			if err != nil {
+				return "", false, recoverySlotInspectionError(step.Provider, accountName, err)
+			}
+			if recorded.IDToken == liveCredentials.IDToken &&
+				recorded.AccessToken == liveCredentials.AccessToken &&
+				recorded.RefreshToken == liveCredentials.RefreshToken &&
+				recorded.AccountID == liveCredentials.AccountID {
+				return "", false, nil
+			}
+			if recorded.AccountID == liveCredentials.AccountID {
+				matchedAccount = accountName
+			}
+		}
+		return matchedAccount, true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+func recoverySlotInspectionError(providerName, accountName string, err error) error {
+	return fmt.Errorf("inspect %s account %q while recovering an interrupted switch; live credentials were left unchanged, repair that slot and retry: %w", providerName, accountName, err)
+}
+
+func (manager switchManager) reclaimInterruptedRefreshLocks(transaction switchTransaction) error {
+	for _, step := range transaction.Steps {
+		for _, accountName := range uniqueAccounts(step.Previous, step.Target) {
+			slotPath, err := manager.vault.SlotPath(step.Provider, accountName)
+			if err != nil {
+				return fmt.Errorf("reclaim the interrupted %s switch lock for account %q; repair the transaction or slot name and retry: %w", step.Provider, accountName, err)
+			}
+			lockPath := filepath.Join(slotPath, ".refresh.lock")
+			if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("reclaim the interrupted %s switch lock at %s; check its permissions, remove it if no hop process is running, and retry: %w", step.Provider, lockPath, err)
+			}
+		}
+	}
+	return nil
 }
 
 // confirmTransactionLiveTargets refuses to restore a transaction that was
