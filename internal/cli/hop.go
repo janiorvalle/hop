@@ -817,3 +817,7 @@ func (store claudeFileLiveStore) Read(context.Context) (claude.Credentials, erro
 func (store claudeFileLiveStore) Write(_ context.Context, credentials claude.Credentials) error {
 	return store.store.Write(credentials)
 }
+
+func (store claudeFileLiveStore) Clear(context.Context) error {
+	return store.store.Clear()
+}
