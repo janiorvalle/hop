@@ -259,7 +259,10 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 		return err
 	}
 	defer reservation.Cleanup()
-	if err := manager.saveClaudeSlot(activeAccount, activeSlotEmail, originalCredentials); err != nil {
+	// Copy-back updates the credentials only. The existing slot metadata owns
+	// the custody decision, and staging another account must not promote a
+	// hand-seeded, read-only slot to managed refresh.
+	if err := manager.saveClaudeCredentials(activeAccount, originalCredentials); err != nil {
 		return fmt.Errorf("copy back active Claude account %q before login; the live login was not changed: %w", activeAccount, err)
 	}
 	if err := manager.beginClaudeStaging(activeAccount); err != nil {
@@ -710,14 +713,22 @@ func (manager loginManager) installClaudeSlot(accountName, slotPath, email strin
 }
 
 func (manager loginManager) saveClaudeSlot(accountName, email string, credentials claude.Credentials) error {
+	if err := manager.saveClaudeCredentials(accountName, credentials); err != nil {
+		return err
+	}
 	credentialsPath, err := manager.vault.CredentialsPath("claude", accountName)
 	if err != nil {
 		return err
 	}
-	if err := (claude.FileStore{Path: credentialsPath}).Write(credentials); err != nil {
+	return writeManagedSlotMetadata(filepath.Dir(credentialsPath), email)
+}
+
+func (manager loginManager) saveClaudeCredentials(accountName string, credentials claude.Credentials) error {
+	credentialsPath, err := manager.vault.CredentialsPath("claude", accountName)
+	if err != nil {
 		return err
 	}
-	return writeManagedSlotMetadata(filepath.Dir(credentialsPath), email)
+	return (claude.FileStore{Path: credentialsPath}).Write(credentials)
 }
 
 func (manager loginManager) installCodexSlot(accountName, slotPath string, credentials codex.Credentials, email string) error {

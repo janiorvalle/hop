@@ -508,6 +508,55 @@ func TestLoginClaudeStagesNewAccountAndRestoresActiveLogin(t *testing.T) {
 	}
 }
 
+func TestLoginClaudeStagingPreservesReadOnlyActiveSlotPolicy(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	activeState := state.New()
+	activeState.SetActive("claude", "seeded")
+	if err := activeState.Save(accountVault.Root()); err != nil {
+		t.Fatalf("state.Save() error = %v", err)
+	}
+	original := claude.Credentials{AccessToken: "seeded", RefreshToken: "seeded-refresh"}
+	credentialsPath, _ := accountVault.CredentialsPath("claude", "seeded")
+	if err := (claude.FileStore{Path: credentialsPath}).Write(original); err != nil {
+		t.Fatalf("seed Claude slot: %v", err)
+	}
+	metadataPath := filepath.Join(filepath.Dir(credentialsPath), slotMetadataFilename)
+	if err := os.WriteFile(metadataPath, []byte(`{"refresh_policy":"read-only","email":"seeded@example.com"}`), 0o600); err != nil {
+		t.Fatalf("seed slot metadata: %v", err)
+	}
+	live := &fakeClaudeLiveStore{credentials: original}
+	emailReads := 0
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
+				live.credentials = claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}
+			}
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		getenv: func(string) string { return "approved" },
+		claudeEmail: func(context.Context) (string, error) {
+			emailReads++
+			if emailReads == 1 {
+				return "seeded@example.com", nil
+			}
+			return "personal@example.com", nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if metadata := readSlotMetadata(t, filepath.Dir(credentialsPath)); metadata.RefreshPolicy != "read-only" {
+		t.Fatalf("active slot refresh policy = %q, want read-only", metadata.RefreshPolicy)
+	}
+}
+
 // Right after hop's own switch the Claude CLI still reports the email of the
 // account hop switched away from, while the live Keychain already holds the
 // active slot's tokens. Enrollment must key on those tokens, and must not
