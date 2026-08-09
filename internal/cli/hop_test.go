@@ -149,8 +149,7 @@ func TestFreshCodexInstallationRequiresProviderDirectoryThenSwitchesFromAbsence(
 	providerDirectory := filepath.Join(providerHome, ".codex")
 	livePath := filepath.Join(providerDirectory, "auth.json")
 	t.Setenv("HOP_HOME", hopHome)
-	t.Setenv("HOME", providerHome)
-	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_HOME", providerDirectory)
 	t.Setenv(codexAuthFileOverride, "")
 
 	accountVault, err := vault.New(hopHome)
