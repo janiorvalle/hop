@@ -82,6 +82,24 @@ func TestTableNarrowUsesOneMeterPerLine(t *testing.T) {
 	}
 }
 
+func TestTableOmitsRegenForIdleWindowWithoutReset(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{{
+		Provider: provider.Claude,
+		Account:  "idle",
+		Windows:  []provider.Window{{Kind: provider.FiveHour, UsedPercent: 0}},
+	}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "CLAUDE\n- idle               5h [--------]   0%\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
 func TestTableNarrowErrorKeepsRecoveryStepOnItsOwnLine(t *testing.T) {
 	t.Parallel()
 

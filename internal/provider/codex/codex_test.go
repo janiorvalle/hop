@@ -79,6 +79,34 @@ func TestFetchUsageClassifiesWindowsByDurationAndParsesEmail(t *testing.T) {
 	}
 }
 
+func TestFetchUsageStatusMatchesTheRecoveryStep(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		statusCode int
+		want       string
+	}{
+		{name: "authentication", statusCode: http.StatusUnauthorized, want: "hop login codex <account>"},
+		{name: "rate limit", statusCode: http.StatusTooManyRequests, want: "wait and retry 'hop ls'"},
+		{name: "provider outage", statusCode: http.StatusServiceUnavailable, want: "usage service is unavailable"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.statusCode)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token", AccountID: "account-id"})
+			if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("FetchUsage() error = %v, want %q recovery", err, testCase.want)
+			}
+		})
+	}
+}
+
 func TestRefreshUsesFormGrantAndPersistsRotation(t *testing.T) {
 	t.Parallel()
 

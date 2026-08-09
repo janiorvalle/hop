@@ -55,6 +55,86 @@ func TestFetchUsageSendsRequiredHeadersAndParsesLimits(t *testing.T) {
 	}
 }
 
+func TestFetchUsageAcceptsIdleWindowAndLimitWithoutReset(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := os.ReadFile("testdata/usage_idle.json")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(fixture)
+	}))
+	t.Cleanup(server.Close)
+
+	usage, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	if got := usage.Windows[0]; got.Kind != provider.FiveHour || got.UsedPercent != 0 || !got.ResetsAt.IsZero() {
+		t.Fatalf("idle five-hour window = %+v, want 0%% with no reset", got)
+	}
+	if got := usage.Limits[0]; got.Kind != "session" || got.UsedPercent != 0 || got.Active || !got.ResetsAt.IsZero() {
+		t.Fatalf("idle session limit = %+v, want inactive 0%% with no reset", got)
+	}
+}
+
+func TestFetchUsageRejectsMissingResetForActiveUsage(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		body string
+	}{
+		{name: "used window", body: `{"five_hour":{"utilization":1,"resets_at":null}}`},
+		{name: "used limit", body: `{"limits":[{"kind":"session","group":"session","percent":1,"resets_at":null,"is_active":false}]}`},
+		{name: "active limit", body: `{"limits":[{"kind":"session","group":"session","percent":0,"resets_at":null,"is_active":true}]}`},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, testCase.body)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token"})
+			if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), "resets_at may be null") {
+				t.Fatalf("FetchUsage() error = %v, want guarded null-reset error", err)
+			}
+		})
+	}
+}
+
+func TestFetchUsageStatusMatchesTheRecoveryStep(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		statusCode int
+		want       string
+	}{
+		{name: "authentication", statusCode: http.StatusUnauthorized, want: "hop login claude <account>"},
+		{name: "rate limit", statusCode: http.StatusTooManyRequests, want: "wait and retry 'hop ls'"},
+		{name: "provider outage", statusCode: http.StatusServiceUnavailable, want: "usage service is unavailable"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.statusCode)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token"})
+			if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("FetchUsage() error = %v, want %q recovery", err, testCase.want)
+			}
+		})
+	}
+}
+
 func TestCredentialFetcherImplementsSharedContract(t *testing.T) {
 	t.Parallel()
 

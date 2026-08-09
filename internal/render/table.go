@@ -171,6 +171,9 @@ func meter(label string, percent float64, resetsAt time.Time, options Options) s
 	if options.Color {
 		value = severityColor(percent) + value + "\x1b[0m"
 	}
+	if resetsAt.IsZero() {
+		return value
+	}
 	return fmt.Sprintf("%s regen %s", value, countdown(options.Now, resetsAt))
 }
 

@@ -127,7 +127,7 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
-		return provider.Usage{}, fmt.Errorf("codex usage returned HTTP %d; run 'hop login codex <account>' and retry: %w", response.StatusCode, ErrUsage)
+		return provider.Usage{}, fmt.Errorf("codex usage returned HTTP %d; %s: %w", response.StatusCode, provider.UsageHTTPAction(provider.Codex, response.StatusCode), ErrUsage)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, responseLimit))
 	if err != nil {

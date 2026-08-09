@@ -141,7 +141,7 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
-		return provider.Usage{}, fmt.Errorf("claude usage returned HTTP %d; run 'hop login claude <account>' and retry: %w", response.StatusCode, ErrUsage)
+		return provider.Usage{}, fmt.Errorf("claude usage returned HTTP %d; %s: %w", response.StatusCode, provider.UsageHTTPAction(provider.Claude, response.StatusCode), ErrUsage)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, responseLimit))
@@ -314,14 +314,23 @@ func parseUsage(body []byte) (provider.Usage, error) {
 		Limits:   make([]provider.Limit, 0, len(response.Limits)),
 	}
 	if response.FiveHour != nil {
+		if response.FiveHour.ResetsAt.IsZero() && response.FiveHour.Utilization != 0 {
+			return provider.Usage{}, fmt.Errorf("decode Claude five-hour usage window; resets_at may be null only while utilization is zero, update hop before retrying: %w", ErrUsage)
+		}
 		usage.Windows = append(usage.Windows, provider.Window{Kind: provider.FiveHour, UsedPercent: response.FiveHour.Utilization, ResetsAt: response.FiveHour.ResetsAt})
 	}
 	if response.SevenDay != nil {
+		if response.SevenDay.ResetsAt.IsZero() && response.SevenDay.Utilization != 0 {
+			return provider.Usage{}, fmt.Errorf("decode Claude seven-day usage window; resets_at may be null only while utilization is zero, update hop before retrying: %w", ErrUsage)
+		}
 		usage.Windows = append(usage.Windows, provider.Window{Kind: provider.Weekly, UsedPercent: response.SevenDay.Utilization, ResetsAt: response.SevenDay.ResetsAt})
 	}
 	for _, limit := range response.Limits {
-		if limit.Kind == "" || limit.Group == "" || limit.ResetsAt.IsZero() {
-			return provider.Usage{}, fmt.Errorf("decode Claude usage response; a limit omitted kind, group, or resets_at, update hop before retrying: %w", ErrUsage)
+		if limit.Kind == "" || limit.Group == "" {
+			return provider.Usage{}, fmt.Errorf("decode Claude usage response; a limit omitted kind or group, update hop before retrying: %w", ErrUsage)
+		}
+		if limit.ResetsAt.IsZero() && (limit.Percent != 0 || limit.Active) {
+			return provider.Usage{}, fmt.Errorf("decode Claude %s limit; resets_at may be null only while percent is zero and the limit is inactive, update hop before retrying: %w", limit.Kind, ErrUsage)
 		}
 		usage.Limits = append(usage.Limits, provider.Limit{
 			Kind:        limit.Kind,

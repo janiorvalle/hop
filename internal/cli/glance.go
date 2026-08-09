@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/janiorvalle/hop/internal/provider"
@@ -81,7 +82,7 @@ func resultFor(account account, usage provider.Usage, err error) accountResult {
 		Limits:   make([]provider.Limit, 0),
 	}
 	if err != nil {
-		result.Error = usageProblem(account.Provider, account.Name)
+		result.Error = usageProblem(account, err)
 		return result
 	}
 	result.Email = usage.Email
@@ -97,11 +98,11 @@ func resultFor(account account, usage provider.Usage, err error) accountResult {
 	return result
 }
 
-func usageProblem(providerName provider.Name, accountName string) *accountProblem {
+func usageProblem(failedAccount account, err error) *accountProblem {
 	return &accountProblem{
 		Code:      "USAGE_UNAVAILABLE",
-		Message:   fmt.Sprintf("Usage could not be loaded for %s account %q.", providerName, accountName),
-		Action:    fmt.Sprintf("Run 'hop login %s %s', then retry.", providerName, accountName),
+		Message:   fmt.Sprintf("Usage could not be loaded for %s account %q.", failedAccount.Provider, failedAccount.Name),
+		Action:    strings.ReplaceAll(err.Error(), "<account>", failedAccount.Name),
 		Retryable: true,
 	}
 }
