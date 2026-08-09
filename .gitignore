@@ -1,0 +1,6 @@
+/dist/
+/evidence/
+.DS_Store
+
+# Local working documents stay out of the clean-cut tree.
+/PLAN.md

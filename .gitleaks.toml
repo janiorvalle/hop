@@ -1,0 +1,11 @@
+title = "hop gitleaks configuration"
+
+[extend]
+useDefault = true
+
+# No allowlist on purpose. hop's fixtures name tokens with hyphenated words
+# such as old-refresh or claude-target-access, which the default rules already
+# ignore because they carry no secret-like entropy. A pattern broad enough to
+# cover that vocabulary would also suppress a real token that happened to sit
+# beside one of those names, so anything added here must allowlist an exact
+# fixture value rather than a shape.

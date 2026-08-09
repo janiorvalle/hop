@@ -1,0 +1,60 @@
+version: 2
+
+project_name: hop
+
+builds:
+  - id: hop
+    main: .
+    binary: hop
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/janiorvalle/hop/internal/cli.Version={{ .Version }}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - ids:
+      - hop
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*feat(\([^)]*\))?:'
+      order: 0
+    - title: Fixes
+      regexp: '^.*fix(\([^)]*\))?:'
+      order: 1
+    - title: Refactoring
+      regexp: '^.*refactor(\([^)]*\))?:'
+      order: 2
+    - title: CI
+      regexp: '^.*ci(\([^)]*\))?:'
+      order: 3
+    - title: Documentation
+      regexp: '^.*docs(\([^)]*\))?:'
+      order: 4
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^test:"
