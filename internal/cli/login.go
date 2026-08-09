@@ -250,7 +250,8 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if activeEmailErr != nil {
 		return fmt.Errorf("confirm the live Claude account before staging; run 'claude auth status --json' to fix the login, then retry: %w", activeEmailErr)
 	}
-	if err := manager.confirmRecordedClaudeIdentity(activeAccount, activeEmail, originalCredentials); err != nil {
+	activeSlotEmail, err := manager.confirmedActiveClaudeEmail(activeAccount, activeEmail, originalCredentials)
+	if err != nil {
 		return err
 	}
 	reservation, err := manager.reserveNewSlot("claude", accountName)
@@ -258,7 +259,7 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 		return err
 	}
 	defer reservation.Cleanup()
-	if err := manager.saveClaudeSlot(activeAccount, activeEmail, originalCredentials); err != nil {
+	if err := manager.saveClaudeSlot(activeAccount, activeSlotEmail, originalCredentials); err != nil {
 		return fmt.Errorf("copy back active Claude account %q before login; the live login was not changed: %w", activeAccount, err)
 	}
 	if err := manager.beginClaudeStaging(activeAccount); err != nil {
@@ -289,12 +290,24 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if newCredentials.RefreshToken == originalCredentials.RefreshToken {
 		return fmt.Errorf("claude login returned the already-active account %q; the previous login will be restored, retry and choose the account for slot %q", activeAccount, accountName)
 	}
+	// The email is the right oracle for the account that just signed in: its
+	// tokens are new by definition, and the Claude CLI refreshed its own config
+	// cache during that browser sign-in, so the status email names the new
+	// account rather than the one hop staged away.
 	newEmail, newEmailErr := manager.claudeEmail(ctx)
 	if newEmailErr != nil {
 		return fmt.Errorf("read the newly logged-in Claude account email before enrollment; the previous login will be restored, run 'claude auth status --json' to fix the login, then retry: %w", newEmailErr)
 	}
-	if newEmail != "" && activeEmail != "" && strings.EqualFold(newEmail, activeEmail) {
-		return fmt.Errorf("claude login returned the already-active identity %s; the previous login will be restored, retry and choose the account for slot %q", activeEmail, accountName)
+	// The slot's recorded email names the active identity, and for a slot hop
+	// enrolled without one the status email read before the sign-in is all
+	// there is. Without that fallback, signing back into the active identity
+	// would enroll it a second time under another name.
+	activeIdentity := activeSlotEmail
+	if activeIdentity == "" {
+		activeIdentity = activeEmail
+	}
+	if newEmail != "" && activeIdentity != "" && strings.EqualFold(newEmail, activeIdentity) {
+		return fmt.Errorf("claude login returned the already-active identity %s; the previous login will be restored, retry and choose the account for slot %q", activeIdentity, accountName)
 	}
 	if duplicateAccount, err := manager.duplicateClaudeAccount(accountName, newEmail, newCredentials); err != nil {
 		return err
@@ -473,6 +486,13 @@ func (manager loginManager) confirmActiveClaudeSlot(ctx context.Context, account
 	if err != nil {
 		return fmt.Errorf("read the current Claude account email before confirming account %q; run 'claude auth status --json' and retry: %w", accountName, err)
 	}
+	// When the slot already holds exactly these credentials, nothing about the
+	// account changed and its recorded email outranks `claude auth status`,
+	// whose cached email still names the previous account right after a hop
+	// switch. Stamping that stale email here would poison a healthy slot.
+	if recordedEmail, recorded := manager.recordedClaudeSlotEmail(accountName, credentials); recorded && recordedEmail != "" {
+		email = recordedEmail
+	}
 	if err := manager.saveClaudeSlot(accountName, email, credentials); err != nil {
 		return fmt.Errorf("confirm the current live Claude login as account %q; the live login was not changed: %w", accountName, err)
 	}
@@ -480,34 +500,79 @@ func (manager loginManager) confirmActiveClaudeSlot(ctx context.Context, account
 	return err
 }
 
-func (manager loginManager) confirmRecordedClaudeIdentity(accountName, liveEmail string, liveCredentials claude.Credentials) error {
+// confirmedActiveClaudeEmail answers which email belongs to active account
+// accountName and refuses when the live login is a different identity.
+//
+// The recorded credentials decide first: `claude auth status` serves liveEmail
+// from the Claude CLI's own config cache (~/.claude.json), which hop never
+// touches, so right after hop installs a different login that email still
+// names the previous account. Whenever the tokens identify the slot, the
+// recorded email is the fresher of the two and is what the copy-back keeps.
+// The email answers only the case tokens cannot: a live login that rotated
+// outside hop.
+func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail string, liveCredentials claude.Credentials) (string, error) {
+	if recordedEmail, recorded := manager.recordedClaudeSlotEmail(accountName, liveCredentials); recorded {
+		// The recorded email answers even when hop enrolled the slot without
+		// one: the credentials already proved the identity, so filling the gap
+		// from the status cache would relabel a healthy slot with whichever
+		// account that cache still names.
+		return recordedEmail, nil
+	}
 	slotPath, err := manager.vault.SlotPath("claude", accountName)
 	if err != nil {
-		return err
+		return "", err
 	}
 	contents, err := os.ReadFile(filepath.Join(slotPath, slotMetadataFilename))
 	if err != nil {
-		return fmt.Errorf("confirm which login belongs to active Claude account %q; run 'hop login claude %s' first to explicitly adopt the current live login: %w", accountName, accountName, err)
+		return "", fmt.Errorf("confirm which login belongs to active Claude account %q; run 'hop login claude %s' first to explicitly adopt the current live login: %w", accountName, accountName, err)
 	}
 	var metadata slotMetadata
 	if err := json.Unmarshal(contents, &metadata); err != nil {
-		return fmt.Errorf("confirm which login belongs to active Claude account %q; run 'hop login claude %s' first to repair its metadata: %w", accountName, accountName, err)
+		return "", fmt.Errorf("confirm which login belongs to active Claude account %q; run 'hop login claude %s' first to repair its metadata: %w", accountName, accountName, err)
 	}
 	if metadata.Email != "" && liveEmail != "" {
 		if strings.EqualFold(metadata.Email, liveEmail) {
-			return nil
+			return liveEmail, nil
 		}
-		return fmt.Errorf("live Claude is signed in as %s, but hop state names %q as %s; restore the recorded account or run 'hop login claude %s' to explicitly adopt the current live login before adding another account", liveEmail, accountName, metadata.Email, accountName)
+		return "", fmt.Errorf("live Claude is signed in as %s, but hop state names %q as %s; restore the recorded account or run 'hop login claude %s' to explicitly adopt the current live login before adding another account", liveEmail, accountName, metadata.Email, accountName)
 	}
-	credentialsPath := filepath.Join(slotPath, vault.CredentialsFilename)
-	recordedCredentials, err := (claude.FileStore{Path: credentialsPath}).Read()
+	if _, err := (claude.FileStore{Path: filepath.Join(slotPath, vault.CredentialsFilename)}).Read(); err != nil {
+		return "", fmt.Errorf("confirm credentials for active Claude account %q; run 'hop login claude %s' first to repair its slot: %w", accountName, accountName, err)
+	}
+	return "", fmt.Errorf("claude auth status did not provide an email and the live credentials no longer match active account %q; run 'hop login claude %s' to explicitly confirm the current live login, then retry the new account", accountName, accountName)
+}
+
+// recordedClaudeSlotEmail reports whether the slot hop recorded for
+// accountName holds exactly the live credentials, and with it the email
+// recorded there (empty when hop enrolled that slot without one).
+//
+// Only a slot hop enrolled — one whose metadata records the managed refresh
+// policy — can match. Slots are default-deny: one seeded by hand stays
+// read-only until 'hop login' takes custody of it, so matching tokens alone
+// must not let a caller adopt it and promote it to managed; the caller keeps
+// its explicit-adoption error instead. Callers that explain a non-match read
+// the slot themselves so the failure keeps its repair instructions.
+func (manager loginManager) recordedClaudeSlotEmail(accountName string, liveCredentials claude.Credentials) (string, bool) {
+	slotPath, err := manager.vault.SlotPath("claude", accountName)
 	if err != nil {
-		return fmt.Errorf("confirm credentials for active Claude account %q; run 'hop login claude %s' first to repair its slot: %w", accountName, accountName, err)
+		return "", false
 	}
-	if recordedCredentials.RefreshToken == liveCredentials.RefreshToken && recordedCredentials.AccessToken == liveCredentials.AccessToken {
-		return nil
+	recorded, err := (claude.FileStore{Path: filepath.Join(slotPath, vault.CredentialsFilename)}).Read()
+	if err != nil {
+		return "", false
 	}
-	return fmt.Errorf("claude auth status did not provide an email and the live credentials no longer match active account %q; run 'hop login claude %s' to explicitly confirm the current live login, then retry the new account", accountName, accountName)
+	if recorded.AccessToken != liveCredentials.AccessToken || recorded.RefreshToken != liveCredentials.RefreshToken {
+		return "", false
+	}
+	contents, err := os.ReadFile(filepath.Join(slotPath, slotMetadataFilename))
+	if err != nil {
+		return "", false
+	}
+	var metadata slotMetadata
+	if err := json.Unmarshal(contents, &metadata); err != nil || metadata.RefreshPolicy != managedRefreshPolicy {
+		return "", false
+	}
+	return strings.TrimSpace(metadata.Email), true
 }
 
 func acquireClaudeLoginLock(ctx context.Context, root string) (func(), error) {
