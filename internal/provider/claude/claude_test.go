@@ -87,7 +87,7 @@ func TestFetchProfileIdentifiesTheBearerTokenOwner(t *testing.T) {
 			t.Errorf("anthropic-beta = %q, want %q", got, betaHeaderValue)
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(writer, `{"account":{"uuid":"account-uuid","email_address":"owner@example.com"},"organization":{"uuid":"shared-org"}}`)
+		_, _ = io.WriteString(writer, `{"account":{"uuid":"account-uuid","email":"owner@example.com"},"organization":{"uuid":"shared-org"}}`)
 	}))
 	t.Cleanup(server.Close)
 

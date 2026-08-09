@@ -278,7 +278,7 @@ type refreshResponse struct {
 type profileResponse struct {
 	Account struct {
 		UUID  string `json:"uuid"`
-		Email string `json:"email_address"`
+		Email string `json:"email"`
 	} `json:"account"`
 }
 
