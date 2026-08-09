@@ -1,17 +1,26 @@
 # hop
 
-`hop` is a small CLI for people juggling multiple Claude Code and Codex
-accounts. One command shows the 5-hour and weekly usage for every account at a
-glance; one more makes any of them the live login. `hop work` switches every
-provider that has a `work` account; `hop claude personal` switches just
-Claude.
+<p align="center">
+  <img src="assets/hero.png" alt="hop — character select for your Claude and Codex accounts. glance. hop. keep playing." width="840">
+</p>
 
-Before it installs the account you asked for, hop copies the current live
-credentials back to the slot they came from, so the login you're leaving is
-never lost. It swaps credentials and nothing else — provider settings, skills,
-and history stay where they are. One caveat: stop running Claude and Codex
-sessions before hopping, since a session already in flight can fail its next
-token refresh.
+You're running a few Claude Code accounts and a few Codex accounts, because
+that's what it takes now. Somewhere around the second "approaching your weekly
+limit" of the day, the question is always the same: which account still has
+room? Logging into each one to check — MFA and all — is nobody's idea of a
+good time.
+
+`hop` answers it in one command. Type `hop` and every account lines up in one
+table — 5-hour and weekly usage, live from the same endpoints the CLIs use.
+Type `hop work` and that account becomes the live login for every provider
+that has one. Character select, for your accounts.
+
+The switch is careful on purpose: before installing the account you asked
+for, hop copies the current live credentials back to the slot they came from,
+so the login you're leaving is never lost. It swaps credentials and nothing
+else — provider settings, skills, and history stay where they are. One
+caveat: stop running Claude and Codex sessions before hopping, since a
+session already in flight can fail its next token refresh.
 
 ## What hop touches (and what it never does)
 
