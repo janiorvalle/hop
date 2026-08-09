@@ -138,6 +138,28 @@ func TestUpgradeRefusesDevelopmentAndDirtyBuildsBeforeNetworkRequest(t *testing.
 	}
 }
 
+func TestUpgradeRefusesBuildsFromACheckoutNoReleaseTagReaches(t *testing.T) {
+	t.Parallel()
+
+	// What Go stamps as the module version for `go build` in a clone: before the
+	// first release tag, past one, and with local changes. Left unresolved these
+	// look like ordinary prereleases to semver.
+	for _, moduleVersion := range []string{
+		"v0.0.0-20260809191616-20013681d086",
+		"v0.0.0-20260809191616-20013681d086+dirty",
+		"v1.4.1-0.20260809192816-aa3f2ca330f0",
+		"v1.4.1-0.20260809192816-aa3f2ca330f0+dirty",
+	} {
+		t.Run(moduleVersion, func(t *testing.T) {
+			t.Parallel()
+			err := runUpgrade(context.Background(), upgradeOptions{currentVersion: resolveVersion("", moduleVersion)})
+			if err == nil || !strings.Contains(err.Error(), "[UPGRADE_DEV_BUILD]") || !strings.Contains(err.Error(), "published release") {
+				t.Fatalf("runUpgrade() error = %v, want release-install guidance", err)
+			}
+		})
+	}
+}
+
 func TestUpgradeExtractsWindowsZip(t *testing.T) {
 	t.Parallel()
 
