@@ -75,8 +75,8 @@ func TestFetchUsageAcceptsIdleWindowAndLimitWithoutReset(t *testing.T) {
 	if got := usage.Windows[0]; got.Kind != provider.FiveHour || got.UsedPercent != 0 || !got.ResetsAt.IsZero() {
 		t.Fatalf("idle five-hour window = %+v, want 0%% with no reset", got)
 	}
-	if got := usage.Limits[0]; got.Kind != "session" || got.UsedPercent != 0 || got.Active || !got.ResetsAt.IsZero() {
-		t.Fatalf("idle session limit = %+v, want inactive 0%% with no reset", got)
+	if got := usage.Limits[0]; got.Kind != "session" || got.UsedPercent != 0 || !got.Active || !got.ResetsAt.IsZero() {
+		t.Fatalf("idle session limit = %+v, want active 0%% with no reset", got)
 	}
 }
 
@@ -89,7 +89,7 @@ func TestFetchUsageRejectsMissingResetForActiveUsage(t *testing.T) {
 	}{
 		{name: "used window", body: `{"five_hour":{"utilization":1,"resets_at":null}}`},
 		{name: "used limit", body: `{"limits":[{"kind":"session","group":"session","percent":1,"resets_at":null,"is_active":false}]}`},
-		{name: "active limit", body: `{"limits":[{"kind":"session","group":"session","percent":0,"resets_at":null,"is_active":true}]}`},
+		{name: "used active limit", body: `{"limits":[{"kind":"session","group":"session","percent":1,"resets_at":null,"is_active":true}]}`},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
