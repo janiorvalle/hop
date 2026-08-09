@@ -19,6 +19,7 @@ Usage:
   hop login <provider> <account>   Add an account
   hop ls [--json]                  List accounts
   hop rm <provider> <account>      Forget an account
+  hop upgrade                      Install the latest verified release
   hop --version                    Show the installed version
   hop help                         Show this help
 
@@ -82,6 +83,11 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return removeAccount(args[1], args[2], stdout)
+	case "upgrade":
+		if len(args) != 1 {
+			return fmt.Errorf("upgrade takes no arguments; try 'hop upgrade'")
+		}
+		return upgradeHop(context.Background(), stdout)
 	case "claude", "codex":
 		if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
 			return fmt.Errorf("%s needs one account; try 'hop %s work'", args[0], args[0])
