@@ -30,6 +30,30 @@ make full
 the macOS, Linux, and Windows matrix, and installs from that snapshot. It takes
 minutes rather than seconds, which is why it's not part of `make fast`.
 
+## Development vs. your real hop
+
+Development builds and the hop you actually use are separate things, and the
+separation is deliberate — a dev build that writes to `~/.hop` can corrupt the
+accounts you switch between every day.
+
+```sh
+make dev                                   # builds dist/hop-dev
+HOP_HOME=/tmp/hop-sandbox ./dist/hop-dev ls
+```
+
+- The development binary is `dist/hop-dev`. It is never named `hop` and never
+  goes on `PATH`, so it cannot shadow the installed one.
+- `~/.local/bin/hop` belongs to `install.sh` and `hop upgrade`. Nothing else
+  writes there — never `go build -o ~/.local/bin/hop`.
+- Every dev run sets `HOP_HOME` to a throwaway directory. A dev build started
+  without it prints a one-line warning to stderr and then proceeds, because
+  sometimes you really do mean it. Released builds never print it.
+- `HOP_HOME` redirects the vault, not the live credentials. Read-only commands
+  like `ls` are fully sandboxed by it; a dev build that actually switches still
+  writes the real `~/.codex/auth.json` and Keychain item unless you also set
+  `HOP_CODEX_AUTH_FILE`, `HOP_CLAUDE_CREDENTIALS_FILE`, and
+  `HOP_CLAUDE_ACCOUNT_EMAIL` — the same overrides the test policy below uses.
+
 ## Test Policy
 
 Tests must never touch real credentials. Use `HOP_CLAUDE_CREDENTIALS_FILE` and

@@ -4,7 +4,9 @@ GOLANGCI_LINT := $(shell $(GO) env GOPATH)/bin/golangci-lint
 GORELEASER_VERSION ?= v2.11.2
 GORELEASER := $(GO) run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 
-.PHONY: all format vet lint lint-fix test fast full release-check snapshot install-smoke clean
+DEV_BINARY := dist/hop-dev
+
+.PHONY: all format vet lint lint-fix test fast full dev release-check snapshot install-smoke clean
 
 all: fast
 
@@ -27,6 +29,13 @@ test:
 	$(GO) test ./...
 
 fast: format vet lint test
+
+# The development binary is never named `hop` and never lands on PATH, so it
+# cannot shadow the installed hop. It still reads ~/.hop unless HOP_HOME says
+# otherwise, which is what the reminder and the runtime warning are for.
+dev:
+	$(GO) build -o $(DEV_BINARY) .
+	@echo "built $(DEV_BINARY) — run it as: HOP_HOME=/tmp/hop-sandbox ./$(DEV_BINARY) ls"
 
 # The release build is the cross-compile: goreleaser owns the flags for every
 # darwin/linux/windows x amd64/arm64 target, so nothing here can drift from
