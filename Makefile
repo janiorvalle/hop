@@ -33,8 +33,11 @@ fast: format vet lint test
 # The development binary is never named `hop` and never lands on PATH, so it
 # cannot shadow the installed hop. It still reads ~/.hop unless HOP_HOME says
 # otherwise, which is what the reminder and the runtime warning are for.
+# -buildvcs=false keeps Go from stamping the commit as a v0.0.0- pseudo-version:
+# the module version stays "(devel)", which is what marks the binary as a
+# development build at runtime and keeps `hop upgrade` refusing to run from it.
 dev:
-	$(GO) build -o $(DEV_BINARY) .
+	$(GO) build -buildvcs=false -o $(DEV_BINARY) .
 	@echo "built $(DEV_BINARY) — run it as: HOP_HOME=/tmp/hop-sandbox ./$(DEV_BINARY) ls"
 
 # The release build is the cross-compile: goreleaser owns the flags for every

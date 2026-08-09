@@ -65,6 +65,14 @@ func TestResolveVersionPrefersTheStampedReleaseVersion(t *testing.T) {
 		{name: "go install records the module version", stamped: "", module: "v1.3.0", want: "v1.3.0"},
 		{name: "working-tree build names nothing installable", stamped: "", module: "(devel)", want: "dev"},
 		{name: "build info missing entirely", stamped: "", module: "", want: "dev"},
+		{name: "clean checkout before the first release tag", stamped: "", module: "v0.0.0-20260809191616-20013681d086", want: "dev"},
+		{name: "dirty checkout before the first release tag", stamped: "", module: "v0.0.0-20260809191616-20013681d086+dirty", want: "dev"},
+		{name: "clean checkout past a release tag", stamped: "", module: "v1.4.1-0.20260809192816-aa3f2ca330f0", want: "dev"},
+		{name: "dirty checkout past a release tag", stamped: "", module: "v1.4.1-0.20260809192816-aa3f2ca330f0+dirty", want: "dev"},
+		{name: "dirty checkout sitting on a release tag", stamped: "", module: "v1.4.0+dirty", want: "dev"},
+		{name: "clean checkout sitting on a release tag is that release", stamped: "", module: "v1.4.0", want: "v1.4.0"},
+		{name: "prerelease tag is still a release someone installed", stamped: "", module: "v1.4.0-rc.1", want: "v1.4.0-rc.1"},
+		{name: "pseudo-version yields to a stamped release", stamped: "1.4.0", module: "v0.0.0-20260809191616-20013681d086", want: "1.4.0"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -128,6 +136,9 @@ func TestOnlyDevelopmentBuildsWithoutASandboxWarn(t *testing.T) {
 		want           string
 	}{
 		{name: "working-tree build on the real vault", runningVersion: resolveVersion("", "(devel)"), hopHome: "", want: developmentVaultWarning},
+		{name: "clean-checkout build on the real vault", runningVersion: resolveVersion("", "v0.0.0-20260809191616-20013681d086"), hopHome: "", want: developmentVaultWarning},
+		{name: "dirty-checkout build on the real vault", runningVersion: resolveVersion("", "v0.0.0-20260809191616-20013681d086+dirty"), hopHome: "", want: developmentVaultWarning},
+		{name: "post-tag checkout build on the real vault", runningVersion: resolveVersion("", "v1.4.1-0.20260809192816-aa3f2ca330f0"), hopHome: "", want: developmentVaultWarning},
 		{name: "working-tree build in a sandbox", runningVersion: resolveVersion("", "(devel)"), hopHome: "/tmp/hop-sandbox", want: ""},
 		{name: "stamped release build on the real vault", runningVersion: resolveVersion("1.4.0", "(devel)"), hopHome: "", want: ""},
 		{name: "go install build on the real vault", runningVersion: resolveVersion("", "v1.3.0"), hopHome: "", want: ""},
