@@ -558,6 +558,40 @@ func TestLoginClaudeStagesNewAccountWhenStatusEmailIsStale(t *testing.T) {
 	}
 }
 
+func TestLoginClaudeLeavesAnEmailLessActiveSlotUnlabeledWhenStatusEmailIsStale(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	original := claude.Credentials{AccessToken: "seed", RefreshToken: "seed-refresh"}
+	workPath, _ := accountVault.CredentialsPath("claude", "work")
+	if err := writeManagedSlotMetadata(filepath.Dir(workPath), ""); err != nil {
+		t.Fatalf("write email-less metadata: %v", err)
+	}
+	live := &fakeClaudeLiveStore{credentials: original}
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
+				live.credentials = claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}
+			}
+			return nil
+		}),
+		stdout:      io.Discard,
+		stderr:      io.Discard,
+		getenv:      func(string) string { return "approved" },
+		claudeEmail: func(context.Context) (string, error) { return "stale@example.com", nil },
+	}
+
+	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if metadata := readSlotMetadata(t, filepath.Dir(workPath)); metadata.Email != "" {
+		t.Fatalf("active slot email = %q, want the slot left unlabeled rather than named by the status cache", metadata.Email)
+	}
+}
+
 // Slots are default-deny: an account seeded by hand stays read-only until
 // 'hop login' takes custody of it. Matching tokens must not let staging adopt
 // one, or the stale cached email would be stamped onto a slot hop never

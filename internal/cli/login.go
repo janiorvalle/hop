@@ -504,10 +504,11 @@ func (manager loginManager) confirmActiveClaudeSlot(ctx context.Context, account
 // outside hop.
 func (manager loginManager) confirmedActiveClaudeEmail(accountName, liveEmail string, liveCredentials claude.Credentials) (string, error) {
 	if recordedEmail, recorded := manager.recordedClaudeSlotEmail(accountName, liveCredentials); recorded {
-		if recordedEmail != "" {
-			return recordedEmail, nil
-		}
-		return liveEmail, nil
+		// The recorded email answers even when hop enrolled the slot without
+		// one: the credentials already proved the identity, so filling the gap
+		// from the status cache would relabel a healthy slot with whichever
+		// account that cache still names.
+		return recordedEmail, nil
 	}
 	slotPath, err := manager.vault.SlotPath("claude", accountName)
 	if err != nil {
