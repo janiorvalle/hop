@@ -15,7 +15,7 @@
       "severity": "normal",
       "resets_at": null,
       "scope": null,
-      "is_active": false
+      "is_active": true
     },
     {
       "kind": "weekly_all",

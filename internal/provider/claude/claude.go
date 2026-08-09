@@ -329,8 +329,11 @@ func parseUsage(body []byte) (provider.Usage, error) {
 		if limit.Kind == "" || limit.Group == "" {
 			return provider.Usage{}, fmt.Errorf("decode Claude usage response; a limit omitted kind or group, update hop before retrying: %w", ErrUsage)
 		}
-		if limit.ResetsAt.IsZero() && (limit.Percent != 0 || limit.Active) {
-			return provider.Usage{}, fmt.Errorf("decode Claude %s limit; resets_at may be null only while percent is zero and the limit is inactive, update hop before retrying: %w", limit.Kind, ErrUsage)
+		// An idle account reports its enforced limit as is_active with a null
+		// resets_at because no usage window has ever started, so only consumed
+		// percent demands a reset timestamp.
+		if limit.ResetsAt.IsZero() && limit.Percent != 0 {
+			return provider.Usage{}, fmt.Errorf("decode Claude %s limit; resets_at may be null only while percent is zero, update hop before retrying: %w", limit.Kind, ErrUsage)
 		}
 		usage.Limits = append(usage.Limits, provider.Limit{
 			Kind:        limit.Kind,
