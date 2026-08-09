@@ -87,6 +87,18 @@ go install github.com/janiorvalle/hop@latest
 
 `hop --version` reports the installed version.
 
+Once a published release is installed, update it in place without rerunning
+the installer:
+
+```sh
+hop upgrade
+```
+
+Hop downloads the archive for the current OS and architecture, verifies it
+against the release's `checksums.txt`, and only then replaces the running
+binary. Development and dirty builds refuse self-upgrade; install a published
+release first.
+
 ## Development
 
 Run the fast gate while you work:

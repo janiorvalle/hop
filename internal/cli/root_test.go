@@ -22,6 +22,7 @@ func TestHelpShowsPlannedCommandSurface(t *testing.T) {
 		"hop login <provider> <account>",
 		"hop ls [--json]",
 		"hop rm <provider> <account>",
+		"hop upgrade",
 	}
 	for _, command := range commands {
 		if !strings.Contains(stdout.String(), command) {
@@ -82,6 +83,20 @@ func TestVersionRejectsExtraArguments(t *testing.T) {
 		t.Fatalf("Run() exit code = %d, want 2", exitCode)
 	}
 	if got := stderr.String(); !strings.Contains(got, "hop --version") {
+		t.Fatalf("stderr = %q, want the corrected invocation", got)
+	}
+}
+
+func TestUpgradeRejectsExtraArguments(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+	exitCode := Run([]string{"upgrade", "now"}, &bytes.Buffer{}, &stderr)
+
+	if exitCode != 2 {
+		t.Fatalf("Run() exit code = %d, want 2", exitCode)
+	}
+	if got := stderr.String(); !strings.Contains(got, "hop upgrade") {
 		t.Fatalf("stderr = %q, want the corrected invocation", got)
 	}
 }
