@@ -102,7 +102,8 @@ func TestShowAccountsIncludesUnderlyingUsageError(t *testing.T) {
 		if err := showAccountsFrom(context.Background(), &output, asJSON, catalog, time.Now()); err != nil {
 			t.Fatalf("showAccountsFrom(asJSON=%t) error = %v", asJSON, err)
 		}
-		if !bytes.Contains(output.Bytes(), []byte("Claude usage returned HTTP 429; wait and retry")) {
+		unwrapped := strings.Join(strings.Fields(output.String()), " ")
+		if !strings.Contains(unwrapped, "Claude usage returned HTTP 429; wait and retry") {
 			t.Fatalf("showAccountsFrom(asJSON=%t) output omitted cause: %s", asJSON, output.String())
 		}
 		if bytes.Contains(output.Bytes(), []byte("hop login")) {
