@@ -25,6 +25,7 @@ func TestHelpShowsPlannedCommandSurface(t *testing.T) {
 		"hop login <provider> <account>",
 		"hop ls [--json]",
 		"hop rm <provider> <account>",
+		"hop mv <provider> <old> <new>",
 		"hop upgrade",
 	}
 	for _, command := range commands {
@@ -123,6 +124,40 @@ func TestLoginRejectsUnknownProviderWithNextStep(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "use claude or codex") {
 		t.Fatalf("stderr = %q, want provider correction", got)
+	}
+}
+
+func TestRenameRejectsUnknownProviderWithNextStep(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+	exitCode := Run([]string{"mv", "other", "work", "personal"}, &bytes.Buffer{}, &stderr)
+
+	if exitCode != 2 {
+		t.Fatalf("Run() exit code = %d, want 2", exitCode)
+	}
+	if got := stderr.String(); !strings.Contains(got, "use claude or codex") {
+		t.Fatalf("stderr = %q, want provider correction", got)
+	}
+}
+
+func TestRenameRejectsMissingArgumentsWithAnExample(t *testing.T) {
+	t.Parallel()
+
+	for _, args := range [][]string{
+		{"mv"},
+		{"mv", "claude"},
+		{"mv", "claude", "work"},
+		{"mv", "claude", "work", "personal", "extra"},
+	} {
+		var stderr bytes.Buffer
+		exitCode := Run(args, &bytes.Buffer{}, &stderr)
+		if exitCode != 2 {
+			t.Errorf("Run(%q) exit code = %d, want 2", args, exitCode)
+		}
+		if got := stderr.String(); !strings.Contains(got, "hop mv claude work personal") {
+			t.Errorf("Run(%q) stderr = %q, want the corrected invocation", args, got)
+		}
 	}
 }
 

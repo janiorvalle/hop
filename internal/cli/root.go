@@ -19,6 +19,7 @@ Usage:
   hop login <provider> <account>   Add an account
   hop ls [--json]                  List accounts
   hop rm <provider> <account>      Forget an account
+  hop mv <provider> <old> <new>    Rename an account
   hop upgrade                      Install the latest verified release
   hop --version                    Show the installed version
   hop help                         Show this help
@@ -32,6 +33,7 @@ Examples:
   hop login codex work
   hop ls --json
   hop rm codex old
+  hop mv claude work personal
 `
 
 // developmentVaultWarning is the one line an unreleased build prints when it is
@@ -100,6 +102,11 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return removeAccount(args[1], args[2], stdout)
+	case "mv":
+		if err := requireProviderRename(args[1:]); err != nil {
+			return err
+		}
+		return renameAccount(args[1], args[2], args[3], stdout)
 	case "upgrade":
 		if len(args) != 1 {
 			return fmt.Errorf("upgrade takes no arguments; try 'hop upgrade'")
@@ -146,6 +153,19 @@ func requireProviderAccount(command string, args []string) error {
 	}
 	if strings.TrimSpace(args[1]) == "" {
 		return fmt.Errorf("account cannot be empty; try 'hop %s %s work'", command, args[0])
+	}
+	return nil
+}
+
+func requireProviderRename(args []string) error {
+	if len(args) != 3 {
+		return fmt.Errorf("mv needs a provider, the current account, and the new name; try 'hop mv claude work personal'")
+	}
+	if args[0] != "claude" && args[0] != "codex" {
+		return fmt.Errorf("unknown provider %q; use claude or codex", args[0])
+	}
+	if strings.TrimSpace(args[1]) == "" || strings.TrimSpace(args[2]) == "" {
+		return fmt.Errorf("account cannot be empty; try 'hop mv %s work personal'", args[0])
 	}
 	return nil
 }

@@ -26,6 +26,7 @@ const (
 	refreshLockPoll           = 25 * time.Millisecond
 	refreshTransactionTimeout = 20 * time.Second
 	stateLockFilename         = ".state.lock"
+	refreshLockFilename       = ".refresh.lock"
 )
 
 type slotMetadata struct {
@@ -439,7 +440,7 @@ func (store *codexJournaledStore) Write(credentials codex.Credentials) error {
 }
 
 func acquireRefreshLock(ctx context.Context, slotPath string) (func(), error) {
-	lockPath := filepath.Join(slotPath, ".refresh.lock")
+	lockPath := filepath.Join(slotPath, refreshLockFilename)
 	deadline := time.NewTimer(refreshLockWait)
 	defer deadline.Stop()
 	ticker := time.NewTicker(refreshLockPoll)
