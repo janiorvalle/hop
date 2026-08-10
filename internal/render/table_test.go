@@ -278,6 +278,26 @@ func TestTableFallsBackToNarrowWhenWideDoesNotFit(t *testing.T) {
 	}
 }
 
+func TestTableHeadroomBindsOnScopelessActiveLimits(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{{
+		Provider: provider.Claude,
+		Account:  "session",
+		Limits:   []provider.Limit{{Kind: "session", UsedPercent: 95, Active: true}},
+	}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if !strings.Contains(output.String(), "  o session     5% LEFT") {
+		t.Errorf("scope-less active limit did not bind the headline: %q", output.String())
+	}
+	if strings.Contains(output.String(), "100% LEFT") {
+		t.Errorf("account reported fully available despite a 95%% used session limit: %q", output.String())
+	}
+}
+
 func TestScopeLabelExtractsClaudeModelDisplayName(t *testing.T) {
 	t.Parallel()
 

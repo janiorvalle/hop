@@ -499,13 +499,18 @@ func activeLimits(row Row) []provider.Limit {
 	return limits
 }
 
+// headroomPercent binds on every active limit, scoped or not; a scope-less
+// account-level cap must still pull the headline down even though only
+// scoped caps get their own binding column.
 func headroomPercent(row Row) int {
 	tightest := 0.0
 	for _, window := range row.Windows {
 		tightest = math.Max(tightest, window.UsedPercent)
 	}
-	for _, limit := range activeLimits(row) {
-		tightest = math.Max(tightest, limit.UsedPercent)
+	for _, limit := range row.Limits {
+		if limit.Active {
+			tightest = math.Max(tightest, limit.UsedPercent)
+		}
 	}
 	return leftPercent(tightest)
 }
