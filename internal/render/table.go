@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -74,32 +75,68 @@ func Table(writer io.Writer, rows []Row, options Options) error {
 		options.Now = time.Now()
 	}
 
-	var out strings.Builder
-	writeLegend(&out, options)
-	for index, sectionRows := range groupByProvider(rows) {
-		if index > 0 {
-			out.WriteString("\n")
-		}
-		built := newSection(sectionRows)
-		if options.Width < narrowWidth {
-			writeNarrowSection(&out, built, options)
-		} else {
-			writeWideSection(&out, built, options)
-		}
+	sections := groupByProvider(rows)
+	wide := options.Width >= narrowWidth
+	body := renderSections(sections, wide, options)
+	if wide && maxLineWidth(body) > options.Width {
+		wide = false
+		body = renderSections(sections, wide, options)
 	}
+
+	var out strings.Builder
+	writeLegend(&out, wide, options)
+	out.WriteString(body)
 	_, err := io.WriteString(writer, out.String())
 	return err
 }
 
-func writeLegend(out *strings.Builder, options Options) {
-	definition := "HEADROOM = capacity left at the binding limit"
-	if options.Width < narrowWidth {
-		definition = "HEADROOM = left at binding cap   detail = left / resets in   * binding"
+func renderSections(sections [][]Row, wide bool, options Options) string {
+	var out strings.Builder
+	for index, sectionRows := range sections {
+		if index > 0 {
+			out.WriteString("\n")
+		}
+		built := newSection(sectionRows)
+		if wide {
+			writeWideSection(&out, built, options)
+		} else {
+			writeNarrowSection(&out, built, options)
+		}
 	}
-	glyphs := fmt.Sprintf("%s 50-100 plenty   %s 10-49 tight   %s 0-9 nearly/full   ! error   > active",
-		glyphFor(100, options.Plain), glyphFor(49, options.Plain), glyphFor(9, options.Plain))
-	out.WriteString(paint(definition, styleDim, options) + "\n")
-	out.WriteString(paint(glyphs, styleDim, options) + "\n\n")
+	return out.String()
+}
+
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func maxLineWidth(body string) int {
+	widest := 0
+	for _, line := range strings.Split(body, "\n") {
+		if width := utf8.RuneCountInString(ansiPattern.ReplaceAllString(line, "")); width > widest {
+			widest = width
+		}
+	}
+	return widest
+}
+
+func writeLegend(out *strings.Builder, wide bool, options Options) {
+	definition := []string{"HEADROOM = capacity left at the binding limit"}
+	if !wide {
+		definition = []string{"HEADROOM = left at binding cap", "detail = left / resets in", "* binding"}
+	}
+	glyphs := []string{
+		glyphFor(100, options.Plain) + " 50-100 plenty",
+		glyphFor(49, options.Plain) + " 10-49 tight",
+		glyphFor(9, options.Plain) + " 0-9 nearly/full",
+		"! error",
+		"> active",
+	}
+	for _, line := range flow(definition, "   ", options.Width) {
+		out.WriteString(paint(line, styleDim, options) + "\n")
+	}
+	for _, line := range flow(glyphs, "   ", options.Width) {
+		out.WriteString(paint(line, styleDim, options) + "\n")
+	}
+	out.WriteString("\n")
 }
 
 func groupByProvider(rows []Row) [][]Row {
@@ -147,6 +184,7 @@ func newSection(rows []Row) section {
 	plans := map[string]bool{}
 	scopes := map[string]bool{}
 	dataRows := 0
+	fiveHourCap := false
 	for _, row := range sorted {
 		if row.Problem != nil {
 			continue
@@ -162,6 +200,9 @@ func newSection(rows []Row) section {
 		for _, limit := range activeLimits(row) {
 			built.showBinding = true
 			scopes[scopeLabel(limit.Scope)+" / "+limitKindLabel(limit.Kind)] = true
+			if strings.Contains(limit.Kind, "five_hour") {
+				fiveHourCap = true
+			}
 		}
 	}
 	if dataRows > 0 && len(plans) == 1 && !plans[""] {
@@ -175,7 +216,7 @@ func newSection(rows []Row) section {
 			}
 		}
 	}
-	if dataRows > 0 && !built.showFiveHour {
+	if dataRows > 0 && !built.showFiveHour && !fiveHourCap {
 		built.hoisted = append(built.hoisted, "no 5-hour window")
 	}
 	if len(scopes) == 1 {
@@ -311,13 +352,14 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 			line += paint("  ACTIVE", styleBold, options)
 		}
 		out.WriteString(line + "\n")
-		if details := narrowDetails(row, built.showPlan, options); details != "" {
-			out.WriteString(guidanceIndent + paint(details, styleDim, options) + "\n")
+		parts := narrowDetailParts(row, built.showPlan, options)
+		for _, detail := range flow(parts, " "+midDot(options)+" ", options.Width-len(guidanceIndent)) {
+			out.WriteString(guidanceIndent + paint(detail, styleDim, options) + "\n")
 		}
 	}
 }
 
-func narrowDetails(row Row, showPlan bool, options Options) string {
+func narrowDetailParts(row Row, showPlan bool, options Options) []string {
 	parts := make([]string, 0, 4)
 	if window, ok := findWindow(row.Windows, provider.FiveHour); ok {
 		parts = append(parts, "5h "+narrowValue(window.UsedPercent, window.ResetsAt, options))
@@ -326,12 +368,12 @@ func narrowDetails(row Row, showPlan bool, options Options) string {
 		parts = append(parts, "week "+narrowValue(window.UsedPercent, window.ResetsAt, options))
 	}
 	for _, limit := range activeLimits(row) {
-		parts = append(parts, scopeLabel(limit.Scope)+"* "+narrowValue(limit.UsedPercent, limit.ResetsAt, options))
+		parts = append(parts, scopeLabel(limit.Scope)+"*"+limitKindTag(limit.Kind)+" "+narrowValue(limit.UsedPercent, limit.ResetsAt, options))
 	}
 	if showPlan && row.Plan != "" {
 		parts = append(parts, row.Plan)
 	}
-	return strings.Join(parts, " "+midDot(options)+" ")
+	return parts
 }
 
 func narrowValue(usedPercent float64, resetsAt time.Time, options Options) string {
@@ -410,7 +452,7 @@ func bindingCell(row Row, uniformScope bool, options Options) string {
 	if uniformScope {
 		return cell
 	}
-	return scopeLabel(tightest.Scope) + " " + cell
+	return scopeLabel(tightest.Scope) + limitKindTag(tightest.Kind) + " " + cell
 }
 
 // extraLimitCells renders active limits beyond the tightest so a row with
@@ -431,7 +473,7 @@ func extraLimitCells(row Row, options Options) []string {
 		if index == tightest {
 			continue
 		}
-		cell := fmt.Sprintf("%s %d%%", scopeLabel(limit.Scope), leftPercent(limit.UsedPercent))
+		cell := fmt.Sprintf("%s%s %d%%", scopeLabel(limit.Scope), limitKindTag(limit.Kind), leftPercent(limit.UsedPercent))
 		if !limit.ResetsAt.IsZero() {
 			cell += " " + midDot(options) + " " + countdown(options.Now, limit.ResetsAt)
 		}
@@ -514,6 +556,15 @@ func limitKindLabel(kind string) string {
 	return strings.ToUpper(kind)
 }
 
+// limitKindTag marks a cap's window kind wherever no column header carries it;
+// weekly is the design's unmarked default.
+func limitKindTag(kind string) string {
+	if strings.Contains(kind, "five_hour") {
+		return "(5h)"
+	}
+	return ""
+}
+
 func midDot(options Options) string {
 	if options.Plain {
 		return "."
@@ -547,22 +598,28 @@ func padCell(text string, width int, rightAlign bool) string {
 }
 
 func wrap(text string, width int) []string {
+	return flow(strings.Fields(text), " ", width)
+}
+
+// flow packs segments into lines no wider than width, dropping the joiner at
+// each break; a single oversized segment still gets its own line.
+func flow(segments []string, joiner string, width int) []string {
 	if width < 16 {
 		width = 16
 	}
 	var lines []string
 	line := ""
-	for _, word := range strings.Fields(text) {
+	for _, segment := range segments {
 		if line == "" {
-			line = word
+			line = segment
 			continue
 		}
-		if utf8.RuneCountInString(line)+1+utf8.RuneCountInString(word) > width {
+		if utf8.RuneCountInString(line)+utf8.RuneCountInString(joiner)+utf8.RuneCountInString(segment) > width {
 			lines = append(lines, line)
-			line = word
+			line = segment
 			continue
 		}
-		line += " " + word
+		line += joiner + segment
 	}
 	if line != "" {
 		lines = append(lines, line)

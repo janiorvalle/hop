@@ -206,6 +206,78 @@ func TestTableShortensLongAccountNamesDeliberately(t *testing.T) {
 	}
 }
 
+func TestTableKeepsFiveHourClaimHonestForFiveHourCaps(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{{
+		Provider: provider.Codex,
+		Account:  "capped",
+		Windows:  []provider.Window{{Kind: provider.Weekly, UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour)}},
+		Limits:   []provider.Limit{{Kind: "model_five_hour", Scope: "GPT", UsedPercent: 30, ResetsAt: now.Add(time.Hour), Active: true}},
+	}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if strings.Contains(output.String(), "no 5-hour window") {
+		t.Errorf("section claims no 5-hour window despite a five-hour cap: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "BINDING: GPT / 5 HOUR") {
+		t.Errorf("binding header omitted the five-hour kind: %q", output.String())
+	}
+
+	output.Reset()
+	if err := Table(&output, rows, Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if !strings.Contains(output.String(), "GPT*(5h) 70%/1h00m") {
+		t.Errorf("narrow detail omitted the five-hour tag: %q", output.String())
+	}
+}
+
+func TestTableNarrowKeepsEveryLineWithinWidth(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, lockedDesignRows(now), Options{Plain: true, Width: 64, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	for _, line := range strings.Split(output.String(), "\n") {
+		if len([]rune(line)) > 64 {
+			t.Errorf("line exceeds width 64: %q", line)
+		}
+	}
+}
+
+func TestTableFallsBackToNarrowWhenWideDoesNotFit(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{{
+		Provider: provider.Codex,
+		Account:  "averyveryverylongaccountname",
+		Windows: []provider.Window{
+			{Kind: provider.FiveHour, UsedPercent: 10, ResetsAt: now.Add(time.Hour)},
+			{Kind: provider.Weekly, UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour)},
+		},
+		Limits: []provider.Limit{{Kind: "weekly", Scope: "GPT-5.3-Codex-Spark", UsedPercent: 30, ResetsAt: now.Add(24 * time.Hour), Active: true}},
+	}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 88, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	for _, line := range strings.Split(output.String(), "\n") {
+		if len([]rune(line)) > 88 {
+			t.Errorf("line exceeds width 88: %q", line)
+		}
+	}
+	if !strings.Contains(output.String(), "GPT-5.3-Codex-Spark* 70%/1d00h") {
+		t.Errorf("expected narrow fallback detail row: %q", output.String())
+	}
+}
+
 func TestScopeLabelExtractsClaudeModelDisplayName(t *testing.T) {
 	t.Parallel()
 
