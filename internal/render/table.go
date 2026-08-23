@@ -197,7 +197,7 @@ func newSection(rows []Row) section {
 		if _, ok := findWindow(row.Windows, provider.Weekly); ok {
 			built.showWeekly = true
 		}
-		for _, limit := range activeLimits(row) {
+		for _, limit := range scopedLimits(row) {
 			built.showBinding = true
 			scopes[scopeLabel(limit.Scope)+" / "+limitKindLabel(limit.Kind)] = true
 			if strings.Contains(limit.Kind, "five_hour") {
@@ -367,7 +367,7 @@ func narrowDetailParts(row Row, showPlan bool, options Options) []string {
 	if window, ok := findWindow(row.Windows, provider.Weekly); ok {
 		parts = append(parts, "week "+narrowValue(window.UsedPercent, window.ResetsAt, options))
 	}
-	for _, limit := range activeLimits(row) {
+	for _, limit := range scopedLimits(row) {
 		parts = append(parts, scopeLabel(limit.Scope)+"*"+limitKindTag(limit.Kind)+" "+narrowValue(limit.UsedPercent, limit.ResetsAt, options))
 	}
 	if showPlan && row.Plan != "" {
@@ -432,10 +432,10 @@ func windowCell(row Row, kind provider.WindowKind, options Options) string {
 	return cell + " " + midDot(options) + " " + countdown(options.Now, window.ResetsAt)
 }
 
-// bindingCell shows the tightest active model-scoped limit; the scope name is
+// bindingCell shows the tightest model-scoped limit; the scope name is
 // omitted when the section header already carries it.
 func bindingCell(row Row, uniformScope bool, options Options) string {
-	limits := activeLimits(row)
+	limits := scopedLimits(row)
 	if len(limits) == 0 {
 		return dash(options)
 	}
@@ -455,10 +455,10 @@ func bindingCell(row Row, uniformScope bool, options Options) string {
 	return scopeLabel(tightest.Scope) + limitKindTag(tightest.Kind) + " " + cell
 }
 
-// extraLimitCells renders active limits beyond the tightest so a row with
+// extraLimitCells renders scoped limits beyond the tightest so a row with
 // several model caps still loses nothing in the wide layout.
 func extraLimitCells(row Row, options Options) []string {
-	limits := activeLimits(row)
+	limits := scopedLimits(row)
 	if len(limits) < 2 {
 		return nil
 	}
@@ -489,10 +489,13 @@ func planCell(plan string, options Options) string {
 	return "(" + plan + ")"
 }
 
-func activeLimits(row Row) []provider.Limit {
+// scopedLimits keeps every model-scoped limit, active or not: usage on an
+// inactive cap is still real capacity spent, and hiding it once masked an
+// account sitting at 98% used. Only headroomPercent binds on Active.
+func scopedLimits(row Row) []provider.Limit {
 	limits := make([]provider.Limit, 0, len(row.Limits))
 	for _, limit := range row.Limits {
-		if limit.Active && limit.Scope != "" {
+		if limit.Scope != "" {
 			limits = append(limits, limit)
 		}
 	}

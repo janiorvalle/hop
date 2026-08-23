@@ -278,6 +278,44 @@ func TestTableFallsBackToNarrowWhenWideDoesNotFit(t *testing.T) {
 	}
 }
 
+func TestTableShowsInactiveScopedLimitUsage(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{
+		{Provider: provider.Claude, Account: "capped",
+			Windows: []provider.Window{{Kind: provider.FiveHour, UsedPercent: 40, ResetsAt: now.Add(3 * time.Hour)}},
+			Limits: []provider.Limit{
+				{Kind: "session", UsedPercent: 40, Active: true},
+				{Kind: "weekly", Scope: "Fable", UsedPercent: 98, ResetsAt: now.Add(76 * time.Hour), Active: false},
+			},
+		},
+		{Provider: provider.Claude, Account: "bare",
+			Windows: []provider.Window{{Kind: provider.FiveHour, UsedPercent: 40, ResetsAt: now.Add(3 * time.Hour)}},
+		},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	got := output.String()
+	if !strings.Contains(got, "2% . 3d04h") {
+		t.Errorf("inactive Fable weekly limit at 98%% used renders no usage: %q", got)
+	}
+	if strings.Contains(got, "2% LEFT") {
+		t.Errorf("headroom must stay bound to active limits, not the inactive cap: %q", got)
+	}
+	bareLine := ""
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "bare") {
+			bareLine = line
+		}
+	}
+	if !strings.HasSuffix(bareLine, "-") {
+		t.Errorf("account with no scoped limit data lost its dash: %q", bareLine)
+	}
+}
+
 func TestTableHeadroomBindsOnScopelessActiveLimits(t *testing.T) {
 	t.Parallel()
 
