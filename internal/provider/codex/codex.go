@@ -23,15 +23,26 @@ const (
 	// secret and not issued to hop; OpenAI can change it at any time, which is
 	// why Config.ClientID can override it.
 	defaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-	fiveHourSeconds = 18_000
-	weeklySeconds   = 604_800
 	responseLimit   = 1 << 20
+
+	accountGroup    = "account"
+	codeReviewGroup = "code_review"
+	modelGroup      = "model"
 )
 
 var (
 	ErrCredentials = errors.New("codex credentials are invalid")
 	ErrRefresh     = errors.New("codex token refresh failed")
 	ErrUsage       = errors.New("codex usage request failed")
+
+	windowKinds = map[int64]provider.WindowKind{
+		18_000:  provider.FiveHour,
+		604_800: provider.Weekly,
+	}
+	durationUnits = []struct {
+		seconds int64
+		suffix  string
+	}{{86_400, "d"}, {3_600, "h"}, {60, "m"}}
 )
 
 // Credentials is the OAuth token set stored in auth.json.
@@ -219,6 +230,7 @@ type usageResponse struct {
 	PlanType             string                `json:"plan_type"`
 	Email                string                `json:"email"`
 	RateLimit            rateLimit             `json:"rate_limit"`
+	CodeReviewRateLimit  *rateLimit            `json:"code_review_rate_limit"`
 	AdditionalRateLimits []additionalRateLimit `json:"additional_rate_limits"`
 }
 
@@ -241,6 +253,38 @@ type additionalRateLimit struct {
 	RateLimit      rateLimit `json:"rate_limit"`
 }
 
+// scopedGroup carries the account percentages its limits must reach to count
+// as binding. Code review and account-level windows have no base, so the nil
+// map leaves every one of their limits active.
+type scopedGroup struct {
+	name      string
+	scope     string
+	rateLimit rateLimit
+	base      map[provider.WindowKind]float64
+}
+
+func (limit rateLimit) windows() []usageWindow {
+	windows := make([]usageWindow, 0, 2)
+	for _, window := range []*usageWindow{limit.PrimaryWindow, limit.SecondaryWindow} {
+		if window != nil {
+			windows = append(windows, *window)
+		}
+	}
+	return windows
+}
+
+func (group scopedGroup) limit(window provider.Window) provider.Limit {
+	return provider.Limit{
+		Kind:        group.name + "_" + string(window.Kind),
+		Group:       group.name,
+		UsedPercent: window.UsedPercent,
+		Severity:    severity(window.UsedPercent),
+		ResetsAt:    window.ResetsAt,
+		Scope:       group.scope,
+		Active:      window.UsedPercent >= group.base[window.Kind],
+	}
+}
+
 func parseUsage(body []byte, now time.Time) (provider.Usage, error) {
 	var response usageResponse
 	if err := json.Unmarshal(body, &response); err != nil {
@@ -254,18 +298,23 @@ func parseUsage(body []byte, now time.Time) (provider.Usage, error) {
 		Limits:   make([]provider.Limit, 0),
 	}
 	baseByKind := make(map[provider.WindowKind]float64)
-	for _, window := range []*usageWindow{response.RateLimit.PrimaryWindow, response.RateLimit.SecondaryWindow} {
-		if window == nil {
-			continue
-		}
-		normalized, err := normalizeWindow(*window, now)
+	for _, window := range response.RateLimit.windows() {
+		normalized, err := normalizeWindow(window, now)
 		if err != nil {
 			return provider.Usage{}, err
 		}
-		usage.Windows = append(usage.Windows, normalized)
 		baseByKind[normalized.Kind] = normalized.UsedPercent
+		if _, known := windowKinds[window.LimitWindowSeconds]; known {
+			usage.Windows = append(usage.Windows, normalized)
+			continue
+		}
+		usage.Limits = append(usage.Limits, scopedGroup{name: accountGroup, scope: string(normalized.Kind)}.limit(normalized))
 	}
 
+	groups := make([]scopedGroup, 0, 1+len(response.AdditionalRateLimits)+len(response.RateLimit.AdditionalRateLimits))
+	if response.CodeReviewRateLimit != nil {
+		groups = append(groups, scopedGroup{name: codeReviewGroup, scope: "code review", rateLimit: *response.CodeReviewRateLimit})
+	}
 	additional := append(response.AdditionalRateLimits, response.RateLimit.AdditionalRateLimits...)
 	for _, meter := range additional {
 		scope := meter.LimitName
@@ -275,23 +324,15 @@ func parseUsage(body []byte, now time.Time) (provider.Usage, error) {
 		if scope == "" {
 			return provider.Usage{}, fmt.Errorf("decode Codex usage response; an additional rate limit omitted its name, update hop before retrying: %w", ErrUsage)
 		}
-		for _, window := range []*usageWindow{meter.RateLimit.PrimaryWindow, meter.RateLimit.SecondaryWindow} {
-			if window == nil {
-				continue
-			}
-			normalized, err := normalizeWindow(*window, now)
+		groups = append(groups, scopedGroup{name: modelGroup, scope: scope, rateLimit: meter.RateLimit, base: baseByKind})
+	}
+	for _, group := range groups {
+		for _, window := range group.rateLimit.windows() {
+			normalized, err := normalizeWindow(window, now)
 			if err != nil {
 				return provider.Usage{}, err
 			}
-			usage.Limits = append(usage.Limits, provider.Limit{
-				Kind:        "model_" + string(normalized.Kind),
-				Group:       "model",
-				UsedPercent: normalized.UsedPercent,
-				Severity:    severity(normalized.UsedPercent),
-				ResetsAt:    normalized.ResetsAt,
-				Scope:       scope,
-				Active:      normalized.UsedPercent >= baseByKind[normalized.Kind],
-			})
+			usage.Limits = append(usage.Limits, group.limit(normalized))
 		}
 	}
 	if len(usage.Windows) == 0 && len(usage.Limits) == 0 {
@@ -300,16 +341,27 @@ func parseUsage(body []byte, now time.Time) (provider.Usage, error) {
 	return usage, nil
 }
 
-func normalizeWindow(window usageWindow, now time.Time) (provider.Window, error) {
-	var kind provider.WindowKind
-	switch window.LimitWindowSeconds {
-	case fiveHourSeconds:
-		kind = provider.FiveHour
-	case weeklySeconds:
-		kind = provider.Weekly
-	default:
-		return provider.Window{}, fmt.Errorf("classify Codex %d-second usage window; update hop with the provider's new window duration: %w", window.LimitWindowSeconds, ErrUsage)
+func windowKind(seconds int64) provider.WindowKind {
+	if kind, known := windowKinds[seconds]; known {
+		return kind
 	}
+	return provider.WindowKind(durationLabel(seconds))
+}
+
+func durationLabel(seconds int64) string {
+	for _, unit := range durationUnits {
+		if seconds%unit.seconds == 0 {
+			return fmt.Sprintf("%d%s", seconds/unit.seconds, unit.suffix)
+		}
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
+func normalizeWindow(window usageWindow, now time.Time) (provider.Window, error) {
+	if window.LimitWindowSeconds <= 0 {
+		return provider.Window{}, fmt.Errorf("decode Codex usage window; limit_window_seconds is missing, update hop before retrying: %w", ErrUsage)
+	}
+	kind := windowKind(window.LimitWindowSeconds)
 	var resetsAt time.Time
 	if window.ResetAt > 0 {
 		resetsAt = time.Unix(window.ResetAt, 0).UTC()

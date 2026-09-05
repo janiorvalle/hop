@@ -199,7 +199,7 @@ func newSection(rows []Row) section {
 		}
 		for _, limit := range scopedLimits(row) {
 			built.showBinding = true
-			scopes[scopeLabel(limit.Scope)+" / "+limitKindLabel(limit.Kind)] = true
+			scopes[limitHeader(limit)] = true
 			if strings.Contains(limit.Kind, "five_hour") {
 				fiveHourCap = true
 			}
@@ -368,7 +368,7 @@ func narrowDetailParts(row Row, showPlan bool, options Options) []string {
 		parts = append(parts, "week "+narrowValue(window.UsedPercent, window.ResetsAt, options))
 	}
 	for _, limit := range scopedLimits(row) {
-		parts = append(parts, scopeLabel(limit.Scope)+"*"+limitKindTag(limit.Kind)+" "+narrowValue(limit.UsedPercent, limit.ResetsAt, options))
+		parts = append(parts, scopeLabel(limit.Scope)+"*"+limitTag(limit)+" "+narrowValue(limit.UsedPercent, limit.ResetsAt, options))
 	}
 	if showPlan && row.Plan != "" {
 		parts = append(parts, row.Plan)
@@ -452,7 +452,7 @@ func bindingCell(row Row, uniformScope bool, options Options) string {
 	if uniformScope {
 		return cell
 	}
-	return scopeLabel(tightest.Scope) + limitKindTag(tightest.Kind) + " " + cell
+	return scopeLabel(tightest.Scope) + limitTag(tightest) + " " + cell
 }
 
 // extraLimitCells renders scoped limits beyond the tightest so a row with
@@ -473,7 +473,7 @@ func extraLimitCells(row Row, options Options) []string {
 		if index == tightest {
 			continue
 		}
-		cell := fmt.Sprintf("%s%s %d%%", scopeLabel(limit.Scope), limitKindTag(limit.Kind), leftPercent(limit.UsedPercent))
+		cell := fmt.Sprintf("%s%s %d%%", scopeLabel(limit.Scope), limitTag(limit), leftPercent(limit.UsedPercent))
 		if !limit.ResetsAt.IsZero() {
 			cell += " " + midDot(options) + " " + countdown(options.Now, limit.ResetsAt)
 		}
@@ -554,6 +554,16 @@ func severityStyle(left int) string {
 	}
 }
 
+// limitHeader names a section's only scope once; an account-level window is
+// its own scope, so its duration is not repeated as a kind.
+func limitHeader(limit provider.Limit) string {
+	scope := scopeLabel(limit.Scope)
+	if kindDuration(limit.Kind) == scope {
+		return scope
+	}
+	return scope + " / " + limitKindLabel(limit.Kind)
+}
+
 func limitKindLabel(kind string) string {
 	if strings.Contains(kind, "five_hour") {
 		return "5 HOUR"
@@ -561,16 +571,30 @@ func limitKindLabel(kind string) string {
 	if strings.Contains(kind, "weekly") {
 		return "WEEKLY"
 	}
-	return strings.ToUpper(kind)
+	return strings.ToUpper(kindDuration(kind))
 }
 
-// limitKindTag marks a cap's window kind wherever no column header carries it;
-// weekly is the design's unmarked default.
-func limitKindTag(kind string) string {
-	if strings.Contains(kind, "five_hour") {
+// limitTag marks a cap's window kind wherever no column header carries it;
+// weekly is the design's unmarked default, and a scope that already names
+// its own duration is not marked twice.
+func limitTag(limit provider.Limit) string {
+	if strings.Contains(limit.Kind, "five_hour") {
 		return "(5h)"
 	}
-	return ""
+	duration := kindDuration(limit.Kind)
+	if duration == "" || duration == scopeLabel(limit.Scope) {
+		return ""
+	}
+	return "(" + duration + ")"
+}
+
+// kindDuration is the label a provider appends to a limit kind hop has no
+// fixed meter for, such as the 30d in account_30d or model_30d.
+func kindDuration(kind string) string {
+	if strings.Contains(kind, "five_hour") || strings.Contains(kind, "weekly") {
+		return ""
+	}
+	return kind[strings.LastIndex(kind, "_")+1:]
 }
 
 func midDot(options Options) string {

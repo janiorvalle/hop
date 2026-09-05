@@ -183,17 +183,83 @@ func TestRefreshWriteFailureReturnsRecoveryCopy(t *testing.T) {
 	}
 }
 
-func TestFetchUsageRejectsUnknownWindowDuration(t *testing.T) {
+func TestFetchUsageKeepsUnknownWindowsAsScopedLimits(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(writer, `{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":3600,"reset_after_seconds":60}}}`)
+		_, _ = io.WriteString(writer, `{
+			"plan_type": "pro",
+			"rate_limit": {
+				"primary_window": {"used_percent": 45, "limit_window_seconds": 604800, "reset_after_seconds": 1200},
+				"secondary_window": {"used_percent": 20, "limit_window_seconds": 2592000, "reset_after_seconds": 86400}
+			},
+			"code_review_rate_limit": {
+				"primary_window": {"used_percent": 10, "limit_window_seconds": 604800, "reset_after_seconds": 600}
+			},
+			"additional_rate_limits": [{
+				"limit_name": "gpt-5-codex",
+				"rate_limit": {"primary_window": {"used_percent": 5, "limit_window_seconds": 2592000, "reset_after_seconds": 600}}
+			}]
+		}`)
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
-	if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), "3600-second") {
-		t.Fatalf("FetchUsage() error = %v, want actionable unknown-window error", err)
+	usage, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	if len(usage.Windows) != 1 || usage.Windows[0].Kind != provider.Weekly {
+		t.Fatalf("Windows = %+v, want only the weekly window", usage.Windows)
+	}
+	if len(usage.Limits) != 3 {
+		t.Fatalf("Limits = %+v, want monthly, code review, and model limits", usage.Limits)
+	}
+	monthly := usage.Limits[0]
+	if monthly.Kind != "account_30d" || monthly.Group != "account" || monthly.Scope != "30d" || !monthly.Active || monthly.UsedPercent != 20 {
+		t.Errorf("monthly limit = %+v, want active account_30d scoped 30d", monthly)
+	}
+	codeReview := usage.Limits[1]
+	if codeReview.Kind != "code_review_weekly" || codeReview.Group != "code_review" || codeReview.Scope != "code review" || !codeReview.Active {
+		t.Errorf("code review limit = %+v, want active code_review_weekly even below the account's weekly usage", codeReview)
+	}
+	model := usage.Limits[2]
+	if model.Kind != "model_30d" || model.Scope != "gpt-5-codex" || model.Active {
+		t.Errorf("model limit = %+v, want inactive model_30d below the account's monthly usage", model)
+	}
+}
+
+func TestFetchUsageRejectsMalformedWindow(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "empty window", body: `{"rate_limit":{"primary_window":{}}}`, want: "limit_window_seconds is missing"},
+		{name: "missing reset", body: `{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000}}}`, want: "reset_at and reset_after_seconds are missing"},
+	}
+	for _, testCase := range testCases {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(writer, testCase.body)
+		}))
+		t.Cleanup(server.Close)
+
+		_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+		if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), testCase.want) || !strings.Contains(err.Error(), "update hop") {
+			t.Errorf("%s: FetchUsage() error = %v, want ErrUsage naming %q with a next step", testCase.name, err, testCase.want)
+		}
+	}
+}
+
+func TestDurationLabelUsesTheLargestWholeUnit(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[int64]string{2_592_000: "30d", 86_400: "1d", 3_600: "1h", 5_400: "90m", 90: "90s"}
+	for seconds, want := range testCases {
+		if got := durationLabel(seconds); got != want {
+			t.Errorf("durationLabel(%d) = %q, want %q", seconds, got, want)
+		}
 	}
 }
 
