@@ -359,6 +359,71 @@ func TestTableNamesUnknownDurationsOnce(t *testing.T) {
 	}
 }
 
+func TestTableShowsManualResetCreditsAfterTheRow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{
+		{
+			Provider: provider.Codex,
+			Account:  "work",
+			Plan:     "pro",
+			Windows:  []provider.Window{{Kind: provider.Weekly, UsedPercent: 57, ResetsAt: now.Add(141 * time.Hour)}},
+			ResetCredits: provider.ResetCredits{Count: 2, Credits: []provider.ResetCredit{
+				{ExpiresAt: now.Add(30 * 24 * time.Hour)},
+				{ExpiresAt: now.Add(16*24*time.Hour + 5*time.Hour)},
+			}},
+		},
+		{
+			Provider:     provider.Codex,
+			Account:      "spent",
+			Plan:         "pro",
+			Windows:      []provider.Window{{Kind: provider.Weekly, UsedPercent: 4, ResetsAt: now.Add(141 * time.Hour)}},
+			ResetCredits: provider.NoResetCredits(),
+		},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CODEX  .  pro  .  no 5-hour window\n" +
+		"    ACCOUNT    HEADROOM   WEEKLY\n" +
+		"  + spent      96% LEFT    96% . 5d21h\n" +
+		"  ~ work       43% LEFT    43% . 5d21h   2 resets . next expires 16d05h\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+
+	output.Reset()
+	if err := Table(&output, rows, Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if !strings.Contains(output.String(), "2 resets, next expires 16d05h") {
+		t.Errorf("narrow detail missing the resets: %q", output.String())
+	}
+	if strings.Count(output.String(), " resets,") != 1 {
+		t.Errorf("a spent account must show nothing about resets: %q", output.String())
+	}
+}
+
+func TestResetCreditsLabelSingularAndWithoutExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	options := Options{Plain: true, Now: now}
+	one := provider.ResetCredits{Count: 1, Credits: []provider.ResetCredit{{ExpiresAt: now.Add(3 * 24 * time.Hour)}}}
+	if got := resetCreditsLabel(one, " . ", options); got != "1 reset . expires 3d00h" {
+		t.Errorf("one credit = %q", got)
+	}
+	countOnly := provider.ResetCredits{Count: 3, Credits: []provider.ResetCredit{}}
+	if got := resetCreditsLabel(countOnly, " . ", options); got != "3 resets" {
+		t.Errorf("count without expiries = %q", got)
+	}
+}
+
 func TestTableShowsInactiveScopedLimitUsage(t *testing.T) {
 	t.Parallel()
 

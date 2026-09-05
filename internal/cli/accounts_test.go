@@ -209,7 +209,7 @@ func TestCodexSlotFetcherRefreshesExpiredManagedJWT(t *testing.T) {
 	if err := store.Write(codex.Credentials{AccessToken: "header." + expiredPayload + ".signature", RefreshToken: "refresh", AccountID: "account"}); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
-	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
+	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits", TokenURL: server.URL + "/token"})
 	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
@@ -445,7 +445,7 @@ func TestCodexSlotFetcherRetriesSavingRotatedRecoveryCredentials(t *testing.T) {
 	t.Cleanup(server.Close)
 	expiredPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1}`))
 	store := &failFirstCodexWriteStore{credentials: codex.Credentials{AccessToken: "header." + expiredPayload + ".signature", RefreshToken: "refresh", AccountID: "account"}}
-	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
+	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits", TokenURL: server.URL + "/token"})
 	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
 
 	if err := fetcher.Prepare(context.Background()); err != nil {

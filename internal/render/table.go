@@ -41,13 +41,14 @@ type Problem struct {
 
 // Row is one account in the rendered glance.
 type Row struct {
-	Provider provider.Name
-	Account  string
-	Active   bool
-	Plan     string
-	Windows  []provider.Window
-	Limits   []provider.Limit
-	Problem  *Problem
+	Provider     provider.Name
+	Account      string
+	Active       bool
+	Plan         string
+	Windows      []provider.Window
+	Limits       []provider.Limit
+	ResetCredits provider.ResetCredits
+	Problem      *Problem
 }
 
 // Options controls terminal capabilities without tying rendering to os.Stdout.
@@ -320,7 +321,7 @@ func wideLine(row Row, cells []string, widths []int, options Options) string {
 		}
 		line += paint(padded, cellStyle(row, column), options)
 	}
-	for _, extra := range extraLimitCells(row, options) {
+	for _, extra := range trailingCells(row, options) {
 		line += columnGap + paint(extra, styleDim, options)
 	}
 	return strings.TrimRight(line, " ") + "\n"
@@ -372,6 +373,9 @@ func narrowDetailParts(row Row, showPlan bool, options Options) []string {
 	}
 	if showPlan && row.Plan != "" {
 		parts = append(parts, row.Plan)
+	}
+	if row.ResetCredits.Count > 0 {
+		parts = append(parts, resetCreditsLabel(row.ResetCredits, ", ", options))
 	}
 	return parts
 }
@@ -480,6 +484,28 @@ func extraLimitCells(row Row, options Options) []string {
 		cells = append(cells, cell)
 	}
 	return cells
+}
+
+// trailingCells hang off the end of a wide row without a column: the extra
+// scoped limits, then the manual resets an account still holds.
+func trailingCells(row Row, options Options) []string {
+	cells := extraLimitCells(row, options)
+	if row.ResetCredits.Count > 0 {
+		cells = append(cells, resetCreditsLabel(row.ResetCredits, " "+midDot(options)+" ", options))
+	}
+	return cells
+}
+
+func resetCreditsLabel(credits provider.ResetCredits, joiner string, options Options) string {
+	label, expires := fmt.Sprintf("%d resets", credits.Count), "next expires "
+	if credits.Count == 1 {
+		label, expires = "1 reset", "expires "
+	}
+	expiry, ok := credits.SoonestExpiry()
+	if !ok {
+		return label
+	}
+	return label + joiner + expires + countdown(options.Now, expiry)
 }
 
 func planCell(plan string, options Options) string {

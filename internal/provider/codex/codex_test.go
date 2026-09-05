@@ -61,7 +61,7 @@ func TestFetchUsageClassifiesWindowsByDurationAndParsesEmail(t *testing.T) {
 	t.Cleanup(server.Close)
 	fixedNow := time.Date(2026, 8, 8, 5, 0, 0, 0, time.UTC)
 
-	usage, err := New(Config{UsageURL: server.URL, Now: func() time.Time { return fixedNow }}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token", AccountID: "account-id"})
+	usage, err := New(Config{UsageURL: server.URL, ResetCreditsURL: server.URL, Now: func() time.Time { return fixedNow }}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token", AccountID: "account-id"})
 	if err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
@@ -204,7 +204,7 @@ func TestFetchUsageKeepsUnknownWindowsAsScopedLimits(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	usage, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+	usage, err := New(Config{UsageURL: server.URL, ResetCreditsURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
 	if err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
@@ -249,6 +249,138 @@ func TestFetchUsageRejectsMalformedWindow(t *testing.T) {
 		if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), testCase.want) || !strings.Contains(err.Error(), "update hop") {
 			t.Errorf("%s: FetchUsage() error = %v, want ErrUsage naming %q with a next step", testCase.name, err, testCase.want)
 		}
+	}
+}
+
+const usageWithCredits = `{
+	"plan_type": "pro",
+	"rate_limit": {"primary_window": {"used_percent": 45, "limit_window_seconds": 604800, "reset_after_seconds": 1200}},
+	"rate_limit_reset_credits": {
+		"available_count": 2,
+		"credits": [
+			{"id": "a", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-01T00:00:00Z", "expires_at": "2026-08-30T00:00:00Z"},
+			{"id": "b", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-02T00:00:00Z", "expires_at": "2026-08-20T00:00:00Z"},
+			{"id": "c", "status": "consumed", "reset_type": "codex_rate_limits", "granted_at": "2026-07-01T00:00:00Z", "expires_at": "2026-08-25T00:00:00Z"},
+			{"id": "d", "status": "available", "reset_type": "other", "granted_at": "2026-07-01T00:00:00Z", "expires_at": "2026-08-10T00:00:00Z"}
+		]
+	}
+}`
+
+const usageWithoutCredits = `{
+	"plan_type": "pro",
+	"rate_limit": {"primary_window": {"used_percent": 45, "limit_window_seconds": 604800, "reset_after_seconds": 1200}}
+}`
+
+func TestFetchUsageReadsResetCreditsFromTheUsagePayload(t *testing.T) {
+	t.Parallel()
+
+	creditsCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/credits" {
+			creditsCalls++
+		}
+		_, _ = io.WriteString(writer, usageWithCredits)
+	}))
+	t.Cleanup(server.Close)
+
+	usage, err := New(Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits"}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	if creditsCalls != 0 {
+		t.Fatalf("credits endpoint called %d times, want none when the usage payload carries them", creditsCalls)
+	}
+	assertTwoAvailableCredits(t, usage)
+}
+
+func TestFetchUsageFallsBackToTheResetCreditsEndpoint(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/credits" {
+			_, _ = io.WriteString(writer, usageWithoutCredits)
+			return
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer access" {
+			t.Errorf("Authorization = %q, want the usage bearer", got)
+		}
+		if got := request.Header.Get("chatgpt-account-id"); got != "account" {
+			t.Errorf("chatgpt-account-id = %q, want account", got)
+		}
+		if got := request.Header.Get("OpenAI-Beta"); got != "codex-1" {
+			t.Errorf("OpenAI-Beta = %q, want codex-1", got)
+		}
+		if got := request.Header.Get("Originator"); got != "Codex Desktop" {
+			t.Errorf("Originator = %q, want Codex Desktop", got)
+		}
+		_, _ = io.WriteString(writer, `{
+			"available_count": 2,
+			"credits": [
+				{"id": "a", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-01T00:00:00Z", "expires_at": "2026-08-30T00:00:00Z"},
+				{"id": "b", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-02T00:00:00Z", "expires_at": "2026-08-20T00:00:00Z"}
+			]
+		}`)
+	}))
+	t.Cleanup(server.Close)
+
+	usage, err := New(Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits"}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	assertTwoAvailableCredits(t, usage)
+}
+
+func TestFetchUsageSurvivesAFailedResetCreditsCall(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		credits http.HandlerFunc
+	}{
+		{name: "server error", credits: func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusInternalServerError) }},
+		{name: "malformed body", credits: func(writer http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(writer, "not json") }},
+		{name: "hangs past its timeout", credits: func(_ http.ResponseWriter, request *http.Request) { <-request.Context().Done() }},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/credits" {
+					testCase.credits(writer, request)
+					return
+				}
+				_, _ = io.WriteString(writer, usageWithoutCredits)
+			}))
+			t.Cleanup(server.Close)
+
+			usage, err := New(Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits"}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+			if err != nil {
+				t.Fatalf("FetchUsage() error = %v, want usage without credits", err)
+			}
+			if len(usage.Windows) != 1 {
+				t.Fatalf("Windows = %+v, want the weekly window kept", usage.Windows)
+			}
+			if usage.ResetCredits != nil {
+				t.Fatalf("ResetCredits = %+v, want unknown credits left nil rather than reported as zero", usage.ResetCredits)
+			}
+		})
+	}
+}
+
+func assertTwoAvailableCredits(t *testing.T, usage provider.Usage) {
+	t.Helper()
+	credits := usage.ResetCredits
+	if credits == nil || credits.Count != 2 || len(credits.Credits) != 2 {
+		t.Fatalf("ResetCredits = %+v, want count 2 with the two available codex credits", credits)
+	}
+	wantGranted := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	wantExpires := time.Date(2026, time.August, 30, 0, 0, 0, 0, time.UTC)
+	if !credits.Credits[0].GrantedAt.Equal(wantGranted) || !credits.Credits[0].ExpiresAt.Equal(wantExpires) {
+		t.Errorf("first credit = %+v, want granted %s expiring %s", credits.Credits[0], wantGranted, wantExpires)
+	}
+	soonest, ok := credits.SoonestExpiry()
+	if !ok || !soonest.Equal(time.Date(2026, time.August, 20, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("SoonestExpiry() = %s, %t, want the August 20 credit", soonest, ok)
 	}
 }
 

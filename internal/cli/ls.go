@@ -32,6 +32,9 @@ func writeTable(writer io.Writer, document glanceDocument, options render.Option
 			Windows:  account.Windows,
 			Limits:   account.Limits,
 		}
+		if account.ResetCredits != nil {
+			row.ResetCredits = *account.ResetCredits
+		}
 		if account.Error != nil {
 			row.Problem = &render.Problem{Message: account.Error.Message, Action: account.Error.Action}
 		}
