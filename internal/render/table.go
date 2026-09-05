@@ -44,6 +44,7 @@ type Row struct {
 	Provider     provider.Name
 	Account      string
 	Active       bool
+	Disabled     bool
 	Plan         string
 	Windows      []provider.Window
 	Limits       []provider.Limit
@@ -175,8 +176,8 @@ func newSection(rows []Row) section {
 	copy(sorted, rows)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		left, right := sorted[i], sorted[j]
-		if (left.Problem == nil) != (right.Problem == nil) {
-			return left.Problem == nil
+		if rowRank(left) != rowRank(right) {
+			return rowRank(left) < rowRank(right)
 		}
 		return headroomPercent(left) > headroomPercent(right)
 	})
@@ -187,7 +188,7 @@ func newSection(rows []Row) section {
 	dataRows := 0
 	fiveHourCap := false
 	for _, row := range sorted {
-		if row.Problem != nil {
+		if row.Problem != nil || row.Disabled {
 			continue
 		}
 		dataRows++
@@ -227,6 +228,19 @@ func newSection(rows []Row) section {
 		built.uniformScope = true
 	}
 	return built
+}
+
+// rowRank orders usable accounts first, then errors that need a hand, then
+// accounts parked on purpose.
+func rowRank(row Row) int {
+	switch {
+	case row.Disabled:
+		return 2
+	case row.Problem != nil:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func writeSectionTitle(out *strings.Builder, built section, options Options) {
@@ -290,6 +304,9 @@ func writeWideSection(out *strings.Builder, built section, options Options) {
 // only the account and headroom columns.
 func wideCells(row Row, built section, options Options) []string {
 	name := shorten(row.Account, maxNameRunes, options.Plain)
+	if row.Disabled {
+		return []string{name, fmt.Sprintf("%*s", headroomCellWidth, "disabled")}
+	}
 	if row.Problem != nil {
 		return []string{name, fmt.Sprintf("%*s", headroomCellWidth, "ERROR")}
 	}
@@ -339,6 +356,14 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 
 	for _, row := range built.rows {
 		name := padCell(shorten(row.Account, maxNameRunes, options.Plain), nameWidth, false)
+		if row.Disabled {
+			line := name + "  " + fmt.Sprintf("%*s", headroomCellWidth, "disabled")
+			if row.Active {
+				line += "  ACTIVE"
+			}
+			out.WriteString(rowPrefix(row, options) + paint(line, styleDim, options) + "\n")
+			continue
+		}
 		if row.Problem != nil {
 			line := rowPrefix(row, options) + name + "  " +
 				paint(fmt.Sprintf("%*s", headroomCellWidth, "ERROR"), styleRed, options)
@@ -404,6 +429,9 @@ func rowPrefix(row Row, options Options) string {
 	if row.Active {
 		marker = ">"
 	}
+	if row.Disabled {
+		return marker + "   "
+	}
 	if row.Problem != nil {
 		return marker + " " + paint("!", styleRed, options) + " "
 	}
@@ -412,6 +440,9 @@ func rowPrefix(row Row, options Options) string {
 }
 
 func cellStyle(row Row, column int) string {
+	if row.Disabled {
+		return styleDim
+	}
 	if column == 0 {
 		return ""
 	}

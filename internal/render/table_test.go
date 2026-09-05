@@ -490,3 +490,83 @@ func TestScopeLabelExtractsClaudeModelDisplayName(t *testing.T) {
 		t.Fatalf("scopeLabel() = %q, want Fable", got)
 	}
 }
+
+// disabledDesignRows adds a parked slot to each provider: one alongside data
+// and error rows, one that is the active account and the only row.
+func disabledDesignRows(now time.Time) []Row {
+	return []Row{
+		{Provider: provider.Claude, Account: "paused", Disabled: true},
+		{Provider: provider.Claude, Account: "broken", Problem: &Problem{Message: "Usage is unavailable.", Action: "Run 'hop login claude broken', then retry."}},
+		{Provider: provider.Claude, Account: "work", Active: true,
+			Windows: []provider.Window{
+				{Kind: provider.FiveHour, UsedPercent: 7, ResetsAt: now.Add(4*time.Hour + 38*time.Minute)},
+				{Kind: provider.Weekly, UsedPercent: 49, ResetsAt: now.Add(83 * time.Hour)},
+			},
+		},
+		{Provider: provider.Codex, Account: "work2", Active: true, Disabled: true},
+	}
+}
+
+func TestTableWideDisabledRowSortsLastAndShowsDisabledAsHeadroom(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, disabledDesignRows(now), Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         WEEKLY\n" +
+		"> + work       51% LEFT    93% . 4h38m    51% . 3d11h\n" +
+		"  ! broken        ERROR\n" +
+		"    Usage is unavailable. Run 'hop login claude broken', then retry.\n" +
+		"    paused     disabled\n" +
+		"\n" +
+		"CODEX\n" +
+		"    ACCOUNT    HEADROOM\n" +
+		">   work2      disabled\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableNarrowDisabledRowKeepsActiveTag(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, disabledDesignRows(now), Options{Plain: true, Width: 80, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = left at binding cap   detail = left / resets in   * binding\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"> + work     51% LEFT  ACTIVE\n" +
+		"    5h 93%/4h38m . week 51%/3d11h\n" +
+		"  ! broken      ERROR\n" +
+		"    Usage is unavailable. Run 'hop login claude broken', then retry.\n" +
+		"    paused   disabled\n" +
+		"\n" +
+		"CODEX\n" +
+		">   work2   disabled  ACTIVE\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableDimsDisabledRowInColor(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{{Provider: provider.Codex, Account: "work2", Active: true, Disabled: true}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Color: true, Width: 120}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if got := output.String(); !strings.HasSuffix(got, ">   \x1b[2mwork2  \x1b[0m   \x1b[2m disabled\x1b[0m\n") {
+		t.Fatalf("output = %q, want the name and disabled cells dimmed", got)
+	}
+}

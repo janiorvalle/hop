@@ -22,6 +22,7 @@ type accountResult struct {
 	Provider     provider.Name          `json:"provider"`
 	Account      string                 `json:"account"`
 	Active       bool                   `json:"active"`
+	Disabled     bool                   `json:"disabled"`
 	Email        string                 `json:"email,omitempty"`
 	Plan         string                 `json:"plan,omitempty"`
 	Windows      []provider.Window      `json:"windows"`
@@ -53,7 +54,13 @@ func fetchGlance(ctx context.Context, accountCatalog catalog) (glanceDocument, e
 	}
 	document := glanceDocument{Schema: listSchema, Accounts: make([]accountResult, len(accounts))}
 	results := make(chan indexedResult, len(accounts))
+	fetching := 0
 	for index, currentAccount := range accounts {
+		if currentAccount.Disabled {
+			document.Accounts[index] = resultFor(currentAccount, provider.Usage{}, nil)
+			continue
+		}
+		fetching++
 		go func() {
 			if preparer, ok := currentAccount.Fetcher.(accountPreparer); ok {
 				if err := preparer.Prepare(ctx); err != nil {
@@ -67,7 +74,7 @@ func fetchGlance(ctx context.Context, accountCatalog catalog) (glanceDocument, e
 			results <- indexedResult{index: index, result: resultFor(currentAccount, usage, fetchErr)}
 		}()
 	}
-	for range accounts {
+	for range fetching {
 		result := <-results
 		document.Accounts[result.index] = result.result
 	}
@@ -79,6 +86,7 @@ func resultFor(account account, usage provider.Usage, err error) accountResult {
 		Provider: account.Provider,
 		Account:  account.Name,
 		Active:   account.Active,
+		Disabled: account.Disabled,
 		Windows:  make([]provider.Window, 0),
 		Limits:   make([]provider.Limit, 0),
 	}

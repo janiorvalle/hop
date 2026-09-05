@@ -13,16 +13,18 @@ import (
 const helpText = `hop - glance at and switch between Claude and Codex accounts
 
 Usage:
-  hop                              Show usage for every account
-  hop <account>                    Switch both providers with that account
-  hop <provider> <account>         Switch one provider
-  hop login <provider> <account>   Add an account
-  hop ls [--json]                  List accounts
-  hop rm <provider> <account>      Forget an account
-  hop mv <provider> <old> <new>    Rename an account
-  hop upgrade                      Install the latest verified release
-  hop --version                    Show the installed version
-  hop help                         Show this help
+  hop                                Show usage for every account
+  hop <account>                      Switch both providers with that account
+  hop <provider> <account>           Switch one provider
+  hop login <provider> <account>     Add an account
+  hop ls [--json]                    List accounts
+  hop disable <provider> <account>   Park an account: no usage fetch, no switching
+  hop enable <provider> <account>    Bring a parked account back
+  hop rm <provider> <account>        Forget an account
+  hop mv <provider> <old> <new>      Rename an account
+  hop upgrade                        Install the latest verified release
+  hop --version                      Show the installed version
+  hop help                           Show this help
 
 Providers:
   claude, codex
@@ -32,6 +34,8 @@ Examples:
   hop claude personal
   hop login codex work
   hop ls --json
+  hop disable codex paused
+  hop enable codex paused
   hop rm codex old
   hop mv claude work personal
 `
@@ -97,6 +101,16 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("ls accepts only --json; try 'hop ls --json'")
 		}
 		return showAccountsSafely(context.Background(), stdout, stderr, len(args) == 2)
+	case "disable":
+		if err := requireProviderAccount("disable", args[1:]); err != nil {
+			return err
+		}
+		return disableAccount(args[1], args[2], stdout)
+	case "enable":
+		if err := requireProviderAccount("enable", args[1:]); err != nil {
+			return err
+		}
+		return enableAccount(args[1], args[2], stdout)
 	case "rm":
 		if err := requireProviderAccount("rm", args[1:]); err != nil {
 			return err

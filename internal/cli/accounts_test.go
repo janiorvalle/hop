@@ -128,20 +128,20 @@ func TestShowAccountsJSONCarriesClaudePlanFromStoredTier(t *testing.T) {
 	}
 }
 
-func TestSlotAllowsRefreshOnlyForExplicitManagedMetadata(t *testing.T) {
+func TestLoadSlotMetadataTreatsMissingFileAsReadOnlySlot(t *testing.T) {
 	t.Parallel()
 
 	slot := t.TempDir()
-	allowed, err := slotAllowsRefresh(slot)
-	if err != nil || allowed {
-		t.Fatalf("missing metadata = %t, %v; want false, nil", allowed, err)
+	metadata, err := loadSlotMetadata(slot)
+	if err != nil || metadata != (slotMetadata{}) {
+		t.Fatalf("missing metadata = %+v, %v; want empty, nil", metadata, err)
 	}
-	if err := os.WriteFile(filepath.Join(slot, slotMetadataFilename), []byte(`{"refresh_policy":"managed"}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(slot, slotMetadataFilename), []byte(`{"refresh_policy":"managed","disabled":true}`), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	allowed, err = slotAllowsRefresh(slot)
-	if err != nil || !allowed {
-		t.Fatalf("managed metadata = %t, %v; want true, nil", allowed, err)
+	metadata, err = loadSlotMetadata(slot)
+	if err != nil || metadata.RefreshPolicy != managedRefreshPolicy || !metadata.Disabled {
+		t.Fatalf("managed metadata = %+v, %v; want managed and disabled", metadata, err)
 	}
 }
 
