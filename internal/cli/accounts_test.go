@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -78,6 +80,51 @@ func TestDefaultVaultUsesHopHome(t *testing.T) {
 	}
 	if got := accountVault.Root(); got != hopHome {
 		t.Fatalf("vault root = %q, want %q", got, hopHome)
+	}
+}
+
+func TestShowAccountsJSONCarriesClaudePlanFromStoredTier(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"five_hour":{"utilization":25,"resets_at":"2026-08-08T08:00:00Z"}}`))
+	}))
+	t.Cleanup(server.Close)
+	accountVault, err := vault.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("vault.New() error = %v", err)
+	}
+	credentialsPath, err := accountVault.CredentialsPath("claude", "work")
+	if err != nil {
+		t.Fatalf("CredentialsPath() error = %v", err)
+	}
+	store := claude.FileStore{Path: credentialsPath}
+	if err := store.Write(claude.Credentials{AccessToken: "access", SubscriptionType: "max", RateLimitTier: "default_claude_max_20x"}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	catalog := vaultCatalog{
+		vault:         accountVault,
+		state:         state.New(),
+		claudeAdapter: claude.New(claude.Config{UsageURL: server.URL}),
+		codexAdapter:  codex.New(codex.Config{}),
+		now:           time.Now,
+	}
+
+	var output bytes.Buffer
+	if err := showAccountsFrom(context.Background(), &output, true, catalog, time.Now()); err != nil {
+		t.Fatalf("showAccountsFrom() error = %v", err)
+	}
+	var document struct {
+		Accounts []struct {
+			Account string `json:"account"`
+			Plan    string `json:"plan"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &document); err != nil {
+		t.Fatalf("JSON output is invalid: %v\n%s", err, output.String())
+	}
+	if len(document.Accounts) != 1 || document.Accounts[0].Account != "work" || document.Accounts[0].Plan != "Max 20x" {
+		t.Fatalf("accounts = %+v, want claude/work with plan Max 20x", document.Accounts)
 	}
 }
 

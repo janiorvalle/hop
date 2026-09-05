@@ -17,21 +17,21 @@ func lockedDesignRows(now time.Time) []Row {
 			Message: `Usage could not be loaded for claude account "jvalle1".`,
 			Action:  `decode Claude session limit; resets_at may be null only while percent is zero and the limit is inactive, update hop before retrying: claude usage request failed`,
 		}},
-		{Provider: provider.Claude, Account: "work1",
+		{Provider: provider.Claude, Account: "work1", Plan: "Max 5x",
 			Windows: []provider.Window{
 				{Kind: provider.FiveHour, UsedPercent: 66, ResetsAt: now.Add(48 * time.Minute)},
 				{Kind: provider.Weekly, UsedPercent: 66, ResetsAt: now.Add(107 * time.Hour)},
 			},
 			Limits: []provider.Limit{{Kind: "weekly", Scope: "Fable", UsedPercent: 97, ResetsAt: now.Add(107 * time.Hour), Active: true}},
 		},
-		{Provider: provider.Claude, Account: "work2", Active: true,
+		{Provider: provider.Claude, Account: "work2", Active: true, Plan: "Max 20x",
 			Windows: []provider.Window{
 				{Kind: provider.FiveHour, UsedPercent: 7, ResetsAt: now.Add(4*time.Hour + 38*time.Minute)},
 				{Kind: provider.Weekly, UsedPercent: 49, ResetsAt: now.Add(83 * time.Hour)},
 			},
 			Limits: []provider.Limit{{Kind: "weekly", Scope: "Fable", UsedPercent: 68, ResetsAt: now.Add(83 * time.Hour), Active: true}},
 		},
-		{Provider: provider.Claude, Account: "work3",
+		{Provider: provider.Claude, Account: "work3", Plan: "Pro",
 			Windows: []provider.Window{
 				{Kind: provider.FiveHour, UsedPercent: 1, ResetsAt: now.Add(4*time.Hour + 48*time.Minute)},
 				{Kind: provider.Weekly, UsedPercent: 60, ResetsAt: now.Add(76 * time.Hour)},
@@ -63,10 +63,10 @@ func TestTableWidePlainSnapshotMatchesLockedDesign(t *testing.T) {
 		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
 		"\n" +
 		"CLAUDE\n" +
-		"    ACCOUNT    HEADROOM   5 HOUR         WEEKLY         BINDING: Fable / WEEKLY\n" +
-		"> ~ work2      32% LEFT    93% . 4h38m    51% . 3d11h    32% . 3d11h\n" +
-		"  o work1       3% LEFT    34% . 48m      34% . 4d11h     3% . 4d11h\n" +
-		"  o work3       0% LEFT    99% . 4h48m    40% . 3d04h     0% . 3d04h\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         WEEKLY         BINDING: Fable / WEEKLY   PLAN\n" +
+		"> ~ work2      32% LEFT    93% . 4h38m    51% . 3d11h    32% . 3d11h              (Max 20x)\n" +
+		"  o work1       3% LEFT    34% . 48m      34% . 4d11h     3% . 4d11h              (Max 5x)\n" +
+		"  o work3       0% LEFT    99% . 4h48m    40% . 3d04h     0% . 3d04h              (Pro)\n" +
 		"  ! jvalle1       ERROR\n" +
 		"    Usage could not be loaded for claude account \"jvalle1\". decode Claude session limit;\n" +
 		"    resets_at may be null only while percent is zero and the limit is inactive, update hop\n" +
@@ -95,11 +95,11 @@ func TestTableNarrowPlainSnapshotMatchesLockedDesign(t *testing.T) {
 		"\n" +
 		"CLAUDE\n" +
 		"> ~ work2     32% LEFT  ACTIVE\n" +
-		"    5h 93%/4h38m . week 51%/3d11h . Fable* 32%/3d11h\n" +
+		"    5h 93%/4h38m . week 51%/3d11h . Fable* 32%/3d11h . Max 20x\n" +
 		"  o work1      3% LEFT\n" +
-		"    5h 34%/48m . week 34%/4d11h . Fable* 3%/4d11h\n" +
+		"    5h 34%/48m . week 34%/4d11h . Fable* 3%/4d11h . Max 5x\n" +
 		"  o work3      0% LEFT\n" +
-		"    5h 99%/4h48m . week 40%/3d04h . Fable* 0%/3d04h\n" +
+		"    5h 99%/4h48m . week 40%/3d04h . Fable* 0%/3d04h . Pro\n" +
 		"  ! jvalle1      ERROR\n" +
 		"    Usage could not be loaded for claude account \"jvalle1\". decode Claude\n" +
 		"    session limit; resets_at may be null only while percent is zero and the\n" +
