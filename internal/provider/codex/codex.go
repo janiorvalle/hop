@@ -35,6 +35,13 @@ const (
 	accountGroup    = "account"
 	codeReviewGroup = "code_review"
 	modelGroup      = "model"
+	// OpenAI publishes no refresh-token lifetime and auth.json records only
+	// last_refresh. The Codex CLI re-mints its tokens once last_refresh is 8
+	// days old (TOKEN_REFRESH_INTERVAL in codex-rs/login/src/auth/manager.rs),
+	// so a token is known to survive at least that long idle. Fifteen days
+	// puts hop's seven-day rotation lead at that same 8-day age, and a slot
+	// only warns once it has outlived what the CLI itself tolerates.
+	refreshTokenLifetime = 15 * 24 * time.Hour
 )
 
 var (
@@ -166,6 +173,7 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 			usage.ResetCredits = &credits
 		}
 	}
+	usage.RefreshTokenExpiresAt = credentials.RefreshTokenExpiry()
 	return usage, nil
 }
 
@@ -281,6 +289,16 @@ func (credentials Credentials) NeedsRefresh(now time.Time, skew time.Duration) b
 		return false
 	}
 	return time.Unix(claims.ExpiresAt, 0).Before(now.Add(skew))
+}
+
+// RefreshTokenExpiry is when hop stops trusting the refresh token: last_refresh
+// plus refreshTokenLifetime, or zero when last_refresh is missing.
+func (credentials Credentials) RefreshTokenExpiry() time.Time {
+	lastRefresh, err := time.Parse(time.RFC3339Nano, credentials.LastRefresh)
+	if err != nil {
+		return time.Time{}
+	}
+	return lastRefresh.Add(refreshTokenLifetime).UTC()
 }
 
 type usageResponse struct {

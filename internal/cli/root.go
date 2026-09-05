@@ -148,7 +148,7 @@ func showAccounts(ctx context.Context, stdout io.Writer, asJSON bool) error {
 }
 
 func showAccountsFrom(ctx context.Context, stdout io.Writer, asJSON bool, accountCatalog catalog, now time.Time) error {
-	document, err := fetchGlance(ctx, accountCatalog)
+	document, err := fetchGlance(ctx, accountCatalog, now)
 	if err != nil {
 		return err
 	}

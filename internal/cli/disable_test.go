@@ -246,7 +246,7 @@ func TestGlanceSkipsFetchAndRefreshForDisabledSlot(t *testing.T) {
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
 	catalog := vaultCatalog{vault: accountVault, state: state.New(), claudeAdapter: adapter, codexAdapter: codex.New(codex.Config{}), now: time.Now}
 
-	document, err := fetchGlance(context.Background(), catalog)
+	document, err := fetchGlance(context.Background(), catalog, time.Now())
 	if err != nil {
 		t.Fatalf("fetchGlance() error = %v", err)
 	}

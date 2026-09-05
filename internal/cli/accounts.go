@@ -21,6 +21,8 @@ const (
 	slotMetadataFilename      = "slot.json"
 	managedRefreshPolicy      = "managed"
 	refreshSkew               = 5 * time.Minute
+	refreshTokenWarnLead      = 7 * 24 * time.Hour
+	refreshTokenCriticalLead  = 2 * 24 * time.Hour
 	refreshLockWait           = 20 * time.Second
 	refreshLockStale          = 2 * time.Minute
 	refreshLockPoll           = 25 * time.Millisecond
@@ -28,6 +30,15 @@ const (
 	stateLockFilename         = ".state.lock"
 	refreshLockFilename       = ".refresh.lock"
 )
+
+// errRotatedTokensLost marks a rotation the provider completed but hop could not
+// persist: the token on disk is already revoked, so the row must say so now.
+var errRotatedTokensLost = errors.New("rotated tokens were not preserved")
+
+type tokenLifetimes interface {
+	NeedsRefresh(now time.Time, skew time.Duration) bool
+	RefreshTokenExpiry() time.Time
+}
 
 type slotMetadata struct {
 	RefreshPolicy string `json:"refresh_policy,omitempty"`
@@ -283,11 +294,11 @@ func (fetcher claudeSlotFetcher) Prepare(ctx context.Context) error {
 		return nil
 	}
 	credentials, err := fetcher.store.Read()
-	if err != nil || !credentials.NeedsRefresh(fetcher.now(), refreshSkew) {
+	if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
 		return err
 	}
 	_, err = refreshClaudeSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
-	return err
+	return rotationErrorFor(credentials, fetcher.now(), err)
 }
 
 func (fetcher codexSlotFetcher) Prepare(ctx context.Context) error {
@@ -295,11 +306,40 @@ func (fetcher codexSlotFetcher) Prepare(ctx context.Context) error {
 		return nil
 	}
 	credentials, err := fetcher.store.Read()
-	if err != nil || !credentials.NeedsRefresh(fetcher.now(), refreshSkew) {
+	if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
 		return err
 	}
 	_, err = refreshCodexSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
-	return err
+	return rotationErrorFor(credentials, fetcher.now(), err)
+}
+
+// A rotation that only ran early, while the access token still works and the
+// slot is unchanged, must not cost the row its usage: the row's expiry warning
+// names the fix and the next glance retries the rotation.
+func rotationErrorFor(credentials tokenLifetimes, now time.Time, rotationErr error) error {
+	if rotationErr == nil || credentials.NeedsRefresh(now, refreshSkew) || errors.Is(rotationErr, errRotatedTokensLost) {
+		return rotationErr
+	}
+	return nil
+}
+
+func slotNeedsRotation(credentials tokenLifetimes, now time.Time) bool {
+	return credentials.NeedsRefresh(now, refreshSkew) || expiresWithin(credentials.RefreshTokenExpiry(), now, refreshTokenWarnLead)
+}
+
+func expiresWithin(expiry, now time.Time, lead time.Duration) bool {
+	return !expiry.IsZero() && !expiry.After(now.Add(lead))
+}
+
+func refreshTokenSeverity(expiry, now time.Time) string {
+	switch {
+	case expiresWithin(expiry, now, refreshTokenCriticalLead):
+		return "critical"
+	case expiresWithin(expiry, now, refreshTokenWarnLead):
+		return "warning"
+	default:
+		return "normal"
+	}
 }
 
 func refreshClaudeSlot(ctx context.Context, adapter claude.Adapter, store claude.Store, now time.Time) (claude.Credentials, error) {
@@ -310,7 +350,7 @@ func refreshClaudeSlot(ctx context.Context, adapter claude.Adapter, store claude
 		}
 		defer release()
 		credentials, err := fileStore.Read()
-		if err != nil || !credentials.NeedsRefresh(now, refreshSkew) {
+		if err != nil || !slotNeedsRotation(credentials, now) {
 			return credentials, err
 		}
 		if err := ctx.Err(); err != nil {
@@ -323,7 +363,7 @@ func refreshClaudeSlot(ctx context.Context, adapter claude.Adapter, store claude
 		return credentials, err
 	}
 	if recoveryErr := store.Write(credentials); recoveryErr != nil {
-		return claude.Credentials{}, fmt.Errorf("save rotated Claude tokens after two write attempts; run 'hop login claude <account>' before retrying because the slot could not retain the recovery copy: %v: %w", recoveryErr, err)
+		return claude.Credentials{}, fmt.Errorf("save rotated Claude tokens after two write attempts; run 'hop login claude <account>' before retrying because the slot could not retain the recovery copy: %v: %w: %w", recoveryErr, err, errRotatedTokensLost)
 	}
 	return credentials, nil
 }
@@ -336,7 +376,7 @@ func refreshCodexSlot(ctx context.Context, adapter codex.Adapter, store codex.St
 		}
 		defer release()
 		credentials, err := fileStore.Read()
-		if err != nil || !credentials.NeedsRefresh(now, refreshSkew) {
+		if err != nil || !slotNeedsRotation(credentials, now) {
 			return credentials, err
 		}
 		if err := ctx.Err(); err != nil {
@@ -349,7 +389,7 @@ func refreshCodexSlot(ctx context.Context, adapter codex.Adapter, store codex.St
 		return credentials, err
 	}
 	if recoveryErr := store.Write(credentials); recoveryErr != nil {
-		return codex.Credentials{}, fmt.Errorf("save rotated Codex tokens after two write attempts; run 'hop login codex <account>' before retrying because the slot could not retain the recovery copy: %v: %w", recoveryErr, err)
+		return codex.Credentials{}, fmt.Errorf("save rotated Codex tokens after two write attempts; run 'hop login codex <account>' before retrying because the slot could not retain the recovery copy: %v: %w: %w", recoveryErr, err, errRotatedTokensLost)
 	}
 	return credentials, nil
 }
@@ -376,7 +416,7 @@ func refreshClaudeFileSlot(ctx context.Context, adapter claude.Adapter, store cl
 		return claude.Credentials{}, refreshErr
 	}
 	if !journaledStore.saved {
-		return claude.Credentials{}, fmt.Errorf("preserve rotated Claude tokens before replacing the slot; run 'hop login claude <account>' before retrying because the private recovery journal failed: %w", refreshErr)
+		return claude.Credentials{}, fmt.Errorf("preserve rotated Claude tokens before replacing the slot; run 'hop login claude <account>' before retrying because the private recovery journal failed: %w: %w", refreshErr, errRotatedTokensLost)
 	}
 	// The journaled store synced the recovery copy before attempting primary.
 	return credentials, nil
@@ -404,7 +444,7 @@ func refreshCodexFileSlot(ctx context.Context, adapter codex.Adapter, store code
 		return codex.Credentials{}, refreshErr
 	}
 	if !journaledStore.saved {
-		return codex.Credentials{}, fmt.Errorf("preserve rotated Codex tokens before replacing the slot; run 'hop login codex <account>' before retrying because the private recovery journal failed: %w", refreshErr)
+		return codex.Credentials{}, fmt.Errorf("preserve rotated Codex tokens before replacing the slot; run 'hop login codex <account>' before retrying because the private recovery journal failed: %w: %w", refreshErr, errRotatedTokensLost)
 	}
 	// The journaled store synced the recovery copy before attempting primary.
 	return credentials, nil

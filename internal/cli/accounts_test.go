@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -372,7 +373,7 @@ func TestManagedRefreshPersistsRotationAfterGlanceDeadline(t *testing.T) {
 	}
 	result := make(chan glanceResponse, 1)
 	go func() {
-		document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "managed", Fetcher: fetcher}})
+		document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "managed", Fetcher: fetcher}}, time.Now())
 		result <- glanceResponse{document: document, err: err}
 	}()
 	<-tokenStarted
@@ -417,7 +418,7 @@ func TestManagedRefreshLockWaitHonorsGlanceDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "locked", Fetcher: fetcher}})
+	document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "locked", Fetcher: fetcher}}, time.Now())
 	if err != nil {
 		t.Fatalf("fetchGlance() error = %v", err)
 	}
@@ -459,6 +460,18 @@ func TestCodexSlotFetcherRetriesSavingRotatedRecoveryCredentials(t *testing.T) {
 	}
 }
 
+type unwritableClaudeStore struct {
+	credentials claude.Credentials
+}
+
+func (store *unwritableClaudeStore) Read() (claude.Credentials, error) {
+	return store.credentials, nil
+}
+
+func (store *unwritableClaudeStore) Write(claude.Credentials) error {
+	return fmt.Errorf("injected write failure")
+}
+
 type failFirstClaudeWriteStore struct {
 	credentials claude.Credentials
 	writes      int
@@ -497,3 +510,185 @@ func (store *failFirstCodexWriteStore) Write(credentials codex.Credentials) erro
 
 var _ provider.Fetcher = claudeSlotFetcher{}
 var _ provider.Fetcher = codexSlotFetcher{}
+
+func TestClaudeSlotFetcherRotatesBeforeRefreshTokenExpires(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	for _, scenario := range []struct {
+		name           string
+		refreshAllowed bool
+		expiresIn      time.Duration
+		wantCalls      int32
+	}{
+		{name: "managed six days out", refreshAllowed: true, expiresIn: 6 * 24 * time.Hour, wantCalls: 1},
+		{name: "managed eight days out", refreshAllowed: true, expiresIn: 8 * 24 * time.Hour, wantCalls: 0},
+		{name: "unmanaged six days out", refreshAllowed: false, expiresIn: 6 * 24 * time.Hour, wantCalls: 0},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			var refreshCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				refreshCalls.Add(1)
+				_, _ = writer.Write([]byte(`{"access_token":"fresh","refresh_token":"rotated","expires_in":3600,"refresh_token_expires_in":2592000}`))
+			}))
+			t.Cleanup(server.Close)
+			store := claude.FileStore{Path: filepath.Join(t.TempDir(), "credentials.json")}
+			seeded := claude.Credentials{
+				AccessToken:           "valid",
+				RefreshToken:          "refresh",
+				ExpiresAt:             now.Add(time.Hour).UnixMilli(),
+				RefreshTokenExpiresAt: now.Add(scenario.expiresIn).UnixMilli(),
+			}
+			if err := store.Write(seeded); err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+			adapter := claude.New(claude.Config{TokenURL: server.URL, Now: clock})
+			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: scenario.refreshAllowed, now: clock}
+			if err := fetcher.Prepare(context.Background()); err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			if got := refreshCalls.Load(); got != scenario.wantCalls {
+				t.Fatalf("refresh calls = %d, want %d", got, scenario.wantCalls)
+			}
+			stored, err := store.Read()
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			wantExpiry := seeded.RefreshTokenExpiresAt
+			if scenario.wantCalls == 1 {
+				wantExpiry = now.Add(30 * 24 * time.Hour).UnixMilli()
+			}
+			if stored.RefreshTokenExpiresAt != wantExpiry {
+				t.Fatalf("stored refreshTokenExpiresAt = %d, want %d", stored.RefreshTokenExpiresAt, wantExpiry)
+			}
+		})
+	}
+}
+
+func TestClaudeSlotFetcherKeepsUsableAccessTokenWhenEarlyRotationFails(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	for _, scenario := range []struct {
+		name            string
+		accessExpiresIn time.Duration
+		wantPrepareErr  bool
+	}{
+		{name: "access token still valid", accessExpiresIn: time.Hour, wantPrepareErr: false},
+		{name: "access token expired", accessExpiresIn: -time.Hour, wantPrepareErr: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/usage" {
+					_, _ = writer.Write([]byte(`{"five_hour":{"utilization":25,"resets_at":"2026-08-08T08:00:00Z"}}`))
+					return
+				}
+				http.Error(writer, "token endpoint down", http.StatusBadGateway)
+			}))
+			t.Cleanup(server.Close)
+			store := claude.FileStore{Path: filepath.Join(t.TempDir(), "credentials.json")}
+			if err := store.Write(claude.Credentials{
+				AccessToken:           "valid",
+				RefreshToken:          "refresh",
+				ExpiresAt:             now.Add(scenario.accessExpiresIn).UnixMilli(),
+				RefreshTokenExpiresAt: now.Add(6 * 24 * time.Hour).UnixMilli(),
+			}); err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+			adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token", Now: clock})
+			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: clock}
+			err := fetcher.Prepare(context.Background())
+			if (err != nil) != scenario.wantPrepareErr {
+				t.Fatalf("Prepare() error = %v, want error %t", err, scenario.wantPrepareErr)
+			}
+			if scenario.wantPrepareErr {
+				return
+			}
+			usage, err := fetcher.FetchUsage(context.Background())
+			if err != nil {
+				t.Fatalf("FetchUsage() error = %v", err)
+			}
+			if !usage.RefreshTokenExpiresAt.Equal(now.Add(6 * 24 * time.Hour)) {
+				t.Fatalf("usage refresh token expiry = %s, want the unrotated six-day expiry", usage.RefreshTokenExpiresAt)
+			}
+		})
+	}
+}
+
+func TestClaudeSlotFetcherSurfacesRotatedTokensItCouldNotSave(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"access_token":"fresh","refresh_token":"rotated","expires_in":3600,"refresh_token_expires_in":2592000}`))
+	}))
+	t.Cleanup(server.Close)
+	store := &unwritableClaudeStore{credentials: claude.Credentials{
+		AccessToken:           "valid",
+		RefreshToken:          "refresh",
+		ExpiresAt:             now.Add(time.Hour).UnixMilli(),
+		RefreshTokenExpiresAt: now.Add(6 * 24 * time.Hour).UnixMilli(),
+	}}
+	adapter := claude.New(claude.Config{TokenURL: server.URL, Now: clock})
+	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: clock}
+
+	err := fetcher.Prepare(context.Background())
+	if !errors.Is(err, errRotatedTokensLost) {
+		t.Fatalf("Prepare() error = %v, want the lost-rotation error even though the access token is still valid", err)
+	}
+}
+
+func TestCodexSlotFetcherRotatesWhenLastRefreshAgesOut(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	for _, scenario := range []struct {
+		name      string
+		age       time.Duration
+		wantCalls int32
+	}{
+		{name: "nine days old", age: 9 * 24 * time.Hour, wantCalls: 1},
+		{name: "one day old", age: 24 * time.Hour, wantCalls: 0},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			var refreshCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				refreshCalls.Add(1)
+				_, _ = writer.Write([]byte(`{"access_token":"fresh","refresh_token":"rotated"}`))
+			}))
+			t.Cleanup(server.Close)
+			validPayload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, now.Add(time.Hour).Unix())))
+			store := codex.FileStore{Path: filepath.Join(t.TempDir(), "credentials.json")}
+			lastRefresh := now.Add(-scenario.age).Format(time.RFC3339Nano)
+			if err := store.Write(codex.Credentials{AccessToken: "header." + validPayload + ".signature", RefreshToken: "refresh", AccountID: "account", LastRefresh: lastRefresh}); err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+			adapter := codex.New(codex.Config{TokenURL: server.URL, Now: clock})
+			fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: clock}
+			if err := fetcher.Prepare(context.Background()); err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			if got := refreshCalls.Load(); got != scenario.wantCalls {
+				t.Fatalf("refresh calls = %d, want %d", got, scenario.wantCalls)
+			}
+			stored, err := store.Read()
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			wantLastRefresh := lastRefresh
+			if scenario.wantCalls == 1 {
+				wantLastRefresh = now.Format(time.RFC3339Nano)
+			}
+			if stored.LastRefresh != wantLastRefresh {
+				t.Fatalf("stored last_refresh = %q, want %q", stored.LastRefresh, wantLastRefresh)
+			}
+		})
+	}
+}

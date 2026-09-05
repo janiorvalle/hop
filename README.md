@@ -45,6 +45,16 @@ What hop touches:
 - **The live credential slot, in place.** Before installing the account you
   asked for, hop copies the current live credentials back to the account slot
   they came from, so the login you're leaving is never lost.
+- **Idle account tokens, before they die.** Every glance rotates a managed
+  account's tokens when its access token is about to expire, or when its
+  refresh token has less than seven days left, so an account you haven't
+  looked at in weeks doesn't quietly send you back through MFA. Claude says
+  when its refresh token expires. Codex doesn't, so hop treats a Codex refresh
+  token as good for fifteen days after its `last_refresh`, which rotates it at
+  eight days, the same age the Codex CLI itself renews at. Any account, managed
+  or not, gets a warning on its row inside seven days and a red one inside two,
+  with the `hop rm` and `hop login` commands that renew it. `hop ls --json` carries the
+  same thing as `refresh_token_expiry`.
 
 What hop never does:
 

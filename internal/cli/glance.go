@@ -29,6 +29,14 @@ type accountResult struct {
 	Limits       []provider.Limit       `json:"limits"`
 	ResetCredits *provider.ResetCredits `json:"reset_credits,omitempty"`
 	Error        *accountProblem        `json:"error,omitempty"`
+	// RefreshTokenExpiry is additive on hop.ls/v1 and absent when the expiry is unknown.
+	RefreshTokenExpiry *refreshTokenExpiry `json:"refresh_token_expiry,omitempty"`
+}
+
+type refreshTokenExpiry struct {
+	ExpiresAt time.Time `json:"expires_at"`
+	Severity  string    `json:"severity"`
+	Action    string    `json:"action,omitempty"`
 }
 
 type accountProblem struct {
@@ -47,7 +55,7 @@ type accountPreparer interface {
 	Prepare(context.Context) error
 }
 
-func fetchGlance(ctx context.Context, accountCatalog catalog) (glanceDocument, error) {
+func fetchGlance(ctx context.Context, accountCatalog catalog, now time.Time) (glanceDocument, error) {
 	accounts, err := accountCatalog.Accounts()
 	if err != nil {
 		return glanceDocument{}, err
@@ -71,7 +79,9 @@ func fetchGlance(ctx context.Context, accountCatalog catalog) (glanceDocument, e
 			usageCtx, cancel := context.WithTimeout(ctx, usageTimeout)
 			defer cancel()
 			usage, fetchErr := currentAccount.Fetcher.FetchUsage(usageCtx)
-			results <- indexedResult{index: index, result: resultFor(currentAccount, usage, fetchErr)}
+			result := resultFor(currentAccount, usage, fetchErr)
+			result.RefreshTokenExpiry = refreshTokenExpiryFor(currentAccount, usage.RefreshTokenExpiresAt, now)
+			results <- indexedResult{index: index, result: result}
 		}()
 	}
 	for range fetching {
@@ -112,6 +122,27 @@ func resultFor(account account, usage provider.Usage, err error) accountResult {
 		result.ResetCredits = &credits
 	}
 	return result
+}
+
+// Only the provider CLI can renew the live login; hop login would adopt it unchanged.
+var liveRenewalActions = map[provider.Name]string{
+	provider.Claude: "Run 'claude' and use /login to renew it.",
+	provider.Codex:  "Run 'codex login' to renew it.",
+}
+
+func refreshTokenExpiryFor(account account, expiresAt, now time.Time) *refreshTokenExpiry {
+	if expiresAt.IsZero() {
+		return nil
+	}
+	expiry := &refreshTokenExpiry{ExpiresAt: expiresAt, Severity: refreshTokenSeverity(expiresAt, now)}
+	if expiry.Severity == "normal" {
+		return expiry
+	}
+	expiry.Action = fmt.Sprintf("Run 'hop rm %s %s' and then 'hop login %s %s' to renew it.", account.Provider, account.Name, account.Provider, account.Name)
+	if account.Active {
+		expiry.Action = liveRenewalActions[account.Provider]
+	}
+	return expiry
 }
 
 func usageProblem(failedAccount account, err error) *accountProblem {

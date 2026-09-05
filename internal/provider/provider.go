@@ -96,6 +96,8 @@ type Usage struct {
 	Limits   []Limit  `json:"limits"`
 	// ResetCredits is nil when the provider has no manual resets or the count is unknown.
 	ResetCredits *ResetCredits `json:"reset_credits,omitempty"`
+	// RefreshTokenExpiresAt is zero when the provider never said.
+	RefreshTokenExpiresAt time.Time `json:"refresh_token_expires_at"`
 }
 
 // Fetcher retrieves normalized usage for one account.

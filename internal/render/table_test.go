@@ -570,3 +570,93 @@ func TestTableDimsDisabledRowInColor(t *testing.T) {
 		t.Fatalf("output = %q, want the name and disabled cells dimmed", got)
 	}
 }
+
+func refreshWarningRows(now time.Time) []Row {
+	windows := []provider.Window{{Kind: provider.FiveHour, UsedPercent: 12, ResetsAt: now.Add(time.Hour)}}
+	return []Row{
+		{Provider: provider.Claude, Account: "quiet", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(6 * 24 * time.Hour), Severity: "warning", Action: "Run 'hop rm claude quiet' and then 'hop login claude quiet' to renew it."}},
+		{Provider: provider.Claude, Account: "urgent", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(36 * time.Hour), Severity: "critical", Action: "Run 'hop rm claude urgent' and then 'hop login claude urgent' to renew it."}},
+		{Provider: provider.Claude, Account: "dead", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(-time.Hour), Severity: "critical", Action: "Run 'hop rm claude dead' and then 'hop login claude dead' to renew it."}},
+		{Provider: provider.Claude, Account: "fine", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(30 * 24 * time.Hour), Severity: "normal"}},
+	}
+}
+
+func TestTableWideRefreshTokenWarningSnapshot(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, refreshWarningRows(now), Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR\n" +
+		"  + quiet      88% LEFT    88% . 1h00m\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude quiet' and then 'hop login claude quiet'\n" +
+		"    to renew it.\n" +
+		"  + urgent     88% LEFT    88% . 1h00m\n" +
+		"    Refresh token expires in 1d12h. Run 'hop rm claude urgent' and then 'hop login claude\n" +
+		"    urgent' to renew it.\n" +
+		"  + dead       88% LEFT    88% . 1h00m\n" +
+		"    Refresh token has expired. Run 'hop rm claude dead' and then 'hop login claude dead' to\n" +
+		"    renew it.\n" +
+		"  + fine       88% LEFT    88% . 1h00m\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableNarrowRefreshTokenWarningSnapshot(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, refreshWarningRows(now), Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = left at binding cap   detail = left / resets in\n" +
+		"* binding\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full\n" +
+		"! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"  + quiet    88% LEFT\n" +
+		"    5h 88%/1h00m\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude\n" +
+		"    quiet' and then 'hop login claude quiet' to renew it.\n" +
+		"  + urgent   88% LEFT\n" +
+		"    5h 88%/1h00m\n" +
+		"    Refresh token expires in 1d12h. Run 'hop rm claude\n" +
+		"    urgent' and then 'hop login claude urgent' to renew it.\n" +
+		"  + dead     88% LEFT\n" +
+		"    5h 88%/1h00m\n" +
+		"    Refresh token has expired. Run 'hop rm claude dead' and\n" +
+		"    then 'hop login claude dead' to renew it.\n" +
+		"  + fine     88% LEFT\n" +
+		"    5h 88%/1h00m\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableColorsRefreshTokenWarningAmberAndRed(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	rows := []Row{
+		{Provider: provider.Codex, Account: "amber", RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(5 * 24 * time.Hour), Severity: "warning", Action: "Renew it."}},
+		{Provider: provider.Codex, Account: "red", RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(24 * time.Hour), Severity: "critical", Action: "Renew it."}},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Color: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	for _, line := range []string{styleAmber + "Refresh token expires in 5d00h. Renew it." + styleReset, styleRed + "Refresh token expires in 1d00h. Renew it." + styleReset} {
+		if !strings.Contains(output.String(), line) {
+			t.Errorf("output missing %q: %q", line, output.String())
+		}
+	}
+}
