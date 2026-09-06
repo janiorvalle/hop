@@ -440,7 +440,7 @@ func writeExpiryGuidance(out *strings.Builder, expiry *TokenExpiry, options Opti
 	}
 	notice := "Refresh token has expired."
 	if expiry.ExpiresAt.After(options.Now) {
-		notice = fmt.Sprintf("Refresh token expires in %s.", countdown(options.Now, expiry.ExpiresAt))
+		notice = fmt.Sprintf("Refresh token expires in %s.", Countdown(options.Now, expiry.ExpiresAt))
 	}
 	writeGuidance(out, notice+" "+expiry.Action, style, options)
 }
