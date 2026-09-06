@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/janiorvalle/hop/internal/provider"
 	"github.com/janiorvalle/hop/internal/render"
 )
 
@@ -77,6 +78,11 @@ func refreshStatus(ctx context.Context, current account) (string, error) {
 	}
 }
 
+var unmanagedRemedies = map[provider.Name]string{
+	provider.Claude: "run 'hop rm claude %[1]s' and then 'hop login claude %[1]s'",
+	provider.Codex:  "run 'hop login codex %[1]s'",
+}
+
 func unmanagedStatus(current account) string {
-	return fmt.Sprintf("skipped: not managed by hop, run 'hop rm %s %s' and then 'hop login %s %s' to let hop rotate it", current.Provider, current.Name, current.Provider, current.Name)
+	return fmt.Sprintf("skipped: not managed by hop, %s to let hop rotate it", fmt.Sprintf(unmanagedRemedies[current.Provider], current.Name))
 }

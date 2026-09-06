@@ -40,7 +40,10 @@ This spends 1 of 2 manual resets on codex account "work". Continue? [y/N]
 
 Automation can answer with `HOP_CODEX_RESET=approved`. Hop records the request
 id in the account slot before it calls OpenAI and sends the same id again on a
-retry, so a dropped connection never spends two credits. An account with no
+retry, so a dropped connection never spends two credits. While that request is
+still unconfirmed, `hop rm codex work` refuses to forget the account, and
+`hop login codex work` signs the same identity in again without touching the
+record, so an expired token never costs a second credit. An account with no
 credits left is refused with the count and when its weekly limit resets on its
 own. Claude has no manual resets, so `hop reset claude` is refused.
 
@@ -69,8 +72,9 @@ What hop touches:
   token as good for fifteen days after its `last_refresh`, which rotates it at
   eight days, the same age the Codex CLI itself renews at. Any account, managed
   or not, gets a warning on its row inside seven days and a red one inside two,
-  with the `hop rm` and `hop login` commands that renew it. `hop ls --json` carries the
-  same thing as `refresh_token_expiry`. `hop refresh` does the same rotation
+  with the command that renews it: `hop login codex <name>` signs a Codex
+  account in again in place, and a Claude account needs `hop rm` before
+  `hop login`. `hop ls --json` carries the same thing as `refresh_token_expiry`. `hop refresh` does the same rotation
   without fetching usage, so a scheduler can run it for you.
 
 What hop never does:

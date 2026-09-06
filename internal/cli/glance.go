@@ -148,6 +148,13 @@ var liveRenewalActions = map[provider.Name]string{
 	provider.Codex:  "Run 'codex login' to renew it.",
 }
 
+// Codex login renews an enrolled slot in place; Claude login still needs the
+// slot gone first.
+var slotRenewalActions = map[provider.Name]string{
+	provider.Claude: "Run 'hop rm claude %[1]s' and then 'hop login claude %[1]s' to renew it.",
+	provider.Codex:  "Run 'hop login codex %[1]s' to renew it.",
+}
+
 func refreshTokenExpiryFor(account account, expiresAt, now time.Time) *refreshTokenExpiry {
 	if expiresAt.IsZero() {
 		return nil
@@ -156,7 +163,7 @@ func refreshTokenExpiryFor(account account, expiresAt, now time.Time) *refreshTo
 	if expiry.Severity == "normal" {
 		return expiry
 	}
-	expiry.Action = fmt.Sprintf("Run 'hop rm %s %s' and then 'hop login %s %s' to renew it.", account.Provider, account.Name, account.Provider, account.Name)
+	expiry.Action = fmt.Sprintf(slotRenewalActions[account.Provider], account.Name)
 	if account.Active {
 		expiry.Action = liveRenewalActions[account.Provider]
 	}

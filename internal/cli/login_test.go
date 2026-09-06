@@ -696,3 +696,278 @@ func TestBrowserCommandHonorsBROWSERBeforeThePlatformOpener(t *testing.T) {
 		t.Fatalf("browserCommand().Args = %v, want %v", got, want)
 	}
 }
+
+func TestLoginCodexRenewsAnEnrolledSlotAndKeepsItsPendingReset(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	slotPath := filepath.Dir(credentialsPath)
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "expired", RefreshToken: "dead", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	if err := writeSlotMetadata(slotPath, slotMetadata{RefreshPolicy: managedRefreshPolicy, Email: "owner@example.com", Disabled: true}); err != nil {
+		t.Fatalf("seed slot metadata: %v", err)
+	}
+	pendingPath := filepath.Join(slotPath, pendingResetFilename)
+	if err := writePendingReset(pendingPath, pendingReset{RedeemRequestID: "0f3c9a1e-7d2b-4c8e-9a1f-2b3c4d5e6f70", AccountID: "account"}); err != nil {
+		t.Fatalf("seed pending reset: %v", err)
+	}
+	var stdout bytes.Buffer
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: &stdout,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "codex", "work", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	renewed, err := (codex.FileStore{Path: credentialsPath}).Read()
+	if err != nil || renewed.RefreshToken != "fresh-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want the fresh sign-in", renewed, err)
+	}
+	pending, found, err := readPendingReset(pendingPath)
+	if err != nil || !found || pending.RedeemRequestID != "0f3c9a1e-7d2b-4c8e-9a1f-2b3c4d5e6f70" {
+		t.Fatalf("pending reset after renewal = %+v, %t, %v; want the recorded request kept", pending, found, err)
+	}
+	metadata := readSlotMetadata(t, slotPath)
+	if metadata.RefreshPolicy != managedRefreshPolicy || metadata.Email != "owner@example.com" || !metadata.Disabled {
+		t.Fatalf("slot metadata = %+v, want custody and the disabled flag kept", metadata)
+	}
+	if got := stdout.String(); !strings.Contains(got, `Renewed codex account "work" (owner@example.com)`) {
+		t.Fatalf("stdout = %q, want renewal receipt", got)
+	}
+}
+
+func TestLoginCodexRefusesRenewingASlotWithAnotherIdentity(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "kept", RefreshToken: "kept-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "other", RefreshToken: "other-refresh", AccountID: "other-account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			t.Fatal("email looked up for a refused sign-in")
+			return "", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_OTHER_IDENTITY]") || !strings.Contains(err.Error(), "hop rm codex work") {
+		t.Fatalf("Login() error = %v, want the other-identity refusal with the removal next step", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.RefreshToken != "kept-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want them untouched", got, err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingTheActiveAccountBeforeSigningIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "live", RefreshToken: "live-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	activeState := state.New()
+	activeState.SetActive("codex", "work")
+	if err := activeState.Save(accountVault.Root()); err != nil {
+		t.Fatalf("state.Save() error = %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("codex login started for the active account")
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_ACTIVE_ACCOUNT]") || !strings.Contains(err.Error(), "codex login") {
+		t.Fatalf("Login() error = %v, want the active-account refusal with the live renewal next step", err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingAnAccountThatWentLiveDuringSignIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "kept", RefreshToken: "kept-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			activeState := state.New()
+			activeState.SetActive("codex", "work")
+			if err := activeState.Save(accountVault.Root()); err != nil {
+				t.Fatalf("state.Save() error = %v", err)
+			}
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_ACTIVE_ACCOUNT]") {
+		t.Fatalf("Login() error = %v, want the active-account refusal after sign-in", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.RefreshToken != "kept-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want the live slot untouched", got, err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingASlotReEnrolledDuringSignIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "other", RefreshToken: "other-refresh", AccountID: "other-account"}); err != nil {
+				t.Fatalf("re-enroll slot during sign-in: %v", err)
+			}
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_OTHER_IDENTITY]") {
+		t.Fatalf("Login() error = %v, want the other-identity refusal after sign-in", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.AccountID != "other-account" {
+		t.Fatalf("slot credentials = %#v, error = %v; want the re-enrolled identity kept", got, err)
+	}
+}
+
+func TestLoginCodexExplainsASlotRemovedDuringSignIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if err := os.RemoveAll(filepath.Dir(credentialsPath)); err != nil {
+				t.Fatalf("remove slot during sign-in: %v", err)
+			}
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "removed while you signed in") {
+		t.Fatalf("Login() error = %v, want the removed-slot explanation", err)
+	}
+	if _, err := os.Stat(filepath.Dir(credentialsPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("slot after refused renewal: %v, want it absent", err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingTheSlotTheLiveLoginMatchesWhenNoActiveAccountIsRecorded(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{credentials: codex.Credentials{AccessToken: "live", RefreshToken: "live-refresh", AccountID: "account"}},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("codex login started for the slot the live login matches")
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_ACTIVE_ACCOUNT]") {
+		t.Fatalf("Login() error = %v, want the active-account refusal from the live login match", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.RefreshToken != "old-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want them untouched", got, err)
+	}
+}
+
+func TestLoginCodexStopsRenewalWhenTheLiveLoginCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: errors.New("auth.json is half written")},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("codex login started while the live login was unreadable")
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "half written") || !strings.Contains(err.Error(), "codex login") {
+		t.Fatalf("Login() error = %v, want the live-login repair step", err)
+	}
+}
