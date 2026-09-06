@@ -278,6 +278,87 @@ func TestTableFallsBackToNarrowWhenWideDoesNotFit(t *testing.T) {
 	}
 }
 
+func TestTableShowsCodexDurationAndCodeReviewLimits(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{{
+		Provider: provider.Codex,
+		Account:  "work",
+		Plan:     "pro",
+		Windows:  []provider.Window{{Kind: provider.FiveHour, UsedPercent: 62, ResetsAt: now.Add(2*time.Hour + 10*time.Minute)}},
+		Limits: []provider.Limit{
+			{Kind: "account_30d", Group: "account", Scope: "30d", UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour), Active: true},
+			{Kind: "code_review_weekly", Group: "code_review", Scope: "code review", UsedPercent: 10, ResetsAt: now.Add(10 * time.Minute), Active: true},
+		},
+	}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CODEX  .  pro\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         BINDING\n" +
+		"  ~ work       38% LEFT    38% . 2h10m   30d  80% . 1d00h   code review 90% . 10m\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+
+	output.Reset()
+	if err := Table(&output, rows, Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	for _, detail := range []string{"30d* 80%/1d00h", "code review* 90%/10m"} {
+		if !strings.Contains(output.String(), detail) {
+			t.Errorf("narrow detail missing %q: %q", detail, output.String())
+		}
+	}
+}
+
+func TestTableNamesUnknownDurationsOnce(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	testCases := []struct {
+		name       string
+		limit      provider.Limit
+		wantHeader string
+		wantNarrow string
+	}{
+		{
+			name:       "account window is its own scope",
+			limit:      provider.Limit{Kind: "account_30d", Scope: "30d", UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour), Active: true},
+			wantHeader: "BINDING: 30d\n",
+			wantNarrow: "30d* 80%/1d00h",
+		},
+		{
+			name:       "model cap carries its duration",
+			limit:      provider.Limit{Kind: "model_30d", Scope: "GPT", UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour), Active: true},
+			wantHeader: "BINDING: GPT / 30D\n",
+			wantNarrow: "GPT*(30d) 80%/1d00h",
+		},
+	}
+	for _, testCase := range testCases {
+		rows := []Row{{Provider: provider.Codex, Account: "work", Limits: []provider.Limit{testCase.limit}}}
+		var output bytes.Buffer
+		if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+			t.Fatalf("%s: Table() error = %v", testCase.name, err)
+		}
+		if !strings.Contains(output.String(), testCase.wantHeader) {
+			t.Errorf("%s: wide header missing %q: %q", testCase.name, testCase.wantHeader, output.String())
+		}
+		output.Reset()
+		if err := Table(&output, rows, Options{Plain: true, Width: 60, Now: now}); err != nil {
+			t.Fatalf("%s: Table() error = %v", testCase.name, err)
+		}
+		if !strings.Contains(output.String(), testCase.wantNarrow) {
+			t.Errorf("%s: narrow detail missing %q: %q", testCase.name, testCase.wantNarrow, output.String())
+		}
+	}
+}
+
 func TestTableShowsInactiveScopedLimitUsage(t *testing.T) {
 	t.Parallel()
 
