@@ -19,10 +19,9 @@ import (
 // opted-in run cannot disturb a real login.
 const roundTripService = "hop-keychain-round-trip-test"
 
-// TestKeychainRoundTripThroughSecurityInteractiveMode proves the two facts the
+// TestKeychainRoundTripThroughSecurityInteractiveMode proves the fact the
 // fakes elsewhere have to assume: security(1)'s interactive tokenizer returns
-// the credential JSON byte for byte, and a missing item exits with the status
-// clearLiveCredentials treats as already cleared.
+// the credential JSON byte for byte.
 //
 // It is opt-in because it runs the real security(1) against a keychain it
 // creates. Set HOP_CLAUDE_KEYCHAIN_TEST=1 to run it.
@@ -62,18 +61,6 @@ func TestKeychainRoundTripThroughSecurityInteractiveMode(t *testing.T) {
 	restored, err := parseCredentials(readBack)
 	if err != nil || restored.AccessToken != credentials.AccessToken || restored.RefreshToken != credentials.RefreshToken {
 		t.Fatalf("restored credentials = %+v, error = %v; want %+v", restored, err, credentials)
-	}
-
-	deleteCommand, err := keychainDeleteCommand(roundTripService)
-	if err != nil {
-		t.Fatalf("keychainDeleteCommand() error = %v", err)
-	}
-	if output, err := runSecurity(ctx, t, withKeychain(deleteCommand, keychainPath)); err != nil {
-		t.Fatalf("delete the round-trip item: %v: %s", err, output)
-	}
-	_, err = runSecurity(ctx, t, withKeychain(deleteCommand, keychainPath))
-	if securityExitCode(err) != securityItemNotFound {
-		t.Fatalf("deleting a missing item exited with %d, want %d; clearLiveCredentials reads that status as already cleared", securityExitCode(err), securityItemNotFound)
 	}
 }
 

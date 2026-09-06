@@ -50,13 +50,6 @@ func WriteLiveCredentials(ctx context.Context, credentials Credentials) error {
 	return writeLiveCredentials(ctx, systemSecurity{}, credentials)
 }
 
-// ClearLiveCredentials removes Claude Code's Keychain item so the Claude CLI
-// sees no login and opens its browser sign-in. An item that is already absent
-// counts as cleared.
-func ClearLiveCredentials(ctx context.Context) error {
-	return clearLiveCredentials(ctx, systemSecurity{})
-}
-
 // ClearLiveCredentialsIfMatches refuses to turn a read-then-delete into a
 // compare-and-delete promise Keychain cannot provide. The user can remove the
 // item explicitly, after which retrying hop completes recovery from absence.
@@ -122,41 +115,6 @@ func writeLiveCredentials(ctx context.Context, security securityCommander, crede
 	return verifyClaudeAcceptsLogin(ctx, claudePath)
 }
 
-func clearLiveCredentials(ctx context.Context, security securityCommander) error {
-	command, err := keychainDeleteCommand(keychainService)
-	if err != nil {
-		return err
-	}
-	// Exactly one delete, because a Keychain search returns the same first match
-	// to every tool: this removes the item ReadLiveCredentials handed to the
-	// caller to stash, and nothing hop has no copy of.
-	if _, err := security.Run(ctx, command, "-i"); err != nil && securityExitCode(err) != securityItemNotFound {
-		return fmt.Errorf("clear the %q Keychain item so Claude opens a fresh browser login; unlock Keychain and retry: %w", keychainService, err)
-	}
-	remaining, err := keychainItemExists(ctx, security)
-	if err != nil {
-		return err
-	}
-	if remaining {
-		return fmt.Errorf("clear the %q Keychain item so Claude opens a fresh browser login; a second item still uses that service and hop holds no copy of it, so open Keychain Access, remove or rename the duplicate, and retry", keychainService)
-	}
-	return nil
-}
-
-// keychainItemExists reports whether any item still uses the service. It asks
-// for the item's attributes rather than its password, which keeps the check
-// away from the access controls that guard the secret itself.
-func keychainItemExists(ctx context.Context, security securityCommander) (bool, error) {
-	_, err := security.Run(ctx, "", "find-generic-password", "-s", keychainService)
-	if err == nil {
-		return true, nil
-	}
-	if securityExitCode(err) == securityItemNotFound {
-		return false, nil
-	}
-	return false, fmt.Errorf("confirm the %q Keychain item is gone before Claude's browser login opens; unlock Keychain and retry: %w", keychainService, err)
-}
-
 // keychainWriteCommand builds the security(1) interactive-mode command that
 // stores contents as the item's password. Interactive mode reads its commands
 // from stdin, so the secret never reaches the process arguments that every
@@ -170,12 +128,6 @@ func keychainWriteCommand(service, account, trustedApplication, contents string)
 		"-w", quoteSecurityArgument(contents),
 	}, " ")
 	return terminateSecurityCommand(command, service)
-}
-
-// keychainDeleteCommand builds the security(1) interactive-mode command that
-// removes the item.
-func keychainDeleteCommand(service string) (string, error) {
-	return terminateSecurityCommand("delete-generic-password -s "+quoteSecurityArgument(service), service)
 }
 
 func terminateSecurityCommand(command, service string) (string, error) {
