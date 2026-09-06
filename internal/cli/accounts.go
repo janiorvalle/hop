@@ -40,6 +40,21 @@ type tokenLifetimes interface {
 	RefreshTokenExpiry() time.Time
 }
 
+type rotationOutcome string
+
+const (
+	rotationUnmanaged rotationOutcome = "unmanaged"
+	rotationFresh     rotationOutcome = "fresh"
+	rotationRotated   rotationOutcome = "rotated"
+)
+
+// rotation is what one idle slot reports after the refresh decision the glance
+// makes in Prepare has run for it.
+type rotation struct {
+	Outcome            rotationOutcome
+	RefreshTokenExpiry time.Time
+}
+
 type slotMetadata struct {
 	RefreshPolicy string `json:"refresh_policy,omitempty"`
 	Email         string `json:"email,omitempty"`
@@ -311,6 +326,46 @@ func (fetcher codexSlotFetcher) Prepare(ctx context.Context) error {
 	}
 	_, err = refreshCodexSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
 	return rotationErrorFor(credentials, fetcher.now(), err)
+}
+
+func (fetcher claudeSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
+	if !fetcher.refreshAllowed {
+		return rotation{Outcome: rotationUnmanaged}, nil
+	}
+	credentials, err := fetcher.store.Read()
+	if err != nil {
+		return rotation{}, err
+	}
+	if !slotNeedsRotation(credentials, fetcher.now()) {
+		return rotation{Outcome: rotationFresh, RefreshTokenExpiry: credentials.RefreshTokenExpiry()}, nil
+	}
+	rotated, err := refreshClaudeSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
+	if err != nil {
+		return rotation{}, err
+	}
+	return rotation{Outcome: rotationRotated, RefreshTokenExpiry: rotated.RefreshTokenExpiry()}, nil
+}
+
+func (fetcher codexSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
+	if !fetcher.refreshAllowed {
+		return rotation{Outcome: rotationUnmanaged}, nil
+	}
+	credentials, err := fetcher.store.Read()
+	if err != nil {
+		return rotation{}, err
+	}
+	if !slotNeedsRotation(credentials, fetcher.now()) {
+		return rotation{Outcome: rotationFresh, RefreshTokenExpiry: credentials.RefreshTokenExpiry()}, nil
+	}
+	rotated, err := refreshCodexSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
+	if err != nil {
+		return rotation{}, err
+	}
+	return rotation{Outcome: rotationRotated, RefreshTokenExpiry: rotated.RefreshTokenExpiry()}, nil
+}
+
+func (fetcher failingFetcher) Rotate(context.Context) (rotation, error) {
+	return rotation{}, fetcher.err
 }
 
 // A rotation that only ran early, while the access token still works and the

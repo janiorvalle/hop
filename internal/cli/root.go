@@ -18,6 +18,7 @@ Usage:
   hop <provider> <account>           Switch one provider
   hop login <provider> <account>     Add an account
   hop ls [--json]                    List accounts
+  hop refresh                        Rotate idle account tokens, for cron
   hop disable <provider> <account>   Park an account: no usage fetch, no switching
   hop enable <provider> <account>    Bring a parked account back
   hop rm <provider> <account>        Forget an account
@@ -36,6 +37,7 @@ Examples:
   hop ls --json
   hop disable codex paused
   hop enable codex paused
+  hop refresh
   hop rm codex old
   hop mv claude work personal
 `
@@ -111,6 +113,13 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return enableAccount(args[1], args[2], stdout)
+	case "refresh":
+		if len(args) != 1 {
+			return fmt.Errorf("refresh takes no arguments; try 'hop refresh'")
+		}
+		return withRecoveredSwitch(context.Background(), stdout, stderr, func(ctx context.Context) error {
+			return refreshAccounts(ctx, stdout)
+		})
 	case "rm":
 		if err := requireProviderAccount("rm", args[1:]); err != nil {
 			return err
