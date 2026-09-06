@@ -59,7 +59,7 @@ func TestFetchGlanceRunsAccountsInParallelAndIsolatesErrors(t *testing.T) {
 	}
 	completed := make(chan response, 1)
 	go func() {
-		document, err := fetchGlance(context.Background(), catalog)
+		document, err := fetchGlance(context.Background(), catalog, time.Now())
 		completed <- response{document: document, err: err}
 	}()
 
@@ -153,7 +153,7 @@ func TestFetchGlanceDoesNotBlockHealthyAccountBehindSlowPreparation(t *testing.T
 	}
 	completed := make(chan error, 1)
 	go func() {
-		_, err := fetchGlance(context.Background(), catalog)
+		_, err := fetchGlance(context.Background(), catalog, time.Now())
 		completed <- err
 	}()
 	<-preparationStarted
@@ -304,5 +304,60 @@ func TestShowAccountsHonorsAnEarlierCallerDeadline(t *testing.T) {
 	}
 	if len(document.Accounts) != 1 || document.Accounts[0].Error == nil {
 		t.Fatalf("accounts = %+v, want one isolated timeout error", document.Accounts)
+	}
+}
+
+func TestFetchGlanceWarnsAtRefreshTokenThresholds(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	for _, scenario := range []struct {
+		name         string
+		expiresAt    time.Time
+		active       bool
+		wantSeverity string
+		wantAction   string
+	}{
+		{name: "thirty days out", expiresAt: now.Add(30 * 24 * time.Hour), wantSeverity: "normal"},
+		{name: "six days out", expiresAt: now.Add(6 * 24 * time.Hour), wantSeverity: "warning", wantAction: "Run 'hop rm claude work' and then 'hop login claude work' to renew it."},
+		{name: "one day out", expiresAt: now.Add(24 * time.Hour), wantSeverity: "critical", wantAction: "Run 'hop rm claude work' and then 'hop login claude work' to renew it."},
+		{name: "active account renews through its own CLI", expiresAt: now.Add(24 * time.Hour), active: true, wantSeverity: "critical", wantAction: "Run 'claude' and use /login to renew it."},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			catalog := staticCatalog{{Provider: provider.Claude, Name: "work", Active: scenario.active, Fetcher: fetchFunc(func(context.Context) (provider.Usage, error) {
+				return provider.Usage{Provider: provider.Claude, RefreshTokenExpiresAt: scenario.expiresAt}, nil
+			})}}
+			document, err := fetchGlance(context.Background(), catalog, now)
+			if err != nil {
+				t.Fatalf("fetchGlance() error = %v", err)
+			}
+			expiry := document.Accounts[0].RefreshTokenExpiry
+			if expiry == nil {
+				t.Fatal("refresh_token_expiry = nil, want a status")
+			}
+			if !expiry.ExpiresAt.Equal(scenario.expiresAt) || expiry.Severity != scenario.wantSeverity || expiry.Action != scenario.wantAction {
+				t.Fatalf("refresh_token_expiry = %+v, want %s at %s with action %q", expiry, scenario.wantSeverity, scenario.expiresAt, scenario.wantAction)
+			}
+		})
+	}
+}
+
+func TestFetchGlanceOmitsRefreshTokenExpiryWhenUnknown(t *testing.T) {
+	t.Parallel()
+
+	catalog := staticCatalog{{Provider: provider.Codex, Name: "seeded", Fetcher: fetchFunc(func(context.Context) (provider.Usage, error) {
+		return provider.Usage{Provider: provider.Codex}, nil
+	})}}
+	document, err := fetchGlance(context.Background(), catalog, time.Now())
+	if err != nil {
+		t.Fatalf("fetchGlance() error = %v", err)
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if bytes.Contains(encoded, []byte("refresh_token_expiry")) {
+		t.Fatalf("JSON carries refresh_token_expiry for an unknown expiry: %s", encoded)
 	}
 }

@@ -177,6 +177,7 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 		return provider.Usage{}, err
 	}
 	usage.Plan = credentials.Plan()
+	usage.RefreshTokenExpiresAt = credentials.RefreshTokenExpiry()
 	return usage, nil
 }
 
@@ -262,10 +263,10 @@ func (adapter Adapter) Refresh(ctx context.Context, store Store) (Credentials, e
 
 	credentials.AccessToken = refreshed.AccessToken
 	credentials.RefreshToken = refreshed.RefreshToken
-	credentials.ExpiresAt = adapter.now().Add(time.Duration(refreshed.ExpiresIn) * time.Second).UnixMilli()
-	if refreshed.RefreshTokenExpiresIn > 0 {
-		credentials.RefreshTokenExpiresAt = adapter.now().Add(time.Duration(refreshed.RefreshTokenExpiresIn) * time.Second).UnixMilli()
-	}
+	// The old refresh token is gone with this rotation, so its expiry must not
+	// survive it: a stale value would rotate this slot on every glance.
+	credentials.ExpiresAt = expiryMilli(adapter.now(), refreshed.ExpiresIn)
+	credentials.RefreshTokenExpiresAt = expiryMilli(adapter.now(), refreshed.RefreshTokenExpiresIn)
 	if err := store.Write(credentials); err != nil {
 		return credentials, fmt.Errorf("save rotated Claude tokens; the returned credentials are the recovery copy and must be saved before retrying: %w: %w", err, ErrRefresh)
 	}
@@ -275,6 +276,21 @@ func (adapter Adapter) Refresh(ctx context.Context, store Store) (Credentials, e
 // NeedsRefresh reports whether an access token expires within skew.
 func (credentials Credentials) NeedsRefresh(now time.Time, skew time.Duration) bool {
 	return credentials.ExpiresAt <= now.Add(skew).UnixMilli()
+}
+
+// RefreshTokenExpiry is when the refresh token stops working, or zero when unknown.
+func (credentials Credentials) RefreshTokenExpiry() time.Time {
+	if credentials.RefreshTokenExpiresAt <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(credentials.RefreshTokenExpiresAt).UTC()
+}
+
+func expiryMilli(now time.Time, lifetimeSeconds int64) int64 {
+	if lifetimeSeconds <= 0 {
+		return 0
+	}
+	return now.Add(time.Duration(lifetimeSeconds) * time.Second).UnixMilli()
 }
 
 // HasScope reports whether Anthropic granted a named OAuth scope.

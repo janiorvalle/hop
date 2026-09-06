@@ -39,17 +39,27 @@ type Problem struct {
 	Action  string
 }
 
+// TokenExpiry warns that the refresh token behind a row is near the end of its life.
+type TokenExpiry struct {
+	ExpiresAt time.Time
+	Severity  string
+	Action    string
+}
+
+var expiryStyles = map[string]string{"warning": styleAmber, "critical": styleRed}
+
 // Row is one account in the rendered glance.
 type Row struct {
-	Provider     provider.Name
-	Account      string
-	Active       bool
-	Disabled     bool
-	Plan         string
-	Windows      []provider.Window
-	Limits       []provider.Limit
-	ResetCredits provider.ResetCredits
-	Problem      *Problem
+	Provider           provider.Name
+	Account            string
+	Active             bool
+	Disabled           bool
+	Plan               string
+	Windows            []provider.Window
+	Limits             []provider.Limit
+	ResetCredits       provider.ResetCredits
+	Problem            *Problem
+	RefreshTokenExpiry *TokenExpiry
 }
 
 // Options controls terminal capabilities without tying rendering to os.Stdout.
@@ -295,8 +305,9 @@ func writeWideSection(out *strings.Builder, built section, options Options) {
 	for index, row := range built.rows {
 		out.WriteString(wideLine(row, cellsByRow[index], widths, options))
 		if row.Problem != nil {
-			writeGuidance(out, row.Problem, options)
+			writeProblemGuidance(out, row.Problem, options)
 		}
+		writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
 	}
 }
 
@@ -368,7 +379,8 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 			line := rowPrefix(row, options) + name + "  " +
 				paint(fmt.Sprintf("%*s", headroomCellWidth, "ERROR"), styleRed, options)
 			out.WriteString(strings.TrimRight(line, " ") + "\n")
-			writeGuidance(out, row.Problem, options)
+			writeProblemGuidance(out, row.Problem, options)
+			writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
 			continue
 		}
 		headroom := fmt.Sprintf("%3d%% LEFT", headroomPercent(row))
@@ -382,6 +394,7 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 		for _, detail := range flow(parts, " "+midDot(options)+" ", options.Width-len(guidanceIndent)) {
 			out.WriteString(guidanceIndent + paint(detail, styleDim, options) + "\n")
 		}
+		writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
 	}
 }
 
@@ -413,14 +426,32 @@ func narrowValue(usedPercent float64, resetsAt time.Time, options Options) strin
 	return value + "/" + countdown(options.Now, resetsAt)
 }
 
-func writeGuidance(out *strings.Builder, problem *Problem, options Options) {
-	text := strings.TrimSpace(problem.Message + " " + problem.Action)
+func writeProblemGuidance(out *strings.Builder, problem *Problem, options Options) {
+	writeGuidance(out, strings.TrimSpace(problem.Message+" "+problem.Action), styleRed, options)
+}
+
+func writeExpiryGuidance(out *strings.Builder, expiry *TokenExpiry, options Options) {
+	if expiry == nil {
+		return
+	}
+	style, warned := expiryStyles[expiry.Severity]
+	if !warned {
+		return
+	}
+	notice := "Refresh token has expired."
+	if expiry.ExpiresAt.After(options.Now) {
+		notice = fmt.Sprintf("Refresh token expires in %s.", countdown(options.Now, expiry.ExpiresAt))
+	}
+	writeGuidance(out, notice+" "+expiry.Action, style, options)
+}
+
+func writeGuidance(out *strings.Builder, text, style string, options Options) {
 	width := options.Width
 	if width > maxGuidanceWidth {
 		width = maxGuidanceWidth
 	}
 	for _, line := range wrap(text, width-len(guidanceIndent)) {
-		out.WriteString(guidanceIndent + paint(line, styleRed, options) + "\n")
+		out.WriteString(guidanceIndent + paint(line, style, options) + "\n")
 	}
 }
 

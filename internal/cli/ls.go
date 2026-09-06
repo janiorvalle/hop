@@ -39,6 +39,13 @@ func writeTable(writer io.Writer, document glanceDocument, options render.Option
 		if account.Error != nil {
 			row.Problem = &render.Problem{Message: account.Error.Message, Action: account.Error.Action}
 		}
+		if account.RefreshTokenExpiry != nil {
+			row.RefreshTokenExpiry = &render.TokenExpiry{
+				ExpiresAt: account.RefreshTokenExpiry.ExpiresAt,
+				Severity:  account.RefreshTokenExpiry.Severity,
+				Action:    account.RefreshTokenExpiry.Action,
+			}
+		}
 		rows = append(rows, row)
 	}
 	return render.Table(writer, rows, options)
