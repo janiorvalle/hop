@@ -69,7 +69,30 @@ func (adapter Adapter) Login(ctx context.Context, login Login) (Enrollment, erro
 	if err != nil {
 		return Enrollment{}, err
 	}
-	return adapter.exchangeCode(ctx, codeExchange{code: code, verifier: verifier, redirectURI: listener.RedirectURI(), state: state})
+	enrollment, err := adapter.exchangeCode(ctx, codeExchange{code: code, verifier: verifier, redirectURI: listener.RedirectURI(), state: state})
+	if err != nil {
+		return Enrollment{}, err
+	}
+	enrollment.Credentials.SubscriptionType, err = adapter.subscriptionTypeOf(ctx, enrollment.Credentials)
+	if err != nil {
+		return Enrollment{}, err
+	}
+	return enrollment, nil
+}
+
+// subscriptionTypeOf asks the profile endpoint which plan the new tokens belong
+// to. The plan only labels a row, so a profile call that fails leaves it blank
+// instead of failing a sign-in whose tokens already work. A canceled or expired
+// context is the user stopping the login, and that still stops it.
+func (adapter Adapter) subscriptionTypeOf(ctx context.Context, credentials Credentials) (string, error) {
+	profile, err := adapter.FetchProfile(ctx, credentials)
+	if ctx.Err() != nil {
+		return "", loginStopped(ctx.Err())
+	}
+	if err != nil {
+		return "", nil
+	}
+	return profile.SubscriptionType, nil
 }
 
 func newPKCEPair() (verifier, challenge string, err error) {
@@ -161,11 +184,15 @@ func (callback *callbackListener) Await(ctx context.Context) (string, error) {
 	case result := <-callback.results:
 		return result.code, result.err
 	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return "", fmt.Errorf("[CLAUDE_LOGIN_TIMEOUT] The browser sign-in did not finish in time. Retry the login and complete it in the browser: %w", ErrLogin)
-		}
-		return "", fmt.Errorf("[CLAUDE_LOGIN_CANCELED] The login was canceled before the browser sign-in finished. Retry when you are ready: %w", ErrLogin)
+		return "", loginStopped(ctx.Err())
 	}
+}
+
+func loginStopped(cause error) error {
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return fmt.Errorf("[CLAUDE_LOGIN_TIMEOUT] The browser sign-in did not finish in time. Retry the login and complete it in the browser: %w", ErrLogin)
+	}
+	return fmt.Errorf("[CLAUDE_LOGIN_CANCELED] The login was canceled before the browser sign-in finished. Retry when you are ready: %w", ErrLogin)
 }
 
 func (callback *callbackListener) Close() {

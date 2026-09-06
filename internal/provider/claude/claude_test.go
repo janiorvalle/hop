@@ -209,6 +209,40 @@ func TestFetchProfileIdentifiesTheBearerTokenOwner(t *testing.T) {
 	}
 }
 
+func TestFetchProfileNamesThePlanFromTheProfileFlags(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "max outranks pro", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":true,"has_claude_pro":true}}`, want: "max"},
+		{name: "pro", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":true}}`, want: "pro"},
+		{name: "team seat", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_team","subscription_status":"active"}}`, want: "team"},
+		{name: "lapsed team is free", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_team","subscription_status":"canceled"}}`, want: "free"},
+		{name: "free", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false}}`, want: "free"},
+		{name: "flags absent", body: `{"account":{"uuid":"u","email":"e@example.com"}}`, want: ""},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, testCase.body)
+			}))
+			t.Cleanup(server.Close)
+
+			profile, err := New(Config{ProfileURL: server.URL}).FetchProfile(context.Background(), Credentials{AccessToken: "live-access"})
+			if err != nil {
+				t.Fatalf("FetchProfile() error = %v", err)
+			}
+			if profile.SubscriptionType != testCase.want {
+				t.Fatalf("FetchProfile().SubscriptionType = %q, want %q", profile.SubscriptionType, testCase.want)
+			}
+		})
+	}
+}
+
 func TestFetchProfileReturnsARecoverableErrorForAnUnusableResponse(t *testing.T) {
 	t.Parallel()
 

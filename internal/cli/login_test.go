@@ -542,7 +542,7 @@ func TestLoginClaudeInBrowserEnrollsSecondAccountWithoutTouchingTheLiveLogin(t *
 	accountVault := newTestVault(t)
 	seedActiveClaudeAccount(t, accountVault, "work")
 	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "live", RefreshToken: "live-refresh"}}
-	enrolled := claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh", ExpiresAt: 1, RefreshTokenExpiresAt: 2, Scopes: []string{"user:profile"}}
+	enrolled := claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh", ExpiresAt: 1, RefreshTokenExpiresAt: 2, SubscriptionType: "max", Scopes: []string{"user:profile"}}
 	var stdout bytes.Buffer
 	manager := loginManager{
 		vault:      accountVault,

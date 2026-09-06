@@ -45,10 +45,13 @@ type Credentials struct {
 	Scopes                []string `json:"scopes,omitempty"`
 }
 
-// Profile identifies the Claude account that owns an OAuth access token.
+// Profile identifies the Claude account that owns an OAuth access token and
+// names its plan the way the credential envelope's subscriptionType does, or
+// leaves it blank when the profile did not report one.
 type Profile struct {
-	AccountUUID string
-	Email       string
+	AccountUUID      string
+	Email            string
+	SubscriptionType string
 }
 
 var planLabels = map[string]string{
@@ -209,8 +212,9 @@ func (adapter Adapter) FetchProfile(ctx context.Context, credentials Credentials
 		return Profile{}, fmt.Errorf("decode Claude profile response; retry the command: %w: %w", err, ErrProfile)
 	}
 	profile := Profile{
-		AccountUUID: strings.TrimSpace(responseProfile.Account.UUID),
-		Email:       strings.TrimSpace(responseProfile.Account.Email),
+		AccountUUID:      strings.TrimSpace(responseProfile.Account.UUID),
+		Email:            strings.TrimSpace(responseProfile.Account.Email),
+		SubscriptionType: responseProfile.subscriptionType(),
 	}
 	if profile.AccountUUID == "" || profile.Email == "" {
 		return Profile{}, fmt.Errorf("claude profile omitted account.uuid or account.email; retry with a refreshed Claude login: %w", ErrProfile)
@@ -318,9 +322,44 @@ type refreshResponse struct {
 
 type profileResponse struct {
 	Account struct {
-		UUID  string `json:"uuid"`
-		Email string `json:"email"`
+		UUID         string `json:"uuid"`
+		Email        string `json:"email"`
+		HasClaudeMax *bool  `json:"has_claude_max"`
+		HasClaudePro *bool  `json:"has_claude_pro"`
 	} `json:"account"`
+	Organization struct {
+		Type               string `json:"organization_type"`
+		SubscriptionStatus string `json:"subscription_status"`
+	} `json:"organization"`
+}
+
+// subscriptionTypeRules run in order because one profile can satisfy several:
+// the first match names the plan, the way CLIProxyAPI reads the same payload.
+var subscriptionTypeRules = []struct {
+	subscriptionType string
+	applies          func(profileResponse) bool
+}{
+	{"max", func(profile profileResponse) bool { return flagSet(profile.Account.HasClaudeMax) }},
+	{"pro", func(profile profileResponse) bool { return flagSet(profile.Account.HasClaudePro) }},
+	{"team", func(profile profileResponse) bool {
+		return strings.EqualFold(profile.Organization.Type, "claude_team") && strings.EqualFold(profile.Organization.SubscriptionStatus, "active")
+	}},
+	{"free", func(profile profileResponse) bool {
+		return profile.Account.HasClaudeMax != nil && profile.Account.HasClaudePro != nil
+	}},
+}
+
+func (profile profileResponse) subscriptionType() string {
+	for _, rule := range subscriptionTypeRules {
+		if rule.applies(profile) {
+			return rule.subscriptionType
+		}
+	}
+	return ""
+}
+
+func flagSet(flag *bool) bool {
+	return flag != nil && *flag
 }
 
 type usageResponse struct {
