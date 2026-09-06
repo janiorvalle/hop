@@ -55,16 +55,6 @@ func (live LiveFile) Write(credentials Credentials) error {
 	return replaceFileInExistingDirectory(live.Path, contents, "live Claude credentials")
 }
 
-// Clear removes the live credential file so the provider CLI sees no login,
-// leaving the parent directory untouched. A file that is already absent counts
-// as cleared.
-func (live LiveFile) Clear() error {
-	if err := os.Remove(live.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("clear live Claude credentials at %s; fix its permissions and retry: %w", live.Path, err)
-	}
-	return nil
-}
-
 // ClearIfMatches removes only the credential object hop previously installed.
 // A replacement written concurrently remains at the live path.
 func (live LiveFile) ClearIfMatches(expected Credentials) error {
