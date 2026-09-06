@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -142,14 +145,279 @@ func TestFirstCodexSwitchRefusesToDiscardAnUnenrolledLiveAccount(t *testing.T) {
 	}
 }
 
+func TestFreshCodexInstallationRequiresProviderDirectoryThenSwitchesFromAbsence(t *testing.T) {
+	hopHome := t.TempDir()
+	providerHome := t.TempDir()
+	providerDirectory := filepath.Join(providerHome, ".codex")
+	livePath := filepath.Join(providerDirectory, "auth.json")
+	t.Setenv("HOP_HOME", hopHome)
+	t.Setenv("CODEX_HOME", providerDirectory)
+	t.Setenv(codexAuthFileOverride, "")
+
+	accountVault, err := vault.New(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	login := loginManager{
+		vault: accountVault,
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codexCredentials("work"))
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.test", nil
+		},
+	}
+	if err := login.Login(context.Background(), "codex", "work", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+
+	var stderr bytes.Buffer
+	if exitCode := Run([]string{"codex", "work"}, io.Discard, &stderr); exitCode == 0 {
+		t.Fatal("Run(codex work) succeeded before Codex created its directory")
+	}
+	if got := stderr.String(); !strings.Contains(got, "Codex has never run") || !strings.Contains(got, "codex --version") || !strings.Contains(got, "private (0700) permissions") {
+		t.Fatalf("stderr = %q, want run-Codex-once guidance", got)
+	}
+	if _, err := os.Stat(providerDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider directory was created by hop: %v", err)
+	}
+
+	if err := os.Mkdir(providerDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	stderr.Reset()
+	if exitCode := Run([]string{"codex", "work"}, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("Run(codex work) exit code = %d, want 0; stderr = %q", exitCode, stderr.String())
+	}
+	written, err := (codex.LiveFile{Path: livePath}).Read()
+	if err != nil || written.AccountID != codexCredentials("work").AccountID {
+		t.Fatalf("live Codex credentials = %+v, error = %v; want enrolled work account", written, err)
+	}
+	activeState, err := state.Load(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active, found := activeState.Active("codex"); !found || active != "work" {
+		t.Fatalf("active Codex account = %q, %t; want work, true", active, found)
+	}
+	accountCatalog, err := defaultCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := accountCatalog.Accounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].Name != "work" || !accounts[0].Active {
+		t.Fatalf("glance catalog accounts = %+v, want active Codex work account", accounts)
+	}
+}
+
+func TestFreshClaudeFileInstallationRequiresProviderDirectoryThenSwitchesFromAbsence(t *testing.T) {
+	hopHome := t.TempDir()
+	providerDirectory := filepath.Join(t.TempDir(), ".claude")
+	livePath := filepath.Join(providerDirectory, ".credentials.json")
+	t.Setenv("HOP_HOME", hopHome)
+	t.Setenv(claudeCredentialsFileOverride, livePath)
+	t.Setenv(claudeAccountEmailOverride, "owner@example.test")
+
+	accountVault, err := vault.New(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSlot(t, accountVault, "work", claudeCredentials("work"))
+
+	var stderr bytes.Buffer
+	if exitCode := Run([]string{"claude", "work"}, io.Discard, &stderr); exitCode == 0 {
+		t.Fatal("Run(claude work) succeeded before Claude created its directory")
+	}
+	if got := stderr.String(); !strings.Contains(got, "Claude has never run") || !strings.Contains(got, "claude doctor") || !strings.Contains(got, "private (0700) permissions") {
+		t.Fatalf("stderr = %q, want run-Claude-once guidance", got)
+	}
+	if _, err := os.Stat(providerDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider directory was created by hop: %v", err)
+	}
+
+	if err := os.Mkdir(providerDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if exitCode := Run([]string{"claude", "work"}, io.Discard, &stderr); exitCode != 0 {
+		t.Fatalf("Run(claude work) exit code = %d, want 0; stderr = %q", exitCode, stderr.String())
+	}
+	written, err := (claude.LiveFile{Path: livePath}).Read()
+	if err != nil || written.AccessToken != claudeCredentials("work").AccessToken {
+		t.Fatalf("live Claude credentials = %+v, error = %v; want enrolled work account", written, err)
+	}
+}
+
+func TestSwitchMissingCodexLiveFileRollsBackToAbsence(t *testing.T) {
+	manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	codexLive.readErr = os.ErrNotExist
+	stateStore.failSaves = 1
+
+	err := manager.Switch(context.Background(), "codex", "work")
+	if err == nil || !strings.Contains(err.Error(), "previous live credentials were restored") {
+		t.Fatalf("Switch() error = %v, want rollback confirmation", err)
+	}
+	if codexLive.clears != 1 {
+		t.Fatalf("Codex live clears = %d, want 1", codexLive.clears)
+	}
+	if !errors.Is(codexLive.readErr, os.ErrNotExist) {
+		t.Fatalf("Codex live read error = %v, want absent credentials after rollback", codexLive.readErr)
+	}
+	if _, found := stateStore.value.Active("codex"); found {
+		t.Fatal("Codex active state was recorded after rollback")
+	}
+}
+
+func TestSwitchMissingLiveFileRestoresPreexistingActiveStateOnFailure(t *testing.T) {
+	manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "old", codexCredentials("old"))
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	stateStore.value.SetActive("codex", "old")
+	codexLive.readErr = os.ErrNotExist
+	stateStore.failSaves = 1
+
+	err := manager.Switch(context.Background(), "codex", "work")
+	if err == nil || !strings.Contains(err.Error(), "previous live credentials were restored") {
+		t.Fatalf("Switch() error = %v, want rollback confirmation", err)
+	}
+	if active, found := stateStore.value.Active("codex"); !found || active != "old" {
+		t.Fatalf("active Codex account = %q, %t; want restored old, true", active, found)
+	}
+}
+
+func TestSwitchMissingClaudeLiveCredentialsRollsBackToAbsence(t *testing.T) {
+	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+	writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+	claudeLive.readErr = os.ErrNotExist
+	stateStore.failSaves = 1
+
+	err := manager.Switch(context.Background(), "claude", "work")
+	if err == nil || !strings.Contains(err.Error(), "previous live credentials were restored") {
+		t.Fatalf("Switch() error = %v, want rollback confirmation", err)
+	}
+	if claudeLive.clears != 1 {
+		t.Fatalf("Claude live clears = %d, want 1", claudeLive.clears)
+	}
+	if !errors.Is(claudeLive.readErr, os.ErrNotExist) {
+		t.Fatalf("Claude live read error = %v, want absent credentials after rollback", claudeLive.readErr)
+	}
+}
+
+func TestSwitchRefusesCorruptLiveFileWithoutOverwritingIt(t *testing.T) {
+	hopHome := t.TempDir()
+	providerDirectory := t.TempDir()
+	livePath := filepath.Join(providerDirectory, "auth.json")
+	t.Setenv("HOP_HOME", hopHome)
+	t.Setenv(codexAuthFileOverride, livePath)
+	accountVault, err := vault.New(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCodexSlot(t, accountVault, "work", codexCredentials("work"))
+	corrupt := []byte("{not-json\n")
+	if err := os.WriteFile(livePath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	if exitCode := Run([]string{"codex", "work"}, io.Discard, &stderr); exitCode == 0 {
+		t.Fatal("Run(codex work) overwrote corrupt live credentials")
+	}
+	if !strings.Contains(stderr.String(), "read the current live Codex credentials before switching") {
+		t.Fatalf("stderr = %q, want corrupt-live-file refusal", stderr.String())
+	}
+	assertFileContents(t, livePath, string(corrupt))
+	activeState, err := state.Load(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := activeState.Active("codex"); found {
+		t.Fatal("Codex active state changed after corrupt-live-file refusal")
+	}
+}
+
+func TestRecoverInterruptedSwitchRestoresMissingCodexLiveFile(t *testing.T) {
+	manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	codexLive.credentials = codexCredentials("work")
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:      "codex",
+		Target:        "work",
+		LiveWasAbsent: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := manager.recoverInterruptedSwitch(context.Background())
+	if err != nil || !recovered {
+		t.Fatalf("recoverInterruptedSwitch() = %t, %v; want true, nil", recovered, err)
+	}
+	if codexLive.clears != 1 || !errors.Is(codexLive.readErr, os.ErrNotExist) {
+		t.Fatalf("Codex live clear state = %d, %v; want one clear and missing credentials", codexLive.clears, codexLive.readErr)
+	}
+	if _, found := stateStore.value.Active("codex"); found {
+		t.Fatal("Codex active state remains after recovery to absence")
+	}
+}
+
+func TestRecoverInterruptedAbsentSwitchPreservesUnexpectedLiveLogin(t *testing.T) {
+	manager, _, _, codexLive, _ := newSwitchTestManager(t)
+	writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+	codexLive.credentials = codexCredentials("new-login")
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:      "codex",
+		Target:        "work",
+		LiveWasAbsent: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := manager.recoverInterruptedSwitch(context.Background())
+	if err == nil || recovered || !strings.Contains(err.Error(), "left the unexpected login untouched") {
+		t.Fatalf("recoverInterruptedSwitch() = %t, %v; want a refusal that preserves the unexpected login", recovered, err)
+	}
+	if codexLive.clears != 0 || codexLive.credentials.AccountID != codexCredentials("new-login").AccountID {
+		t.Fatalf("unexpected live login changed: clears = %d, credentials = %+v", codexLive.clears, codexLive.credentials)
+	}
+	if _, statErr := os.Stat(manager.transactionPath()); statErr != nil {
+		t.Fatalf("transaction was removed after refused recovery: %v", statErr)
+	}
+}
+
+func TestSwitchTransactionAllowsMissingPreviousAccountOnlyForAbsentLiveCredentials(t *testing.T) {
+	absentPrevious := switchTransaction{Steps: []switchTransactionStep{{Provider: "codex", Target: "work", LiveWasAbsent: true}}}
+	if err := validateSwitchTransaction(absentPrevious); err != nil {
+		t.Fatalf("validateSwitchTransaction(absent previous) error = %v", err)
+	}
+
+	inconsistent := switchTransaction{Steps: []switchTransactionStep{{Provider: "codex", Target: "work", HadActiveState: true, LiveWasAbsent: true}}}
+	if err := validateSwitchTransaction(inconsistent); err == nil || !strings.Contains(err.Error(), "absent live credential") {
+		t.Fatalf("validateSwitchTransaction(inconsistent) error = %v, want invalid active previous state", err)
+	}
+
+	missingMarker := switchTransaction{Steps: []switchTransactionStep{{Provider: "codex", Target: "work"}}}
+	if err := validateSwitchTransaction(missingMarker); err == nil || !strings.Contains(err.Error(), "absent live credential") {
+		t.Fatalf("validateSwitchTransaction(missing marker) error = %v, want absent-live marker requirement", err)
+	}
+}
+
 func TestSwitchRejectsMissingAndUnusableTargetsWithoutChangingLiveCredentials(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		manager, _, claudeLive, _, _ := newSwitchTestManager(t)
 		claudeLive.credentials = claudeCredentials("live")
 
 		err := manager.Switch(context.Background(), "claude", "missing")
-		if err == nil || !strings.Contains(err.Error(), "hop login claude missing") {
-			t.Fatalf("Switch() error = %v, want login next step", err)
+		if err == nil || !strings.HasPrefix(err.Error(), "did you mean 'hop login claude missing'?") {
+			t.Fatalf("Switch() error = %v, want did-you-mean login next step", err)
 		}
 		if len(claudeLive.writes) != 0 {
 			t.Fatalf("live writes = %d, want 0", len(claudeLive.writes))
@@ -213,6 +481,183 @@ func TestSwitchRefusesToCopyBackAChangedLiveIdentity(t *testing.T) {
 		assertCodexSlot(t, manager.vault, "personal", "personal")
 		if len(codexLive.writes) != 0 {
 			t.Fatalf("Codex live writes = %d, want 0", len(codexLive.writes))
+		}
+	})
+}
+
+// hop's own switch makes the Claude CLI's cached email stale: the Keychain
+// holds the account hop just installed while 'claude auth status' still reports
+// the one hop switched away from. The return leg must key on the credentials.
+func TestSwitchConfirmsClaudeIdentityFromCredentialsWhenStatusEmailIsStale(t *testing.T) {
+	t.Run("stale status email", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work1", claudeCredentials("work1"))
+		writeClaudeSlot(t, manager.vault, "work2", claudeCredentials("work2"))
+		writeClaudeSlotEmail(t, manager.vault, "work1", "work1@example.test")
+		writeClaudeSlotEmail(t, manager.vault, "work2", "work2@example.test")
+		stateStore.value.SetActive("claude", "work2")
+		claudeLive.credentials = claudeCredentials("work2")
+		claudeLive.credentials.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			t.Fatal("live profile read when the recorded credential copy already matched")
+			return claude.Profile{}, nil
+		}
+		emailReads := 0
+		manager.claudeEmail = func(context.Context) (string, error) {
+			emailReads++
+			return "work1@example.test", nil
+		}
+
+		if err := manager.Switch(context.Background(), "claude", "work1"); err != nil {
+			t.Fatalf("Switch() error = %v, want the return leg to complete", err)
+		}
+		if emailReads != 0 {
+			t.Fatalf("claude auth status reads = %d, want 0 once the live credentials identify the active slot", emailReads)
+		}
+		if claudeLive.credentials.AccessToken != "work1-access" {
+			t.Fatalf("live Claude access token = %q, want work1-access", claudeLive.credentials.AccessToken)
+		}
+		assertClaudeSlot(t, manager.vault, "work2", "work2")
+		if active, found := stateStore.value.Active("claude"); !found || active != "work1" {
+			t.Fatalf("active Claude account = %q, %t; want work1, true", active, found)
+		}
+	})
+
+	t.Run("live token rotation", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work1", claudeCredentials("work1"))
+		writeClaudeSlot(t, manager.vault, "work2", claudeCredentials("work2"))
+		writeClaudeSlotEmail(t, manager.vault, "work1", "work1@example.test")
+		writeClaudeSlotIdentity(t, manager.vault, "work2", claude.Profile{AccountUUID: "work2-uuid", Email: "work2@example.test"})
+		stateStore.value.SetActive("claude", "work2")
+		claudeLive.credentials = claudeCredentials("work2-rotated")
+		claudeLive.credentials.Scopes = []string{"user:profile"}
+		profileReads := 0
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			profileReads++
+			return claude.Profile{AccountUUID: "work2-uuid", Email: "work2@example.test"}, nil
+		}
+		emailReads := 0
+		manager.claudeEmail = func(context.Context) (string, error) {
+			emailReads++
+			return "work1@example.test", nil
+		}
+
+		if err := manager.Switch(context.Background(), "claude", "work1"); err != nil {
+			t.Fatalf("Switch() error = %v, want a live profile to confirm the rotated work2 login", err)
+		}
+		if profileReads != 1 || emailReads != 0 {
+			t.Fatalf("profile reads = %d, status email reads = %d; want 1, 0", profileReads, emailReads)
+		}
+		assertClaudeSlot(t, manager.vault, "work2", "work2-rotated")
+	})
+
+	t.Run("legacy slot backfill", func(t *testing.T) {
+		manager, _, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		rotated.Scopes = []string{"user:profile"}
+		claudeLive.credentials = rotated
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{AccountUUID: "work-uuid", Email: "work@example.test"}, nil
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			t.Fatal("cached Claude email read after the live profile confirmed the legacy slot")
+			return "", nil
+		}
+
+		if err := manager.confirmActiveClaudeIdentity(context.Background(), "work", rotated); err != nil {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work", "work-rotated")
+		slotPath, _ := manager.vault.SlotPath("claude", "work")
+		if metadata := readSlotMetadata(t, slotPath); metadata.AccountUUID != "work-uuid" {
+			t.Fatalf("account UUID = %q, want work-uuid backfilled", metadata.AccountUUID)
+		}
+	})
+
+	t.Run("profile failure falls back without eager re-record", func(t *testing.T) {
+		manager, _, _, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		rotated.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, errors.New("network unavailable")
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			return "work@example.test", nil
+		}
+
+		if err := manager.confirmActiveClaudeIdentity(context.Background(), "work", rotated); err != nil {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v, want cached-email fallback", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work", "work")
+	})
+
+	t.Run("profile cancellation stops confirmation", func(t *testing.T) {
+		manager, _, _, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		rotated.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(ctx context.Context, _ claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, ctx.Err()
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			t.Fatal("cached email read after profile cancellation")
+			return "", nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := manager.confirmActiveClaudeIdentity(ctx, "work", rotated)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v, want context cancellation", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work", "work")
+	})
+
+	t.Run("missing profile scope falls back", func(t *testing.T) {
+		manager, _, _, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		writeClaudeSlotEmail(t, manager.vault, "work", "work@example.test")
+		rotated := claudeCredentials("work-rotated")
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			t.Fatal("live profile read without the user:profile scope")
+			return claude.Profile{}, nil
+		}
+		manager.claudeEmail = func(context.Context) (string, error) {
+			return "work@example.test", nil
+		}
+
+		if err := manager.confirmActiveClaudeIdentity(context.Background(), "work", rotated); err != nil {
+			t.Fatalf("confirmActiveClaudeIdentity() error = %v, want cached-email fallback", err)
+		}
+	})
+
+	t.Run("different identity", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "work1", claudeCredentials("work1"))
+		writeClaudeSlot(t, manager.vault, "work2", claudeCredentials("work2"))
+		writeClaudeSlotEmail(t, manager.vault, "work1", "work1@example.test")
+		writeClaudeSlotIdentity(t, manager.vault, "work2", claude.Profile{AccountUUID: "work2-uuid", Email: "work2@example.test"})
+		stateStore.value.SetActive("claude", "work2")
+		claudeLive.credentials = claudeCredentials("stranger")
+		claudeLive.credentials.Scopes = []string{"user:profile"}
+		manager.claudeProfile = func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{AccountUUID: "stranger-uuid", Email: "fresh-stranger@example.test"}, nil
+		}
+		manager.claudeEmail = func(context.Context) (string, error) { return "cached@example.test", nil }
+
+		err := manager.Switch(context.Background(), "claude", "work1")
+		if err == nil || !strings.Contains(err.Error(), "fresh-stranger@example.test") {
+			t.Fatalf("Switch() error = %v, want a refusal naming the live identity", err)
+		}
+		assertClaudeSlot(t, manager.vault, "work2", "work2")
+		if len(claudeLive.writes) != 0 {
+			t.Fatalf("live Claude writes = %d, want 0", len(claudeLive.writes))
 		}
 	})
 }
@@ -301,6 +746,214 @@ func TestSwitchRecoversInterruptedInstallBeforeCopyingBackAgain(t *testing.T) {
 	}
 }
 
+func TestSwitchRecoveryPreservesHumanRepairedCodexLogin(t *testing.T) {
+	testCases := []struct {
+		name          string
+		accountID     string
+		activeAccount string
+	}{
+		{name: "different identity", accountID: "repaired-account"},
+		{name: "rotated target identity", accountID: "work-account", activeAccount: "work"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+			writeCodexSlot(t, manager.vault, "old", codexCredentials("old"))
+			writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+			stateStore.value.SetActive("codex", "old")
+			codexLive.credentials = codexCredentials("repaired")
+			codexLive.credentials.AccountID = testCase.accountID
+			transaction := switchTransaction{Steps: []switchTransactionStep{{
+				Provider:       "codex",
+				Previous:       "old",
+				Target:         "work",
+				HadActiveState: true,
+			}}}
+			if err := manager.writeSwitchTransaction(transaction); err != nil {
+				t.Fatal(err)
+			}
+
+			recovered, err := manager.recoverInterruptedSwitch(context.Background())
+			if err != nil {
+				t.Fatalf("recoverInterruptedSwitch() error = %v", err)
+			}
+			if !recovered {
+				t.Fatal("recoverInterruptedSwitch() recovered = false, want true")
+			}
+			if codexLive.credentials.AccessToken != "repaired-access" {
+				t.Fatalf("live Codex access token = %q, want repaired-access", codexLive.credentials.AccessToken)
+			}
+			if len(codexLive.writes) != 0 {
+				t.Fatalf("live Codex writes = %d, want 0 for a repaired login", len(codexLive.writes))
+			}
+			activeAccount, isActive := stateStore.value.Active("codex")
+			if activeAccount != testCase.activeAccount || isActive != (testCase.activeAccount != "") {
+				t.Fatalf("active Codex account = %q, %v; want %q", activeAccount, isActive, testCase.activeAccount)
+			}
+		})
+	}
+}
+
+func TestSwitchRecoveryPreservesHumanRepairedClaudeLogin(t *testing.T) {
+	testCases := []struct {
+		name          string
+		email         string
+		activeAccount string
+	}{
+		{name: "different identity", email: "repaired@example.test"},
+		{name: "rotated previous identity", email: "old@example.test", activeAccount: "old"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+			writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
+			writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+			for accountName, email := range map[string]string{
+				"old":  "old@example.test",
+				"work": "work@example.test",
+			} {
+				slotPath, err := manager.vault.SlotPath("claude", accountName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := writeManagedSlotMetadata(slotPath, claude.Profile{Email: email}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			manager.claudeEmail = func(context.Context) (string, error) {
+				return testCase.email, nil
+			}
+			stateStore.value.SetActive("claude", "old")
+			claudeLive.credentials = claudeCredentials("repaired")
+			transaction := switchTransaction{Steps: []switchTransactionStep{{
+				Provider:       "claude",
+				Previous:       "old",
+				Target:         "work",
+				HadActiveState: true,
+			}}}
+			if err := manager.writeSwitchTransaction(transaction); err != nil {
+				t.Fatal(err)
+			}
+
+			recovered, err := manager.recoverInterruptedSwitch(context.Background())
+			if err != nil {
+				t.Fatalf("recoverInterruptedSwitch() error = %v", err)
+			}
+			if !recovered {
+				t.Fatal("recoverInterruptedSwitch() recovered = false, want true")
+			}
+			if claudeLive.credentials.AccessToken != "repaired-access" {
+				t.Fatalf("live Claude access token = %q, want repaired-access", claudeLive.credentials.AccessToken)
+			}
+			if len(claudeLive.writes) != 0 {
+				t.Fatalf("live Claude writes = %d, want 0 for a repaired login", len(claudeLive.writes))
+			}
+			activeAccount, isActive := stateStore.value.Active("claude")
+			if activeAccount != testCase.activeAccount || isActive != (testCase.activeAccount != "") {
+				t.Fatalf("active Claude account = %q, %v; want %q", activeAccount, isActive, testCase.activeAccount)
+			}
+		})
+	}
+}
+
+func TestSwitchRecoveryLeavesLiveCredentialsUntouchedWhenTargetSlotIsUnreadable(t *testing.T) {
+	t.Run("Claude", func(t *testing.T) {
+		manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+		writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
+		writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+		stateStore.value.SetActive("claude", "old")
+		claudeLive.credentials = claudeCredentials("repaired")
+		writeUnreadableTransactionTarget(t, manager, "claude")
+
+		_, err := manager.recoverInterruptedSwitch(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "live credentials were left unchanged") {
+			t.Fatalf("recoverInterruptedSwitch() error = %v, want unchanged-live guidance", err)
+		}
+		if claudeLive.credentials.AccessToken != "repaired-access" || len(claudeLive.writes) != 0 {
+			t.Fatalf("live Claude = %#v with %d writes, want repaired credentials with no writes", claudeLive.credentials, len(claudeLive.writes))
+		}
+	})
+
+	t.Run("Codex", func(t *testing.T) {
+		manager, stateStore, _, codexLive, _ := newSwitchTestManager(t)
+		writeCodexSlot(t, manager.vault, "old", codexCredentials("old"))
+		writeCodexSlot(t, manager.vault, "work", codexCredentials("work"))
+		stateStore.value.SetActive("codex", "old")
+		codexLive.credentials = codexCredentials("repaired")
+		writeUnreadableTransactionTarget(t, manager, "codex")
+
+		_, err := manager.recoverInterruptedSwitch(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "live credentials were left unchanged") {
+			t.Fatalf("recoverInterruptedSwitch() error = %v, want unchanged-live guidance", err)
+		}
+		if codexLive.credentials.AccessToken != "repaired-access" || len(codexLive.writes) != 0 {
+			t.Fatalf("live Codex = %#v with %d writes, want repaired credentials with no writes", codexLive.credentials, len(codexLive.writes))
+		}
+	})
+}
+
+func writeUnreadableTransactionTarget(t *testing.T, manager switchManager, providerName string) {
+	t.Helper()
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:       providerName,
+		Previous:       "old",
+		Target:         "work",
+		HadActiveState: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+	credentialsPath, err := manager.vault.CredentialsPath(providerName, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentialsPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSwitchRecoveryReclaimsInterruptedRefreshLocks(t *testing.T) {
+	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+	writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
+	writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+	writeClaudeSlot(t, manager.vault, "other", claudeCredentials("other"))
+	stateStore.value.SetActive("claude", "old")
+	claudeLive.credentials = claudeCredentials("work")
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:       "claude",
+		Previous:       "old",
+		Target:         "work",
+		HadActiveState: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(slotPath, ".refresh.lock"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Switch(ctx, "claude", "other"); err != nil {
+		t.Fatalf("Switch() error = %v, want interrupted locks reclaimed immediately", err)
+	}
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(slotPath, ".refresh.lock")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s refresh lock still exists: %v", accountName, err)
+		}
+	}
+}
+
 func TestSwitchRecoveryKeepsCommittedTarget(t *testing.T) {
 	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
 	writeClaudeSlot(t, manager.vault, "old", claudeCredentials("old"))
@@ -319,8 +972,19 @@ func TestSwitchRecoveryKeepsCommittedTarget(t *testing.T) {
 	if err := manager.writeSwitchTransaction(transaction); err != nil {
 		t.Fatal(err)
 	}
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(slotPath, ".refresh.lock"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	if err := manager.Switch(context.Background(), "claude", "work"); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Switch(ctx, "claude", "work"); err != nil {
 		t.Fatalf("Switch() error = %v", err)
 	}
 
@@ -328,6 +992,15 @@ func TestSwitchRecoveryKeepsCommittedTarget(t *testing.T) {
 		t.Fatalf("live Claude access token = %q, want committed target", claudeLive.credentials.AccessToken)
 	}
 	assertClaudeSlot(t, manager.vault, "old", "old")
+	for _, accountName := range []string{"old", "work"} {
+		slotPath, err := manager.vault.SlotPath("claude", accountName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(slotPath, ".refresh.lock")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s refresh lock still exists: %v", accountName, err)
+		}
+	}
 }
 
 func TestGlanceRecoversInterruptedSwitchBeforeReadingState(t *testing.T) {
@@ -520,11 +1193,20 @@ func TestLoginClaudeSandboxStillConfirmsActiveAccount(t *testing.T) {
 	}
 	assertClaudeSlot(t, accountVault, "work", "rotated")
 
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+	t.Setenv(claudeLoginPortOverride, strconv.Itoa(occupied.Addr().(*net.TCPAddr).Port))
 	var stderr bytes.Buffer
 	if exitCode := Run([]string{"login", "claude", "personal"}, &bytes.Buffer{}, &stderr); exitCode == 0 {
-		t.Fatal("Run(login claude personal) succeeded, want sandbox refusal for a new account")
-	} else if !strings.Contains(stderr.String(), claudeCredentialsFileOverride) {
-		t.Fatalf("stderr = %q, want sandbox-override guidance", stderr.String())
+		t.Fatal("Run(login claude personal) succeeded, want the busy callback port refusal")
+	} else if !strings.Contains(stderr.String(), "[CLAUDE_LOGIN_PORT_IN_USE]") || !strings.Contains(stderr.String(), claudeLoginPortOverride) {
+		t.Fatalf("stderr = %q, want the busy-port code and the port override", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(hopHome, "claude", "personal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("slot remains after the refused login: %v", err)
 	}
 }
 
@@ -549,11 +1231,13 @@ func (store *memoryStateStore) Save(value state.State) error {
 type fakeClaudeKeychain struct {
 	credentials claude.Credentials
 	writes      []claude.Credentials
+	clears      int
 	failWrites  int
+	readErr     error
 }
 
 func (store *fakeClaudeKeychain) Read(context.Context) (claude.Credentials, error) {
-	return store.credentials, nil
+	return store.credentials, store.readErr
 }
 
 func (store *fakeClaudeKeychain) Write(_ context.Context, credentials claude.Credentials) error {
@@ -563,17 +1247,40 @@ func (store *fakeClaudeKeychain) Write(_ context.Context, credentials claude.Cre
 		return errors.New("fake Keychain write failed")
 	}
 	store.credentials = credentials
+	store.readErr = nil
 	return nil
+}
+
+func (store *fakeClaudeKeychain) Clear(context.Context) error {
+	store.clears++
+	store.credentials = claude.Credentials{}
+	store.readErr = os.ErrNotExist
+	return nil
+}
+
+func (store *fakeClaudeKeychain) ClearIfMatches(_ context.Context, expected claude.Credentials) error {
+	if errors.Is(store.readErr, os.ErrNotExist) {
+		return nil
+	}
+	if store.readErr != nil {
+		return store.readErr
+	}
+	if store.credentials.AccessToken != expected.AccessToken || store.credentials.RefreshToken != expected.RefreshToken {
+		return errors.New("live Claude credentials changed; hop left the unexpected login untouched")
+	}
+	return store.Clear(context.Background())
 }
 
 type fakeCodexLiveStore struct {
 	credentials codex.Credentials
 	writes      []codex.Credentials
+	clears      int
 	failWrites  int
+	readErr     error
 }
 
 func (store *fakeCodexLiveStore) Read() (codex.Credentials, error) {
-	return store.credentials, nil
+	return store.credentials, store.readErr
 }
 
 func (store *fakeCodexLiveStore) Write(credentials codex.Credentials) error {
@@ -583,6 +1290,23 @@ func (store *fakeCodexLiveStore) Write(credentials codex.Credentials) error {
 		return errors.New("fake auth.json write failed")
 	}
 	store.credentials = credentials
+	store.readErr = nil
+	return nil
+}
+
+func (store *fakeCodexLiveStore) ClearIfMatches(expected codex.Credentials) error {
+	if errors.Is(store.readErr, os.ErrNotExist) {
+		return nil
+	}
+	if store.readErr != nil {
+		return store.readErr
+	}
+	if store.credentials != expected {
+		return errors.New("live Codex credentials changed; hop left the unexpected login untouched")
+	}
+	store.clears++
+	store.credentials = codex.Credentials{}
+	store.readErr = os.ErrNotExist
 	return nil
 }
 
@@ -603,6 +1327,9 @@ func newSwitchTestManager(t *testing.T) (switchManager, *memoryStateStore, *fake
 		codexLive:  codexLive,
 		claudeEmail: func(context.Context) (string, error) {
 			return "owner@example.test", nil
+		},
+		claudeProfile: func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, errors.New("profile unavailable")
 		},
 		stdout: output,
 	}, stateStore, claudeLive, codexLive, output
@@ -633,7 +1360,22 @@ func writeClaudeSlot(t *testing.T, accountVault vault.Vault, accountName string,
 	if err := (claude.FileStore{Path: path}).Write(credentials); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeManagedSlotMetadata(filepath.Dir(path), "owner@example.test"); err != nil {
+	if err := writeManagedSlotMetadata(filepath.Dir(path), claude.Profile{Email: "owner@example.test"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeClaudeSlotEmail(t *testing.T, accountVault vault.Vault, accountName, email string) {
+	writeClaudeSlotIdentity(t, accountVault, accountName, claude.Profile{Email: email})
+}
+
+func writeClaudeSlotIdentity(t *testing.T, accountVault vault.Vault, accountName string, identity claude.Profile) {
+	t.Helper()
+	slotPath, err := accountVault.SlotPath("claude", accountName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManagedSlotMetadata(slotPath, identity); err != nil {
 		t.Fatal(err)
 	}
 }

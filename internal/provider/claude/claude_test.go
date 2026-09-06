@@ -55,6 +55,86 @@ func TestFetchUsageSendsRequiredHeadersAndParsesLimits(t *testing.T) {
 	}
 }
 
+func TestFetchUsageAcceptsIdleWindowAndLimitWithoutReset(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := os.ReadFile("testdata/usage_idle.json")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(fixture)
+	}))
+	t.Cleanup(server.Close)
+
+	usage, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	if got := usage.Windows[0]; got.Kind != provider.FiveHour || got.UsedPercent != 0 || !got.ResetsAt.IsZero() {
+		t.Fatalf("idle five-hour window = %+v, want 0%% with no reset", got)
+	}
+	if got := usage.Limits[0]; got.Kind != "session" || got.UsedPercent != 0 || !got.Active || !got.ResetsAt.IsZero() {
+		t.Fatalf("idle session limit = %+v, want active 0%% with no reset", got)
+	}
+}
+
+func TestFetchUsageRejectsMissingResetForActiveUsage(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		body string
+	}{
+		{name: "used window", body: `{"five_hour":{"utilization":1,"resets_at":null}}`},
+		{name: "used limit", body: `{"limits":[{"kind":"session","group":"session","percent":1,"resets_at":null,"is_active":false}]}`},
+		{name: "used active limit", body: `{"limits":[{"kind":"session","group":"session","percent":1,"resets_at":null,"is_active":true}]}`},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, testCase.body)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token"})
+			if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), "resets_at may be null") {
+				t.Fatalf("FetchUsage() error = %v, want guarded null-reset error", err)
+			}
+		})
+	}
+}
+
+func TestFetchUsageStatusMatchesTheRecoveryStep(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		statusCode int
+		want       string
+	}{
+		{name: "authentication", statusCode: http.StatusUnauthorized, want: "hop login claude <account>"},
+		{name: "rate limit", statusCode: http.StatusTooManyRequests, want: "wait and retry 'hop ls'"},
+		{name: "provider outage", statusCode: http.StatusServiceUnavailable, want: "usage service is unavailable"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.statusCode)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token"})
+			if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("FetchUsage() error = %v, want %q recovery", err, testCase.want)
+			}
+		})
+	}
+}
+
 func TestCredentialFetcherImplementsSharedContract(t *testing.T) {
 	t.Parallel()
 
@@ -63,13 +143,134 @@ func TestCredentialFetcherImplementsSharedContract(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	fetcher := New(Config{UsageURL: server.URL}).Fetcher(Credentials{AccessToken: "access"})
+	fetcher := New(Config{UsageURL: server.URL}).Fetcher(Credentials{AccessToken: "access", RateLimitTier: "default_claude_max_5x"})
 	usage, err := fetcher.FetchUsage(context.Background())
 	if err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
 	if usage.Provider != provider.Claude {
 		t.Errorf("Provider = %q, want claude", usage.Provider)
+	}
+	if usage.Plan != "" {
+		t.Errorf("usage Plan = %q, want the usage endpoint to leave the plan to the enrollment", usage.Plan)
+	}
+	if plan := fetcher.Enrollment().Plan; plan != "Max 5x" {
+		t.Errorf("Enrollment().Plan = %q, want Max 5x from the stored rate limit tier", plan)
+	}
+}
+
+func TestPlanLabelsTierAndFallsBackToSubscriptionType(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		credentials Credentials
+		want        string
+	}{
+		{name: "max 5x tier", credentials: Credentials{RateLimitTier: "default_claude_max_5x", SubscriptionType: "max"}, want: "Max 5x"},
+		{name: "max 20x tier", credentials: Credentials{RateLimitTier: "default_claude_max_20x", SubscriptionType: "max"}, want: "Max 20x"},
+		{name: "pro tier", credentials: Credentials{RateLimitTier: "default_claude_pro", SubscriptionType: "pro"}, want: "Pro"},
+		{name: "missing tier uses subscription type", credentials: Credentials{SubscriptionType: "team"}, want: "Team"},
+		{name: "unknown tier shows raw value", credentials: Credentials{RateLimitTier: "default_claude_max_50x", SubscriptionType: "max"}, want: "default_claude_max_50x"},
+		{name: "unknown subscription type shows raw value", credentials: Credentials{SubscriptionType: "founder"}, want: "founder"},
+		{name: "nothing stored", credentials: Credentials{}, want: ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := testCase.credentials.Plan(); got != testCase.want {
+				t.Errorf("Plan() = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestFetchProfileIdentifiesTheBearerTokenOwner(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", request.Method)
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer live-access" {
+			t.Errorf("Authorization = %q, want live bearer token", got)
+		}
+		if got := request.Header.Get("anthropic-beta"); got != betaHeaderValue {
+			t.Errorf("anthropic-beta = %q, want %q", got, betaHeaderValue)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"account":{"uuid":"account-uuid","email":"owner@example.com"},"organization":{"uuid":"shared-org"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	profile, err := New(Config{ProfileURL: server.URL}).FetchProfile(context.Background(), Credentials{AccessToken: "live-access"})
+	if err != nil {
+		t.Fatalf("FetchProfile() error = %v", err)
+	}
+	if profile.AccountUUID != "account-uuid" || profile.Email != "owner@example.com" {
+		t.Fatalf("FetchProfile() = %#v, want the account identity", profile)
+	}
+}
+
+func TestFetchProfileNamesThePlanFromTheProfileFlags(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "max outranks pro", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":true,"has_claude_pro":true}}`, want: "max"},
+		{name: "pro", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":true}}`, want: "pro"},
+		{name: "team seat", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_team","subscription_status":"active"}}`, want: "team"},
+		{name: "lapsed team is free", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_team","subscription_status":"canceled"}}`, want: "free"},
+		{name: "free", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false}}`, want: "free"},
+		{name: "flags absent", body: `{"account":{"uuid":"u","email":"e@example.com"}}`, want: ""},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, testCase.body)
+			}))
+			t.Cleanup(server.Close)
+
+			profile, err := New(Config{ProfileURL: server.URL}).FetchProfile(context.Background(), Credentials{AccessToken: "live-access"})
+			if err != nil {
+				t.Fatalf("FetchProfile() error = %v", err)
+			}
+			if profile.SubscriptionType != testCase.want {
+				t.Fatalf("FetchProfile().SubscriptionType = %q, want %q", profile.SubscriptionType, testCase.want)
+			}
+		})
+	}
+}
+
+func TestFetchProfileReturnsARecoverableErrorForAnUnusableResponse(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{name: "invalid token", statusCode: http.StatusUnauthorized, body: `{"error":{"details":{"error_code":"token_invalid"}}}`},
+		{name: "missing identity", statusCode: http.StatusOK, body: `{"account":{}}`},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.statusCode)
+				_, _ = io.WriteString(writer, testCase.body)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{ProfileURL: server.URL}).FetchProfile(context.Background(), Credentials{AccessToken: "live-access"})
+			if !errors.Is(err, ErrProfile) {
+				t.Fatalf("FetchProfile() error = %v, want ErrProfile", err)
+			}
+		})
 	}
 }
 
@@ -187,6 +388,18 @@ func TestNeedsRefreshUsesSkew(t *testing.T) {
 	}
 	if credentials.NeedsRefresh(now, 3*time.Minute) {
 		t.Fatal("NeedsRefresh() = true, want false outside skew")
+	}
+}
+
+func TestCredentialsHasScopeMatchesAnExactGrant(t *testing.T) {
+	t.Parallel()
+
+	credentials := Credentials{Scopes: []string{"org:create_api_key", "user:profile"}}
+	if !credentials.HasScope("user:profile") {
+		t.Fatal("HasScope(user:profile) = false, want true")
+	}
+	if credentials.HasScope("profile") {
+		t.Fatal("HasScope(profile) = true, want an exact-scope match")
 	}
 }
 

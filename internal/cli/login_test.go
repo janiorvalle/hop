@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -314,7 +315,7 @@ func TestLoginClaudeEnrollsCurrentLoginWithoutMutatingLiveSeat(t *testing.T) {
 	t.Parallel()
 
 	accountVault := newTestVault(t)
-	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "access", RefreshToken: "refresh"}}
+	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "access", RefreshToken: "refresh", Scopes: []string{"user:profile"}}}
 	runnerCalls := 0
 	manager := loginManager{
 		vault:      accountVault,
@@ -325,9 +326,14 @@ func TestLoginClaudeEnrollsCurrentLoginWithoutMutatingLiveSeat(t *testing.T) {
 		}),
 		stdout: io.Discard,
 		stderr: io.Discard,
-		getenv: func(string) string { return "" },
 		claudeEmail: func(context.Context) (string, error) {
-			return "claude@example.com", nil
+			return "cached@example.com", nil
+		},
+		claudeProfile: func(_ context.Context, credentials claude.Credentials) (claude.Profile, error) {
+			if credentials.AccessToken != "access" {
+				t.Fatalf("profile access token = %q, want access", credentials.AccessToken)
+			}
+			return claude.Profile{AccountUUID: "account-uuid", Email: "claude@example.com"}, nil
 		},
 	}
 
@@ -345,8 +351,72 @@ func TestLoginClaudeEnrollsCurrentLoginWithoutMutatingLiveSeat(t *testing.T) {
 		t.Fatalf("active Claude account = %q, %t; want work, true", active, found)
 	}
 	credentialsPath, _ := accountVault.CredentialsPath("claude", "work")
-	if metadata := readSlotMetadata(t, filepath.Dir(credentialsPath)); metadata.Email != "claude@example.com" {
-		t.Fatalf("slot email = %q, want claude@example.com", metadata.Email)
+	if metadata := readSlotMetadata(t, filepath.Dir(credentialsPath)); metadata.Email != "claude@example.com" || metadata.AccountUUID != "account-uuid" {
+		t.Fatalf("slot identity = %#v, want the fresh profile email and account UUID", metadata)
+	}
+}
+
+func TestLoginClaudeEnrollmentFallsBackToTheStatusEmailWhenProfileFails(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	manager := loginManager{
+		vault: accountVault,
+		claudeLive: &fakeClaudeLiveStore{credentials: claude.Credentials{
+			AccessToken: "access",
+			Scopes:      []string{"user:profile"},
+		}},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error { return nil }),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		claudeEmail: func(context.Context) (string, error) {
+			return "owner@example.com", nil
+		},
+		claudeProfile: func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, errors.New("network unavailable")
+		},
+	}
+
+	if err := manager.Login(context.Background(), "claude", "work", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v, want enrollment to remain network-independent", err)
+	}
+	credentialsPath, _ := accountVault.CredentialsPath("claude", "work")
+	metadata := readSlotMetadata(t, filepath.Dir(credentialsPath))
+	if metadata.Email != "owner@example.com" || metadata.AccountUUID != "" {
+		t.Fatalf("slot identity = %#v, want status email without an account UUID", metadata)
+	}
+}
+
+func TestLoginClaudeEnrollmentStopsWhenTheProfileContextIsCanceled(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	manager := loginManager{
+		vault: accountVault,
+		claudeLive: &fakeClaudeLiveStore{credentials: claude.Credentials{
+			AccessToken: "access",
+			Scopes:      []string{"user:profile"},
+		}},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error { return nil }),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		claudeEmail: func(context.Context) (string, error) {
+			return "owner@example.com", nil
+		},
+		claudeProfile: func(ctx context.Context, _ claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, ctx.Err()
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := manager.Login(ctx, "claude", "work", strings.NewReader(""))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Login() error = %v, want context cancellation", err)
+	}
+	slotPath, _ := accountVault.SlotPath("claude", "work")
+	if _, statErr := os.Stat(slotPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("canceled enrollment slot exists: %v", statErr)
 	}
 }
 
@@ -359,258 +429,6 @@ func TestParseClaudeAccountEmailAllowsSupportedStatusWithoutEmail(t *testing.T) 
 	}
 	if _, err := parseClaudeAccountEmail([]byte(`{"loggedIn":false}`)); err == nil || !strings.Contains(err.Error(), "claude auth login") {
 		t.Fatalf("logged-out status error = %v, want login next step", err)
-	}
-}
-
-func TestLoginClaudeEnrollsSecondAccountWithoutStatusEmailAfterTokenConfirmation(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
-	workPath, _ := accountVault.CredentialsPath("claude", "work")
-	if err := (claude.FileStore{Path: workPath}).Write(original); err != nil {
-		t.Fatalf("write confirmed active credentials: %v", err)
-	}
-	if err := writeManagedSlotMetadata(filepath.Dir(workPath), ""); err != nil {
-		t.Fatalf("write email-less metadata: %v", err)
-	}
-	live := &fakeClaudeLiveStore{credentials: original}
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
-			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
-				live.credentials = claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}
-			}
-			return nil
-		}),
-		stdout: io.Discard,
-		stderr: io.Discard,
-		getenv: func(string) string { return "approved" },
-		claudeEmail: func(context.Context) (string, error) {
-			return "", nil
-		},
-	}
-
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
-		t.Fatalf("Login() error = %v", err)
-	}
-	newPath, _ := accountVault.CredentialsPath("claude", "personal")
-	credentials, err := (claude.FileStore{Path: newPath}).Read()
-	if err != nil || credentials.RefreshToken != "new-refresh" {
-		t.Fatalf("email-less new slot preserved = %t, error = %v", credentials.RefreshToken == "new-refresh", err)
-	}
-}
-
-func TestLoginClaudeRequiresExplicitQuietWindowBeforeLiveMutation(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}}
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner:     loginRunnerFunc(func(context.Context, loginCommand) error { t.Fatal("runner called without approval"); return nil }),
-		stdout:     io.Discard,
-		stderr:     io.Discard,
-		getenv:     func(string) string { return "" },
-	}
-
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "stop Claude agents") || !strings.Contains(err.Error(), "HOP_CLAUDE_LIVE_LOGIN=approved") {
-		t.Fatalf("Login() error = %v, want quiet-window instructions", err)
-	}
-	if live.reads != 0 || len(live.writes) != 0 {
-		t.Fatalf("live reads = %d, writes = %d; want 0, 0 before approval", live.reads, len(live.writes))
-	}
-}
-
-func TestLoginClaudeStagesNewAccountAndRestoresActiveLogin(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
-	enrolled := claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}
-	live := &fakeClaudeLiveStore{credentials: original}
-	var commands []string
-	emailCalls := 0
-	var stdout bytes.Buffer
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
-			commands = append(commands, command.Name+" "+strings.Join(command.Args, " "))
-			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
-				live.credentials = enrolled
-			}
-			return nil
-		}),
-		stdout: &stdout,
-		stderr: io.Discard,
-		getenv: func(name string) string {
-			if name == claudeLiveLoginApproval {
-				return "approved"
-			}
-			return ""
-		},
-		claudeEmail: func(context.Context) (string, error) {
-			emailCalls++
-			if emailCalls == 1 {
-				return "work@example.com", nil
-			}
-			return "personal@example.com", nil
-		},
-	}
-
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
-		t.Fatalf("Login() error = %v", err)
-	}
-	wantCommands := []string{"claude auth logout", "claude auth login"}
-	if !reflect.DeepEqual(commands, wantCommands) {
-		t.Fatalf("commands = %v, want %v", commands, wantCommands)
-	}
-	if live.credentials.RefreshToken != original.RefreshToken || len(live.writes) != 1 {
-		t.Fatalf("live account restored = %t, writes = %d; want true, 1", live.credentials.RefreshToken == original.RefreshToken, len(live.writes))
-	}
-	newPath, _ := accountVault.CredentialsPath("claude", "personal")
-	got, err := (claude.FileStore{Path: newPath}).Read()
-	if err != nil || got.RefreshToken != enrolled.RefreshToken {
-		t.Fatalf("new slot token preserved = %t, error = %v", got.RefreshToken == enrolled.RefreshToken, err)
-	}
-	if metadata := readSlotMetadata(t, filepath.Dir(newPath)); metadata.Email != "personal@example.com" {
-		t.Fatalf("new slot email = %q, want personal@example.com", metadata.Email)
-	}
-	if !strings.Contains(stdout.String(), "restored active account \"work\"") {
-		t.Fatalf("stdout = %q, want restoration receipt", stdout.String())
-	}
-}
-
-func TestLoginClaudeRefusesToOverwriteSlotWhenLiveIdentityChanged(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "other", RefreshToken: "other-refresh"}}
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
-			t.Fatal("runner called after identity mismatch")
-			return nil
-		}),
-		stdout: io.Discard,
-		stderr: io.Discard,
-		getenv: func(string) string { return "approved" },
-		claudeEmail: func(context.Context) (string, error) {
-			return "other@example.com", nil
-		},
-	}
-
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "restore the recorded account") {
-		t.Fatalf("Login() error = %v, want identity reconciliation step", err)
-	}
-	workPath, _ := accountVault.CredentialsPath("claude", "work")
-	workCredentials, readErr := (claude.FileStore{Path: workPath}).Read()
-	if readErr != nil || workCredentials.RefreshToken != "seed-refresh" {
-		t.Fatalf("recorded work slot unchanged = %t, error = %v", workCredentials.RefreshToken == "seed-refresh", readErr)
-	}
-	if len(live.writes) != 0 {
-		t.Fatalf("live writes = %d, want 0", len(live.writes))
-	}
-}
-
-func TestLoginClaudeRejectsFreshTokensForAlreadyActiveIdentity(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
-	live := &fakeClaudeLiveStore{credentials: original}
-	emailCalls := 0
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
-			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
-				live.credentials = claude.Credentials{AccessToken: "fresh", RefreshToken: "fresh-refresh"}
-			}
-			return nil
-		}),
-		stdout: io.Discard,
-		stderr: io.Discard,
-		getenv: func(string) string { return "approved" },
-		claudeEmail: func(context.Context) (string, error) {
-			emailCalls++
-			return "work@example.com", nil
-		},
-	}
-
-	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "already-active identity") {
-		t.Fatalf("Login() error = %v, want duplicate-identity guidance", err)
-	}
-	if emailCalls != 2 {
-		t.Fatalf("email reads = %d, want active and newly logged-in identities", emailCalls)
-	}
-	if live.credentials.RefreshToken != original.RefreshToken {
-		t.Fatalf("active login restored = false, got refresh token %q", live.credentials.RefreshToken)
-	}
-	duplicateSlot, _ := accountVault.SlotPath("claude", "duplicate")
-	if _, err := os.Stat(duplicateSlot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("duplicate identity slot exists: %v", err)
-	}
-}
-
-func TestLoginClaudeRejectsIdentityAlreadyEnrolledUnderAnotherName(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	existingPath, _ := accountVault.CredentialsPath("claude", "existing")
-	if err := (claude.FileStore{Path: existingPath}).Write(claude.Credentials{AccessToken: "existing", RefreshToken: "existing-refresh"}); err != nil {
-		t.Fatalf("write existing slot: %v", err)
-	}
-	if err := writeManagedSlotMetadata(filepath.Dir(existingPath), "personal@example.com"); err != nil {
-		t.Fatalf("write existing metadata: %v", err)
-	}
-	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
-	live := &fakeClaudeLiveStore{credentials: original}
-	emailCalls := 0
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
-			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
-				live.credentials = claude.Credentials{AccessToken: "fresh", RefreshToken: "fresh-refresh"}
-			}
-			return nil
-		}),
-		stdout: io.Discard,
-		stderr: io.Discard,
-		getenv: func(string) string { return "approved" },
-		claudeEmail: func(context.Context) (string, error) {
-			emailCalls++
-			if emailCalls == 1 {
-				return "work@example.com", nil
-			}
-			return "personal@example.com", nil
-		},
-	}
-
-	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), `already enrolled as account "existing"`) {
-		t.Fatalf("Login() error = %v, want duplicate identity guidance", err)
-	}
-	if live.credentials.RefreshToken != original.RefreshToken {
-		t.Fatalf("active login restored = false, got refresh token %q", live.credentials.RefreshToken)
-	}
-	duplicatePath, _ := accountVault.SlotPath("claude", "duplicate")
-	if _, err := os.Stat(duplicatePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("duplicate slot exists: %v", err)
 	}
 }
 
@@ -630,7 +448,6 @@ func TestLoginClaudeCanExplicitlyConfirmCurrentActiveSlot(t *testing.T) {
 		}),
 		stdout: io.Discard,
 		stderr: io.Discard,
-		getenv: func(string) string { return "" },
 		claudeEmail: func(context.Context) (string, error) {
 			return "current@example.com", nil
 		},
@@ -652,160 +469,32 @@ func TestLoginClaudeCanExplicitlyConfirmCurrentActiveSlot(t *testing.T) {
 	}
 }
 
-func TestLoginClaudeRestoresActiveLoginWhenNewLoginFails(t *testing.T) {
+func TestLoginClaudeConfirmationKeepsTheRecordedEmailWhenStatusEmailIsStale(t *testing.T) {
 	t.Parallel()
 
 	accountVault := newTestVault(t)
 	seedActiveClaudeAccount(t, accountVault, "work")
-	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
-	live := &fakeClaudeLiveStore{credentials: original}
+	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "seed", RefreshToken: "seed-refresh"}}
 	manager := loginManager{
 		vault:      accountVault,
 		claudeLive: live,
-		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
-			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
-				live.credentials = claude.Credentials{}
-				return errors.New("browser closed")
-			}
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("runner called while confirming active account")
 			return nil
 		}),
 		stdout: io.Discard,
 		stderr: io.Discard,
-		getenv: func(string) string { return "approved" },
 		claudeEmail: func(context.Context) (string, error) {
-			return "work@example.com", nil
-		},
-	}
-
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "previous login will be restored") {
-		t.Fatalf("Login() error = %v, want restoration guidance", err)
-	}
-	if live.credentials.RefreshToken != original.RefreshToken || len(live.writes) != 1 {
-		t.Fatalf("live account restored after failure = %t, writes = %d; want true, 1", live.credentials.RefreshToken == original.RefreshToken, len(live.writes))
-	}
-	newSlot, _ := accountVault.SlotPath("claude", "personal")
-	if _, err := os.Stat(newSlot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed Claude login slot exists: %v", err)
-	}
-}
-
-func TestLoginClaudeBoundsRestorationAfterFailedLogin(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	live := &fakeClaudeLiveStore{
-		credentials: claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"},
-		blockWrite:  true,
-	}
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
-			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
-				return errors.New("browser closed")
-			}
-			return nil
-		}),
-		stdout:      io.Discard,
-		stderr:      io.Discard,
-		getenv:      func(string) string { return "approved" },
-		restoreWait: 10 * time.Millisecond,
-		claudeEmail: func(context.Context) (string, error) {
-			return "work@example.com", nil
-		},
-	}
-
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "restore active Claude account") || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Login() error = %v, want bounded restoration failure", err)
-	}
-}
-
-func TestLoginClaudeKeepsNewSlotWhenActiveRestorationFails(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	original := claude.Credentials{AccessToken: "old", RefreshToken: "old-refresh"}
-	live := &fakeClaudeLiveStore{credentials: original, writeErr: errors.New("keychain locked")}
-	emailCalls := 0
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
-			if reflect.DeepEqual(command.Args, []string{"auth", "login"}) {
-				live.credentials = claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}
-			}
-			return nil
-		}),
-		stdout: io.Discard,
-		stderr: io.Discard,
-		getenv: func(string) string { return "approved" },
-		claudeEmail: func(context.Context) (string, error) {
-			emailCalls++
-			if emailCalls == 1 {
-				return "work@example.com", nil
-			}
-			return "personal@example.com", nil
-		},
-	}
-
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "could not restore active account") {
-		t.Fatalf("Login() error = %v, want restoration failure", err)
-	}
-	newPath, _ := accountVault.CredentialsPath("claude", "personal")
-	credentials, readErr := (claude.FileStore{Path: newPath}).Read()
-	if readErr != nil || credentials.RefreshToken != "new-refresh" {
-		t.Fatalf("new slot preserved = %t, error = %v", credentials.RefreshToken == "new-refresh", readErr)
-	}
-}
-
-func TestLoginClaudeRecoversInterruptedStagingBeforeContinuing(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	workPath, _ := accountVault.CredentialsPath("claude", "work")
-	wantCredentials := claude.Credentials{AccessToken: "saved", RefreshToken: "saved-refresh"}
-	if err := (claude.FileStore{Path: workPath}).Write(wantCredentials); err != nil {
-		t.Fatalf("write recovery slot: %v", err)
-	}
-	record, err := json.Marshal(claudeStagingRecord{ActiveAccount: "work", ProcessID: 999999, CreatedAt: time.Now().UTC()})
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	transactionPath := filepath.Join(accountVault.Root(), claudeStagingFilename)
-	if err := os.WriteFile(transactionPath, record, 0o600); err != nil {
-		t.Fatalf("WriteFile(transaction) error = %v", err)
-	}
-	live := &fakeClaudeLiveStore{}
-	var stderr bytes.Buffer
-	manager := loginManager{
-		vault:      accountVault,
-		claudeLive: live,
-		runner:     loginRunnerFunc(func(context.Context, loginCommand) error { return nil }),
-		stdout:     io.Discard,
-		stderr:     &stderr,
-		getenv:     func(string) string { return "" },
-		claudeEmail: func(context.Context) (string, error) {
-			return "work@example.com", nil
+			return "stale@example.com", nil
 		},
 	}
 
 	if err := manager.Login(context.Background(), "claude", "work", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
-	if live.credentials.RefreshToken != wantCredentials.RefreshToken {
-		t.Fatalf("live refresh token restored = false, got %q", live.credentials.RefreshToken)
-	}
-	if _, err := os.Stat(transactionPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("completed transaction marker remains: %v", err)
-	}
-	if !strings.Contains(stderr.String(), "restored Claude account \"work\"") {
-		t.Fatalf("stderr = %q, want interrupted-enrollment recovery receipt", stderr.String())
+	workPath, _ := accountVault.CredentialsPath("claude", "work")
+	if metadata := readSlotMetadata(t, filepath.Dir(workPath)); metadata.Email != "work@example.com" {
+		t.Fatalf("confirmed slot email = %q, want the recorded work@example.com kept", metadata.Email)
 	}
 }
 
@@ -829,7 +518,7 @@ func seedActiveClaudeAccount(t *testing.T, accountVault vault.Vault, name string
 	if err := (claude.FileStore{Path: credentialsPath}).Write(claude.Credentials{AccessToken: "seed", RefreshToken: "seed-refresh"}); err != nil {
 		t.Fatalf("seed Claude slot: %v", err)
 	}
-	if err := writeManagedSlotMetadata(filepath.Dir(credentialsPath), "work@example.com"); err != nil {
+	if err := writeManagedSlotMetadata(filepath.Dir(credentialsPath), claude.Profile{Email: "work@example.com"}); err != nil {
 		t.Fatalf("seed Claude slot metadata: %v", err)
 	}
 }
@@ -845,4 +534,440 @@ func readSlotMetadata(t *testing.T, slotPath string) slotMetadata {
 		t.Fatalf("decode slot metadata: %v", err)
 	}
 	return metadata
+}
+
+func TestLoginClaudeInBrowserEnrollsSecondAccountWithoutTouchingTheLiveLogin(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "live", RefreshToken: "live-refresh"}}
+	enrolled := claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh", ExpiresAt: 1, RefreshTokenExpiresAt: 2, SubscriptionType: "max", Scopes: []string{"user:profile"}}
+	var stdout bytes.Buffer
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner:     loginRunnerFunc(func(context.Context, loginCommand) error { t.Fatal("runner called for a browser login"); return nil }),
+		stdout:     &stdout,
+		stderr:     io.Discard,
+		claudeEmail: func(context.Context) (string, error) {
+			t.Fatal("claude auth status consulted for a browser login")
+			return "", nil
+		},
+		claudeLogin: func(context.Context) (claude.Enrollment, error) {
+			return claude.Enrollment{Credentials: enrolled, Profile: claude.Profile{AccountUUID: "personal-uuid", Email: "personal@example.com"}}, nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if live.reads != 0 || len(live.writes) != 0 {
+		t.Fatalf("live reads = %d, writes = %d; want the live login untouched", live.reads, len(live.writes))
+	}
+	newPath, _ := accountVault.CredentialsPath("claude", "personal")
+	got, err := (claude.FileStore{Path: newPath}).Read()
+	if err != nil || !reflect.DeepEqual(got, enrolled) {
+		t.Fatalf("new slot credentials = %#v, error = %v; want %#v", got, err, enrolled)
+	}
+	metadata := readSlotMetadata(t, filepath.Dir(newPath))
+	if metadata.RefreshPolicy != managedRefreshPolicy || metadata.Email != "personal@example.com" || metadata.AccountUUID != "personal-uuid" {
+		t.Fatalf("new slot metadata = %#v, want managed custody with the token response identity", metadata)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(newPath), slotReservationFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reservation marker remains after enrollment: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `Enrolled Claude account "personal" (personal@example.com).`) {
+		t.Fatalf("stdout = %q, want enrollment receipt", stdout.String())
+	}
+}
+
+func TestLoginClaudeInBrowserLeavesNoSlotWhenTheSignInFails(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		loginErr error
+		want     string
+	}{
+		{name: "state mismatch", loginErr: fmt.Errorf("[CLAUDE_LOGIN_STATE_MISMATCH] discarded: %w", claude.ErrLogin), want: "[CLAUDE_LOGIN_STATE_MISMATCH]"},
+		{name: "exchange rejected", loginErr: fmt.Errorf("[CLAUDE_LOGIN_EXCHANGE_FAILED] HTTP 400: %w", claude.ErrLogin), want: "[CLAUDE_LOGIN_EXCHANGE_FAILED]"},
+		{name: "port busy", loginErr: fmt.Errorf("[CLAUDE_LOGIN_PORT_IN_USE] taken: %w", claude.ErrCallbackPort), want: claudeLoginPortOverride},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			accountVault := newTestVault(t)
+			seedActiveClaudeAccount(t, accountVault, "work")
+			live := &fakeClaudeLiveStore{}
+			manager := loginManager{
+				vault:       accountVault,
+				claudeLive:  live,
+				stdout:      io.Discard,
+				stderr:      io.Discard,
+				claudeLogin: func(context.Context) (claude.Enrollment, error) { return claude.Enrollment{}, testCase.loginErr },
+			}
+
+			err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+			if err == nil || !strings.Contains(err.Error(), testCase.want) || !strings.Contains(err.Error(), "before anything was saved") {
+				t.Fatalf("Login() error = %v, want %s with the nothing-saved receipt", err, testCase.want)
+			}
+			slotPath, _ := accountVault.SlotPath("claude", "personal")
+			if _, err := os.Stat(slotPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("slot remains after a failed login: %v", err)
+			}
+			if live.reads != 0 || len(live.writes) != 0 {
+				t.Fatalf("live reads = %d, writes = %d; want the live login untouched", live.reads, len(live.writes))
+			}
+		})
+	}
+}
+
+func TestLoginClaudeInBrowserRefusesAnExistingAccountBeforeOpeningTheBrowser(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	personalPath, _ := accountVault.CredentialsPath("claude", "personal")
+	if err := (claude.FileStore{Path: personalPath}).Write(claude.Credentials{AccessToken: "kept", RefreshToken: "kept-refresh"}); err != nil {
+		t.Fatalf("seed existing slot: %v", err)
+	}
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: &fakeClaudeLiveStore{},
+		stdout:     io.Discard,
+		stderr:     io.Discard,
+		claudeLogin: func(context.Context) (claude.Enrollment, error) {
+			t.Fatal("browser login started for an existing account")
+			return claude.Enrollment{}, nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), `claude account "personal" already exists`) {
+		t.Fatalf("Login() error = %v, want existing-account refusal", err)
+	}
+	if got, err := (claude.FileStore{Path: personalPath}).Read(); err != nil || got.RefreshToken != "kept-refresh" {
+		t.Fatalf("existing slot = %#v, error = %v; want it untouched", got, err)
+	}
+}
+
+func TestLoginClaudeInBrowserRejectsIdentityAlreadyEnrolledUnderAnotherName(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: &fakeClaudeLiveStore{},
+		stdout:     io.Discard,
+		stderr:     io.Discard,
+		claudeLogin: func(context.Context) (claude.Enrollment, error) {
+			return claude.Enrollment{Credentials: claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}, Profile: claude.Profile{Email: "WORK@example.com"}}, nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), `already enrolled as account "work"`) {
+		t.Fatalf("Login() error = %v, want duplicate identity refusal", err)
+	}
+	slotPath, _ := accountVault.SlotPath("claude", "duplicate")
+	if _, err := os.Stat(slotPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("slot remains after a duplicate refusal: %v", err)
+	}
+}
+
+func TestDefaultClaudeLoginRejectsAnUnusablePortOverride(t *testing.T) {
+	t.Setenv(claudeLoginPortOverride, "http")
+
+	_, err := defaultClaudeLogin(io.Discard)
+	if err == nil || !strings.Contains(err.Error(), claudeLoginPortOverride) || !strings.Contains(err.Error(), "between 1 and 65535") {
+		t.Fatalf("defaultClaudeLogin() error = %v, want port override guidance", err)
+	}
+}
+
+func TestBrowserCommandHonorsBROWSERBeforeThePlatformOpener(t *testing.T) {
+	t.Setenv("BROWSER", "my-browser --new-tab")
+
+	got := browserCommand("https://example.test/authorize").Args
+	want := []string{"my-browser", "--new-tab", "https://example.test/authorize"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("browserCommand().Args = %v, want %v", got, want)
+	}
+}
+
+func TestLoginCodexRenewsAnEnrolledSlotAndKeepsItsPendingReset(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	slotPath := filepath.Dir(credentialsPath)
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "expired", RefreshToken: "dead", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	if err := writeSlotMetadata(slotPath, slotMetadata{RefreshPolicy: managedRefreshPolicy, Email: "owner@example.com", Disabled: true}); err != nil {
+		t.Fatalf("seed slot metadata: %v", err)
+	}
+	pendingPath := filepath.Join(slotPath, pendingResetFilename)
+	if err := writePendingReset(pendingPath, pendingReset{RedeemRequestID: "0f3c9a1e-7d2b-4c8e-9a1f-2b3c4d5e6f70", AccountID: "account"}); err != nil {
+		t.Fatalf("seed pending reset: %v", err)
+	}
+	var stdout bytes.Buffer
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: &stdout,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "codex", "work", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	renewed, err := (codex.FileStore{Path: credentialsPath}).Read()
+	if err != nil || renewed.RefreshToken != "fresh-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want the fresh sign-in", renewed, err)
+	}
+	pending, found, err := readPendingReset(pendingPath)
+	if err != nil || !found || pending.RedeemRequestID != "0f3c9a1e-7d2b-4c8e-9a1f-2b3c4d5e6f70" {
+		t.Fatalf("pending reset after renewal = %+v, %t, %v; want the recorded request kept", pending, found, err)
+	}
+	metadata := readSlotMetadata(t, slotPath)
+	if metadata.RefreshPolicy != managedRefreshPolicy || metadata.Email != "owner@example.com" || !metadata.Disabled {
+		t.Fatalf("slot metadata = %+v, want custody and the disabled flag kept", metadata)
+	}
+	if got := stdout.String(); !strings.Contains(got, `Renewed codex account "work" (owner@example.com)`) {
+		t.Fatalf("stdout = %q, want renewal receipt", got)
+	}
+}
+
+func TestLoginCodexRefusesRenewingASlotWithAnotherIdentity(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "kept", RefreshToken: "kept-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "other", RefreshToken: "other-refresh", AccountID: "other-account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			t.Fatal("email looked up for a refused sign-in")
+			return "", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_OTHER_IDENTITY]") || !strings.Contains(err.Error(), "hop rm codex work") {
+		t.Fatalf("Login() error = %v, want the other-identity refusal with the removal next step", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.RefreshToken != "kept-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want them untouched", got, err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingTheActiveAccountBeforeSigningIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "live", RefreshToken: "live-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	activeState := state.New()
+	activeState.SetActive("codex", "work")
+	if err := activeState.Save(accountVault.Root()); err != nil {
+		t.Fatalf("state.Save() error = %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("codex login started for the active account")
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_ACTIVE_ACCOUNT]") || !strings.Contains(err.Error(), "codex login") {
+		t.Fatalf("Login() error = %v, want the active-account refusal with the live renewal next step", err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingAnAccountThatWentLiveDuringSignIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "kept", RefreshToken: "kept-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			activeState := state.New()
+			activeState.SetActive("codex", "work")
+			if err := activeState.Save(accountVault.Root()); err != nil {
+				t.Fatalf("state.Save() error = %v", err)
+			}
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_ACTIVE_ACCOUNT]") {
+		t.Fatalf("Login() error = %v, want the active-account refusal after sign-in", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.RefreshToken != "kept-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want the live slot untouched", got, err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingASlotReEnrolledDuringSignIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "other", RefreshToken: "other-refresh", AccountID: "other-account"}); err != nil {
+				t.Fatalf("re-enroll slot during sign-in: %v", err)
+			}
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_OTHER_IDENTITY]") {
+		t.Fatalf("Login() error = %v, want the other-identity refusal after sign-in", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.AccountID != "other-account" {
+		t.Fatalf("slot credentials = %#v, error = %v; want the re-enrolled identity kept", got, err)
+	}
+}
+
+func TestLoginCodexExplainsASlotRemovedDuringSignIn(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: os.ErrNotExist},
+		runner: loginRunnerFunc(func(_ context.Context, command loginCommand) error {
+			if err := os.RemoveAll(filepath.Dir(credentialsPath)); err != nil {
+				t.Fatalf("remove slot during sign-in: %v", err)
+			}
+			return (codex.FileStore{Path: filepath.Join(command.Env["CODEX_HOME"], "auth.json")}).Write(codex.Credentials{
+				AccessToken: "fresh", RefreshToken: "fresh-refresh", AccountID: "account",
+			})
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+		codexEmail: func(context.Context, codex.Credentials) (string, error) {
+			return "owner@example.com", nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "removed while you signed in") {
+		t.Fatalf("Login() error = %v, want the removed-slot explanation", err)
+	}
+	if _, err := os.Stat(filepath.Dir(credentialsPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("slot after refused renewal: %v, want it absent", err)
+	}
+}
+
+func TestLoginCodexRefusesRenewingTheSlotTheLiveLoginMatchesWhenNoActiveAccountIsRecorded(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{credentials: codex.Credentials{AccessToken: "live", RefreshToken: "live-refresh", AccountID: "account"}},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("codex login started for the slot the live login matches")
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "[CODEX_LOGIN_ACTIVE_ACCOUNT]") {
+		t.Fatalf("Login() error = %v, want the active-account refusal from the live login match", err)
+	}
+	if got, err := (codex.FileStore{Path: credentialsPath}).Read(); err != nil || got.RefreshToken != "old-refresh" {
+		t.Fatalf("slot credentials = %#v, error = %v; want them untouched", got, err)
+	}
+}
+
+func TestLoginCodexStopsRenewalWhenTheLiveLoginCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	credentialsPath, _ := accountVault.CredentialsPath("codex", "work")
+	if err := (codex.FileStore{Path: credentialsPath}).Write(codex.Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "account"}); err != nil {
+		t.Fatalf("seed enrolled slot: %v", err)
+	}
+	manager := loginManager{
+		vault:     accountVault,
+		codexLive: &fakeCodexLiveStore{readErr: errors.New("auth.json is half written")},
+		runner: loginRunnerFunc(func(context.Context, loginCommand) error {
+			t.Fatal("codex login started while the live login was unreadable")
+			return nil
+		}),
+		stdout: io.Discard,
+		stderr: io.Discard,
+	}
+
+	err := manager.Login(context.Background(), "codex", "work", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "half written") || !strings.Contains(err.Error(), "codex login") {
+		t.Fatalf("Login() error = %v, want the live-login repair step", err)
+	}
 }
