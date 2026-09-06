@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -412,4 +413,85 @@ func (store *memoryStore) Write(credentials Credentials) error {
 	store.credentials = credentials
 	store.writes++
 	return nil
+}
+
+func TestConsumeResetCreditSendsTheRedeemIDAsTheDesktopApp(t *testing.T) {
+	t.Parallel()
+
+	var gotPath, gotMethod, gotBody string
+	gotHeaders := http.Header{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		gotPath, gotMethod = request.URL.Path, request.Method
+		body, _ := io.ReadAll(request.Body)
+		gotBody = string(body)
+		gotHeaders = request.Header.Clone()
+		_, _ = io.WriteString(writer, `{}`)
+	}))
+	t.Cleanup(server.Close)
+
+	err := New(Config{ResetCreditsURL: server.URL + "/credits"}).ConsumeResetCredit(context.Background(), Credentials{AccessToken: "access", AccountID: "account"}, "11111111-2222-4333-8444-555555555555")
+	if err != nil {
+		t.Fatalf("ConsumeResetCredit() error = %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/credits/consume" {
+		t.Fatalf("request = %s %s, want POST /credits/consume", gotMethod, gotPath)
+	}
+	if gotBody != `{"redeem_request_id":"11111111-2222-4333-8444-555555555555"}` {
+		t.Fatalf("body = %s", gotBody)
+	}
+	for header, want := range map[string]string{
+		"Authorization":      "Bearer access",
+		"Chatgpt-Account-Id": "account",
+		"Openai-Beta":        "codex-1",
+		"Originator":         "Codex Desktop",
+		"Content-Type":       "application/json",
+	} {
+		if got := gotHeaders.Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestConsumeResetCreditExplainsRejections(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{name: "expired login", status: http.StatusUnauthorized, want: "hop login codex <account>"},
+		{name: "rate limited", status: http.StatusTooManyRequests, want: "wait and retry"},
+		{name: "outage", status: http.StatusBadGateway, want: "retry later"},
+		{name: "unexpected", status: http.StatusConflict, want: "check 'hop ls'"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.status)
+			}))
+			t.Cleanup(server.Close)
+
+			err := New(Config{ResetCreditsURL: server.URL}).ConsumeResetCredit(context.Background(), Credentials{AccessToken: "access", AccountID: "account"}, "id")
+			if !errors.Is(err, ErrReset) {
+				t.Fatalf("ConsumeResetCredit() error = %v, want ErrReset", err)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", testCase.status)) || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("ConsumeResetCredit() error = %v, want the status and %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestConsumeResetCreditReportsAnUnreachableEndpoint(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	server.Close()
+
+	err := New(Config{ResetCreditsURL: server.URL}).ConsumeResetCredit(context.Background(), Credentials{AccessToken: "access", AccountID: "account"}, "id")
+	if !errors.Is(err, ErrReset) || !strings.Contains(err.Error(), "reach the Codex reset endpoint") {
+		t.Fatalf("ConsumeResetCredit() error = %v, want an unreachable-endpoint ErrReset", err)
+	}
 }
