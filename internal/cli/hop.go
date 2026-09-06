@@ -1152,10 +1152,6 @@ func (store claudeFileLiveStore) Write(_ context.Context, credentials claude.Cre
 	return store.store.Write(credentials)
 }
 
-func (store claudeFileLiveStore) Clear(context.Context) error {
-	return store.store.Clear()
-}
-
 func (store claudeFileLiveStore) ClearIfMatches(_ context.Context, expected claude.Credentials) error {
 	return store.store.ClearIfMatches(expected)
 }

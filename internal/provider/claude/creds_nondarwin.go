@@ -28,17 +28,6 @@ func WriteLiveCredentials(_ context.Context, credentials Credentials) error {
 	return (LiveFile{Path: path}).Write(credentials)
 }
 
-// ClearLiveCredentials removes Claude Code's credential file so the Claude CLI
-// sees no login and opens its browser sign-in. A file that is already absent
-// counts as cleared.
-func ClearLiveCredentials(_ context.Context) error {
-	path, err := liveCredentialsPath()
-	if err != nil {
-		return err
-	}
-	return (LiveFile{Path: path}).Clear()
-}
-
 // ClearLiveCredentialsIfMatches removes only the file hop installed.
 func ClearLiveCredentialsIfMatches(_ context.Context, expected Credentials) error {
 	path, err := liveCredentialsPath()
