@@ -17,13 +17,20 @@ import (
 )
 
 const (
-	defaultUsageURL = "https://chatgpt.com/backend-api/wham/usage"
-	defaultTokenURL = "https://auth.openai.com/oauth/token"
+	defaultUsageURL        = "https://chatgpt.com/backend-api/wham/usage"
+	defaultResetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+	defaultTokenURL        = "https://auth.openai.com/oauth/token"
 	// The public client ID published in the open-source Codex CLI. It is not a
 	// secret and not issued to hop; OpenAI can change it at any time, which is
 	// why Config.ClientID can override it.
 	defaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	responseLimit   = 1 << 20
+	// The credits call only runs when the usage payload omits the count, and
+	// it shares the account's 5-second glance budget with the usage call.
+	resetCreditsTimeout = 2 * time.Second
+
+	availableCredit  = "available"
+	codexResetCredit = "codex_rate_limits"
 
 	accountGroup    = "account"
 	codeReviewGroup = "code_review"
@@ -63,20 +70,22 @@ type Store interface {
 
 // Config overrides adapter dependencies and endpoints for tests.
 type Config struct {
-	HTTPClient *http.Client
-	UsageURL   string
-	TokenURL   string
-	ClientID   string
-	Now        func() time.Time
+	HTTPClient      *http.Client
+	UsageURL        string
+	ResetCreditsURL string
+	TokenURL        string
+	ClientID        string
+	Now             func() time.Time
 }
 
 // Adapter talks to Codex OAuth and usage endpoints.
 type Adapter struct {
-	client   *http.Client
-	usageURL string
-	tokenURL string
-	clientID string
-	now      func() time.Time
+	client          *http.Client
+	usageURL        string
+	resetCreditsURL string
+	tokenURL        string
+	clientID        string
+	now             func() time.Time
 }
 
 type credentialFetcher struct {
@@ -96,6 +105,10 @@ func New(config Config) Adapter {
 	if usageURL == "" {
 		usageURL = defaultUsageURL
 	}
+	resetCreditsURL := config.ResetCreditsURL
+	if resetCreditsURL == "" {
+		resetCreditsURL = defaultResetCreditsURL
+	}
 	tokenURL := config.TokenURL
 	if tokenURL == "" {
 		tokenURL = defaultTokenURL
@@ -108,7 +121,7 @@ func New(config Config) Adapter {
 	if now == nil {
 		now = time.Now
 	}
-	return Adapter{client: client, usageURL: usageURL, tokenURL: tokenURL, clientID: clientID, now: now}
+	return Adapter{client: client, usageURL: usageURL, resetCreditsURL: resetCreditsURL, tokenURL: tokenURL, clientID: clientID, now: now}
 }
 
 // Fetcher binds credentials to the shared account fetcher contract.
@@ -125,12 +138,10 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 	if strings.TrimSpace(credentials.AccessToken) == "" || strings.TrimSpace(credentials.AccountID) == "" {
 		return provider.Usage{}, fmt.Errorf("access token or account ID is missing; run 'hop login codex <account>': %w", ErrCredentials)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, adapter.usageURL, nil)
+	request, err := accountRequest(ctx, adapter.usageURL, credentials)
 	if err != nil {
 		return provider.Usage{}, fmt.Errorf("build Codex usage request: %w", err)
 	}
-	request.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
-	request.Header.Set("chatgpt-account-id", credentials.AccountID)
 
 	response, err := adapter.client.Do(request)
 	if err != nil {
@@ -144,7 +155,53 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 	if err != nil {
 		return provider.Usage{}, fmt.Errorf("read Codex usage response; retry the command: %w: %w", err, ErrUsage)
 	}
-	return parseUsage(body, adapter.now())
+	usage, err := parseUsage(body, adapter.now())
+	if err != nil {
+		return provider.Usage{}, err
+	}
+	if usage.ResetCredits == nil {
+		// A failed lookup leaves the credits unknown rather than reporting zero,
+		// and never hides the usage the glance exists to show.
+		if credits, err := adapter.fetchResetCredits(ctx, credentials); err == nil {
+			usage.ResetCredits = &credits
+		}
+	}
+	return usage, nil
+}
+
+func accountRequest(ctx context.Context, endpoint string, credentials Credentials) (*http.Request, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
+	request.Header.Set("chatgpt-account-id", credentials.AccountID)
+	return request, nil
+}
+
+func (adapter Adapter) fetchResetCredits(ctx context.Context, credentials Credentials) (provider.ResetCredits, error) {
+	ctx, cancel := context.WithTimeout(ctx, resetCreditsTimeout)
+	defer cancel()
+	request, err := accountRequest(ctx, adapter.resetCreditsURL, credentials)
+	if err != nil {
+		return provider.ResetCredits{}, fmt.Errorf("build Codex reset credits request: %w", err)
+	}
+	request.Header.Set("OpenAI-Beta", "codex-1")
+	request.Header.Set("Originator", "Codex Desktop")
+
+	response, err := adapter.client.Do(request)
+	if err != nil {
+		return provider.ResetCredits{}, fmt.Errorf("reach Codex reset credits endpoint: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return provider.ResetCredits{}, fmt.Errorf("codex reset credits returned HTTP %d", response.StatusCode)
+	}
+	var payload resetCreditsPayload
+	if err := json.NewDecoder(io.LimitReader(response.Body, responseLimit)).Decode(&payload); err != nil {
+		return provider.ResetCredits{}, fmt.Errorf("decode Codex reset credits response: %w", err)
+	}
+	return payload.normalize(), nil
 }
 
 // Refresh rotates OAuth tokens in a hop-owned store. Never pass the live auth.json store.
@@ -232,6 +289,32 @@ type usageResponse struct {
 	RateLimit            rateLimit             `json:"rate_limit"`
 	CodeReviewRateLimit  *rateLimit            `json:"code_review_rate_limit"`
 	AdditionalRateLimits []additionalRateLimit `json:"additional_rate_limits"`
+	ResetCredits         *resetCreditsPayload  `json:"rate_limit_reset_credits"`
+}
+
+type resetCreditsPayload struct {
+	AvailableCount int           `json:"available_count"`
+	Credits        []resetCredit `json:"credits"`
+}
+
+type resetCredit struct {
+	Status    string    `json:"status"`
+	ResetType string    `json:"reset_type"`
+	GrantedAt time.Time `json:"granted_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// normalize keeps only the credits a Codex reset can spend today.
+func (payload resetCreditsPayload) normalize() provider.ResetCredits {
+	credits := provider.NoResetCredits()
+	credits.Count = payload.AvailableCount
+	for _, credit := range payload.Credits {
+		if credit.Status != availableCredit || credit.ResetType != codexResetCredit || credit.ExpiresAt.IsZero() {
+			continue
+		}
+		credits.Credits = append(credits.Credits, provider.ResetCredit{GrantedAt: credit.GrantedAt, ExpiresAt: credit.ExpiresAt})
+	}
+	return credits
 }
 
 type rateLimit struct {
@@ -337,6 +420,10 @@ func parseUsage(body []byte, now time.Time) (provider.Usage, error) {
 	}
 	if len(usage.Windows) == 0 && len(usage.Limits) == 0 {
 		return provider.Usage{}, fmt.Errorf("decode Codex usage response; no usage windows or limits were present, update hop before retrying: %w", ErrUsage)
+	}
+	if response.ResetCredits != nil {
+		credits := response.ResetCredits.normalize()
+		usage.ResetCredits = &credits
 	}
 	return usage, nil
 }

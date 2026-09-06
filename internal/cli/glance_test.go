@@ -202,6 +202,47 @@ func TestShowAccountsJSONHasStableSchemaAndEmptyArrays(t *testing.T) {
 	}
 }
 
+func TestShowAccountsJSONCarriesResetCreditsOnlyForCodex(t *testing.T) {
+	t.Parallel()
+
+	catalog := staticCatalog{
+		{
+			Provider: provider.Codex,
+			Name:     "work",
+			Fetcher: fetchFunc(func(context.Context) (provider.Usage, error) {
+				return provider.Usage{Provider: provider.Codex, ResetCredits: &provider.ResetCredits{Count: 1}}, nil
+			}),
+		},
+		{
+			Provider: provider.Claude,
+			Name:     "work",
+			Fetcher: fetchFunc(func(context.Context) (provider.Usage, error) {
+				return provider.Usage{Provider: provider.Claude}, nil
+			}),
+		},
+	}
+	var output bytes.Buffer
+	if err := showAccountsFrom(context.Background(), &output, true, catalog, time.Now()); err != nil {
+		t.Fatalf("showAccountsFrom() error = %v", err)
+	}
+	var document struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &document); err != nil {
+		t.Fatalf("JSON output is invalid: %v\n%s", err, output.String())
+	}
+	codex, ok := document.Accounts[0]["reset_credits"].(map[string]any)
+	if !ok || codex["count"] != float64(1) {
+		t.Fatalf("codex reset_credits = %#v, want count 1", document.Accounts[0]["reset_credits"])
+	}
+	if _, ok := codex["credits"].([]any); !ok {
+		t.Fatalf("codex credits = %#v, want a JSON array even when the fetcher gave none", codex["credits"])
+	}
+	if _, present := document.Accounts[1]["reset_credits"]; present {
+		t.Fatalf("claude row carries reset_credits: %s", output.String())
+	}
+}
+
 func TestShowAccountsJSONOmitsMissingResets(t *testing.T) {
 	t.Parallel()
 

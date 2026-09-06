@@ -42,6 +42,37 @@ type Limit struct {
 	Active      bool      `json:"active"`
 }
 
+// ResetCredit is one manual quota reset an account can spend before it expires.
+type ResetCredit struct {
+	GrantedAt time.Time `json:"granted_at,omitzero"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// ResetCredits is the manual resets an account has available right now.
+type ResetCredits struct {
+	Count   int           `json:"count"`
+	Credits []ResetCredit `json:"credits"`
+}
+
+// NoResetCredits is the value for an account that has no credit left to spend.
+func NoResetCredits() ResetCredits {
+	return ResetCredits{Credits: make([]ResetCredit, 0)}
+}
+
+// SoonestExpiry returns the earliest expiry among the credits, if any carries one.
+func (credits ResetCredits) SoonestExpiry() (time.Time, bool) {
+	var soonest time.Time
+	for _, credit := range credits.Credits {
+		if credit.ExpiresAt.IsZero() {
+			continue
+		}
+		if soonest.IsZero() || credit.ExpiresAt.Before(soonest) {
+			soonest = credit.ExpiresAt
+		}
+	}
+	return soonest, !soonest.IsZero()
+}
+
 // UsageHTTPAction gives the caller a status-specific next step.
 func UsageHTTPAction(providerName Name, statusCode int) string {
 	switch {
@@ -63,6 +94,8 @@ type Usage struct {
 	Plan     string   `json:"plan,omitempty"`
 	Windows  []Window `json:"windows"`
 	Limits   []Limit  `json:"limits"`
+	// ResetCredits is nil when the provider has no manual resets or the count is unknown.
+	ResetCredits *ResetCredits `json:"reset_credits,omitempty"`
 }
 
 // Fetcher retrieves normalized usage for one account.

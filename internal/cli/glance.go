@@ -19,14 +19,15 @@ type glanceDocument struct {
 }
 
 type accountResult struct {
-	Provider provider.Name     `json:"provider"`
-	Account  string            `json:"account"`
-	Active   bool              `json:"active"`
-	Email    string            `json:"email,omitempty"`
-	Plan     string            `json:"plan,omitempty"`
-	Windows  []provider.Window `json:"windows"`
-	Limits   []provider.Limit  `json:"limits"`
-	Error    *accountProblem   `json:"error,omitempty"`
+	Provider     provider.Name          `json:"provider"`
+	Account      string                 `json:"account"`
+	Active       bool                   `json:"active"`
+	Email        string                 `json:"email,omitempty"`
+	Plan         string                 `json:"plan,omitempty"`
+	Windows      []provider.Window      `json:"windows"`
+	Limits       []provider.Limit       `json:"limits"`
+	ResetCredits *provider.ResetCredits `json:"reset_credits,omitempty"`
+	Error        *accountProblem        `json:"error,omitempty"`
 }
 
 type accountProblem struct {
@@ -94,6 +95,13 @@ func resultFor(account account, usage provider.Usage, err error) accountResult {
 	}
 	if result.Limits == nil {
 		result.Limits = make([]provider.Limit, 0)
+	}
+	if usage.ResetCredits != nil {
+		credits := *usage.ResetCredits
+		if credits.Credits == nil {
+			credits.Credits = make([]provider.ResetCredit, 0)
+		}
+		result.ResetCredits = &credits
 	}
 	return result
 }
