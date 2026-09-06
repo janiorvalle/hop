@@ -70,7 +70,8 @@ What hop touches:
   eight days, the same age the Codex CLI itself renews at. Any account, managed
   or not, gets a warning on its row inside seven days and a red one inside two,
   with the `hop rm` and `hop login` commands that renew it. `hop ls --json` carries the
-  same thing as `refresh_token_expiry`.
+  same thing as `refresh_token_expiry`. `hop refresh` does the same rotation
+  without fetching usage, so a scheduler can run it for you.
 
 What hop never does:
 
@@ -131,6 +132,71 @@ Hop downloads the archive for the current OS and architecture, verifies it
 against the release's `checksums.txt`, and only then replaces the running
 binary. Development and dirty builds refuse self-upgrade; install a published
 release first.
+
+## Keep idle accounts warm
+
+An account you never glance at still dies when its refresh token expires.
+`hop refresh` makes the same rotation decision a glance makes, for every
+account hop manages, and fetches nothing else. It runs with no daemon, so
+schedule it once a day and read its log.
+
+```sh
+hop refresh
+```
+
+Each run prints one line per account, in the same order `hop ls` uses:
+
+```
+claude personal: rotated, refresh token good until 2026-10-05
+claude work: fresh, no rotation needed
+claude seeded: skipped: not managed by hop, run 'hop rm claude seeded' and then 'hop login claude seeded' to let hop rotate it
+codex work: skipped: active account, hop never rotates the live login
+codex old: failed: codex token endpoint returned HTTP 502; the slot was not changed, run 'hop login codex old'
+```
+
+Grep the log for `failed`. Every failed line ends with the next step, and the
+exit code is non-zero whenever any line failed. Everything else is
+informational.
+
+On macOS, save this as `~/Library/LaunchAgents/com.hop.refresh.plist` and load
+it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hop.refresh.plist`.
+Replace `/Users/you` with your home directory; launchd does not expand `~`.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hop.refresh</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.local/bin/hop</string>
+    <string>refresh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/hop-refresh.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/hop-refresh.log</string>
+</dict>
+</plist>
+```
+
+On Linux, or with cron on macOS, add one line with `crontab -e`:
+
+```
+0 9 * * * "$HOME/.local/bin/hop" refresh >> "$HOME/.hop/refresh.log" 2>&1
+```
+
+Cron mails a job's output and ignores its exit code, so drop the redirection
+and set `MAILTO` if you would rather get every run by mail than in a log.
 
 ## Development
 
