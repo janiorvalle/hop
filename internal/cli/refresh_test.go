@@ -213,3 +213,16 @@ func readSlotFile(t *testing.T, accountVault vault.Vault, providerName, name str
 	}
 	return contents
 }
+
+func TestRefreshSkipsDisabledSlotWithoutTouchingIt(t *testing.T) {
+	t.Parallel()
+
+	parked := account{Provider: "codex", Name: "paused", Disabled: true}
+	var stdout bytes.Buffer
+	if err := refreshAccountsFrom(context.Background(), &stdout, staticCatalog{parked}); err != nil {
+		t.Fatalf("refreshAccountsFrom() error = %v", err)
+	}
+	if got := stdout.String(); got != "codex paused: skipped: disabled, run 'hop enable codex paused' to rotate it again\n" {
+		t.Fatalf("output = %q", got)
+	}
+}
