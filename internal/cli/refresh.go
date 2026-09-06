@@ -70,6 +70,8 @@ func refreshStatus(ctx context.Context, current account) (string, error) {
 		return "rotated, refresh token good until " + outcome.RefreshTokenExpiry.UTC().Format("2006-01-02"), nil
 	case rotationFresh:
 		return "fresh, no rotation needed", nil
+	case rotationBecameActive:
+		return "skipped: became active, hop never rotates the live login", nil
 	default:
 		return unmanagedStatus(current), nil
 	}
