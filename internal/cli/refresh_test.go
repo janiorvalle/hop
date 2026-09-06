@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/janiorvalle/hop/internal/provider"
 	"github.com/janiorvalle/hop/internal/provider/claude"
 	"github.com/janiorvalle/hop/internal/provider/codex"
 	"github.com/janiorvalle/hop/internal/state"
@@ -289,5 +290,21 @@ func TestRefreshReportsSlotsThatBecameActiveSinceTheCatalogWasBuilt(t *testing.T
 	}
 	if teamAfter := readSlotFile(t, accountVault, "codex", "team"); !bytes.Equal(teamBefore, teamAfter) {
 		t.Fatalf("codex team changed on disk after it became the live login:\n%s", teamAfter)
+	}
+}
+
+func TestUnmanagedStatusNamesTheRenewalForEachProvider(t *testing.T) {
+	t.Parallel()
+
+	for _, scenario := range []struct {
+		provider provider.Name
+		want     string
+	}{
+		{provider: provider.Claude, want: "skipped: not managed by hop, run 'hop rm claude seeded' and then 'hop login claude seeded' to let hop rotate it"},
+		{provider: provider.Codex, want: "skipped: not managed by hop, run 'hop login codex seeded' to let hop rotate it"},
+	} {
+		if got := unmanagedStatus(account{Provider: scenario.provider, Name: "seeded"}); got != scenario.want {
+			t.Errorf("unmanagedStatus(%s) = %q, want %q", scenario.provider, got, scenario.want)
+		}
 	}
 }

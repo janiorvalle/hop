@@ -16,7 +16,7 @@ Usage:
   hop                                Show usage for every account
   hop <account>                      Switch both providers with that account
   hop <provider> <account>           Switch one provider
-  hop login <provider> <account>     Add an account
+  hop login <provider> <account>     Add an account, or renew a Codex one
   hop ls [--json]                    List accounts
   hop refresh                        Rotate idle account tokens, for cron
   hop disable <provider> <account>   Park an account: no usage fetch, no switching

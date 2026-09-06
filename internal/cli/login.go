@@ -50,6 +50,7 @@ type loginManager struct {
 	vault         vault.Vault
 	runner        loginRunner
 	claudeLive    claudeLiveStore
+	codexLive     codexLiveStore
 	stdout        io.Writer
 	stderr        io.Writer
 	codexEmail    func(context.Context, codex.Credentials) (string, error)
@@ -83,10 +84,15 @@ func loginAccount(ctx context.Context, providerName, accountName string, stdin i
 	if err != nil {
 		return err
 	}
+	codexLive, _, err := defaultCodexSwitchStore()
+	if err != nil {
+		return err
+	}
 	manager := loginManager{
 		vault:      accountVault,
 		runner:     systemLoginRunner{},
 		claudeLive: claudeDependencies.store,
+		codexLive:  codexLive,
 		stdout:     stdout,
 		stderr:     stderr,
 		codexEmail: func(ctx context.Context, credentials codex.Credentials) (string, error) {
@@ -147,12 +153,7 @@ func browserCommand(authorizeURL string) *exec.Cmd {
 func (manager loginManager) Login(ctx context.Context, providerName, accountName string, stdin io.Reader) error {
 	switch providerName {
 	case "codex":
-		reservation, err := manager.reserveNewSlot(providerName, accountName)
-		if err != nil {
-			return err
-		}
-		defer reservation.Cleanup()
-		return manager.loginCodex(ctx, accountName, reservation, stdin)
+		return manager.loginCodex(ctx, accountName, stdin)
 	case "claude":
 		return manager.loginClaude(ctx, accountName)
 	default:
@@ -160,28 +161,22 @@ func (manager loginManager) Login(ctx context.Context, providerName, accountName
 	}
 }
 
-func (manager loginManager) loginCodex(ctx context.Context, accountName string, reservation *slotReservation, stdin io.Reader) error {
-	temporaryHome, err := os.MkdirTemp("", "hop-codex-login-*")
+func (manager loginManager) loginCodex(ctx context.Context, accountName string, stdin io.Reader) error {
+	slotPath, enrolled, err := manager.enrolledCodexSlot(accountName)
 	if err != nil {
-		return fmt.Errorf("create isolated Codex login directory: %w", err)
+		return err
 	}
-	defer func() { _ = os.RemoveAll(temporaryHome) }()
-	if err := os.Chmod(temporaryHome, 0o700); err != nil {
-		return fmt.Errorf("secure isolated Codex login directory %s: %w", temporaryHome, err)
+	if enrolled {
+		return manager.renewCodexSlot(ctx, accountName, slotPath, stdin)
 	}
-	if err := manager.runner.Run(ctx, loginCommand{
-		Name:   "codex",
-		Args:   []string{"login"},
-		Env:    map[string]string{"CODEX_HOME": temporaryHome},
-		Stdin:  stdin,
-		Stdout: manager.stdout,
-		Stderr: manager.stderr,
-	}); err != nil {
-		return fmt.Errorf("codex login did not finish; complete the browser sign-in and retry 'hop login codex %s': %w", accountName, err)
-	}
-	credentials, err := (codex.FileStore{Path: filepath.Join(temporaryHome, "auth.json")}).Read()
+	reservation, err := manager.reserveNewSlot("codex", accountName)
 	if err != nil {
-		return fmt.Errorf("codex login finished without usable isolated credentials; retry 'hop login codex %s': %w", accountName, err)
+		return err
+	}
+	defer reservation.Cleanup()
+	credentials, err := manager.signInCodex(ctx, accountName, stdin)
+	if err != nil {
+		return err
 	}
 	email, emailErr := manager.codexEmail(ctx, credentials)
 	releaseCodexCommit, err := acquireLoginLock(ctx, manager.vault.Root(), codexLoginLockFilename, "Codex enrollment commit")
@@ -200,14 +195,154 @@ func (manager loginManager) loginCodex(ctx context.Context, accountName string, 
 	if err := reservation.Commit(); err != nil {
 		return err
 	}
+	return manager.reportCodexLogin("Enrolled", accountName, email, emailErr)
+}
+
+// renewCodexSlot signs the identity an enrolled account already holds in
+// again and replaces only its credentials, so the slot keeps its custody
+// record and any reset request that is still waiting on OpenAI. The slot is
+// checked before the browser opens, so a doomed sign-in never starts, and
+// again under the slot lock, because a hop, rm, or login can land while the
+// browser is open.
+func (manager loginManager) renewCodexSlot(ctx context.Context, accountName, slotPath string, stdin io.Reader) error {
+	store := codex.FileStore{Path: filepath.Join(slotPath, vault.CredentialsFilename)}
+	recorded, err := manager.renewableCodexIdentity(accountName, store)
+	if err != nil {
+		return err
+	}
+	credentials, err := manager.signInCodex(ctx, accountName, stdin)
+	if err != nil {
+		return err
+	}
+	if err := refuseOtherCodexIdentity(accountName, recorded, credentials); err != nil {
+		return err
+	}
+	email, emailErr := manager.codexEmail(ctx, credentials)
+	releaseRefresh, err := acquireRefreshLock(ctx, slotPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return removedDuringSignIn(accountName)
+	}
+	if err != nil {
+		return fmt.Errorf("wait to renew codex account %q until its token refresh finishes: %w", accountName, err)
+	}
+	defer releaseRefresh()
+	recorded, err = manager.renewableCodexIdentity(accountName, store)
+	if err != nil {
+		return err
+	}
+	if err := refuseOtherCodexIdentity(accountName, recorded, credentials); err != nil {
+		return err
+	}
+	if err := store.Write(credentials); err != nil {
+		return fmt.Errorf("save the renewed credentials for codex account %q; the slot still holds its previous credentials, retry login: %w", accountName, err)
+	}
+	if err := takeCodexSlotCustody(slotPath, email); err != nil {
+		return fmt.Errorf("save codex account %q metadata; its credentials were renewed, retry login to record custody: %w", accountName, err)
+	}
+	return manager.reportCodexLogin("Renewed", accountName, email, emailErr)
+}
+
+// renewableCodexIdentity returns the identity an enrolled slot holds, or the
+// reason a renewal cannot go into it: the slot is gone or unreadable, or the
+// account is the live login, which the next hop copies back over its slot.
+// With no active account recorded, the switch infers the live slot by account
+// id, so the same check reads the live login here.
+func (manager loginManager) renewableCodexIdentity(accountName string, store codex.FileStore) (codex.Credentials, error) {
+	recorded, err := store.Read()
+	if errors.Is(err, os.ErrNotExist) {
+		return codex.Credentials{}, removedDuringSignIn(accountName)
+	}
+	if err != nil {
+		return codex.Credentials{}, fmt.Errorf("read the credentials codex account %q already holds before renewing them; run 'hop rm codex %s' if the slot is beyond repair, then retry: %w", accountName, accountName, err)
+	}
+	live, err := manager.isLiveCodexAccount(accountName, recorded)
+	if err != nil {
+		return codex.Credentials{}, err
+	}
+	if live {
+		return codex.Credentials{}, fmt.Errorf("[CODEX_LOGIN_ACTIVE_ACCOUNT] codex account %q is the live Codex login, and the next hop copies that login back over its slot, so a sign-in here would be lost. Run 'codex login' to renew the live login, or hop to another Codex account first and retry", accountName)
+	}
+	return recorded, nil
+}
+
+func (manager loginManager) isLiveCodexAccount(accountName string, recorded codex.Credentials) (bool, error) {
+	activeState, err := state.Load(manager.vault.Root())
+	if err != nil {
+		return false, err
+	}
+	if activeAccount, found := activeState.Active("codex"); found {
+		return activeAccount == accountName, nil
+	}
+	liveCredentials, err := manager.codexLive.Read()
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the live Codex login before renewing codex account %q, so the next hop cannot copy it back over the renewal; repair the live auth.json or run 'codex login', then retry: %w", accountName, err)
+	}
+	return liveCredentials.AccountID == recorded.AccountID, nil
+}
+
+func refuseOtherCodexIdentity(accountName string, recorded, signedIn codex.Credentials) error {
+	if signedIn.AccountID == recorded.AccountID {
+		return nil
+	}
+	return fmt.Errorf("[CODEX_LOGIN_OTHER_IDENTITY] The sign-in belongs to a different Codex identity than codex account %q holds, so nothing was saved. Enroll it under a new name with 'hop login codex <name>', or run 'hop rm codex %s' first if you mean to replace the account", accountName, accountName)
+}
+
+func removedDuringSignIn(accountName string) error {
+	return fmt.Errorf("codex account %q was removed while you signed in, so nothing was saved; retry 'hop login codex %s' to enroll it", accountName, accountName)
+}
+
+// enrolledCodexSlot reports whether accountName already holds a finished
+// enrollment, which login renews in place instead of reserving a new slot.
+// A slot still carrying a reservation marker is left to reserveNewSlot, which
+// knows how to wait for or reclaim it.
+func (manager loginManager) enrolledCodexSlot(accountName string) (string, bool, error) {
+	slotPath, err := manager.vault.SlotPath("codex", accountName)
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := os.Stat(filepath.Join(slotPath, vault.CredentialsFilename)); errors.Is(err, os.ErrNotExist) {
+		return slotPath, false, nil
+	} else if err != nil {
+		return "", false, fmt.Errorf("inspect codex account %q; check its permissions and retry: %w", accountName, err)
+	}
+	reserved, _, _ := inspectSlotReservation(slotPath)
+	return slotPath, !reserved, nil
+}
+
+func (manager loginManager) signInCodex(ctx context.Context, accountName string, stdin io.Reader) (codex.Credentials, error) {
+	temporaryHome, err := os.MkdirTemp("", "hop-codex-login-*")
+	if err != nil {
+		return codex.Credentials{}, fmt.Errorf("create isolated Codex login directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(temporaryHome) }()
+	if err := os.Chmod(temporaryHome, 0o700); err != nil {
+		return codex.Credentials{}, fmt.Errorf("secure isolated Codex login directory %s: %w", temporaryHome, err)
+	}
+	if err := manager.runner.Run(ctx, loginCommand{
+		Name:   "codex",
+		Args:   []string{"login"},
+		Env:    map[string]string{"CODEX_HOME": temporaryHome},
+		Stdin:  stdin,
+		Stdout: manager.stdout,
+		Stderr: manager.stderr,
+	}); err != nil {
+		return codex.Credentials{}, fmt.Errorf("codex login did not finish; complete the browser sign-in and retry 'hop login codex %s': %w", accountName, err)
+	}
+	credentials, err := (codex.FileStore{Path: filepath.Join(temporaryHome, "auth.json")}).Read()
+	if err != nil {
+		return codex.Credentials{}, fmt.Errorf("codex login finished without usable isolated credentials; retry 'hop login codex %s': %w", accountName, err)
+	}
+	return credentials, nil
+}
+
+func (manager loginManager) reportCodexLogin(outcome, accountName, email string, emailErr error) error {
 	if emailErr != nil {
-		_, _ = fmt.Fprintf(manager.stderr, "hop: enrolled codex account %q, but its email could not be read; the supplied account name was kept\n", accountName)
+		_, _ = fmt.Fprintf(manager.stderr, "hop: %s codex account %q, but its email could not be read; the supplied account name was kept\n", strings.ToLower(outcome), accountName)
 	}
-	if email != "" {
-		_, err = fmt.Fprintf(manager.stdout, "Enrolled codex account %q (%s).\n", accountName, email)
-	} else {
-		_, err = fmt.Fprintf(manager.stdout, "Enrolled codex account %q.\n", accountName)
-	}
+	_, err := fmt.Fprintf(manager.stdout, "%s codex account %q%s.\n", outcome, accountName, emailSuffix(email))
 	return err
 }
 
@@ -663,6 +798,18 @@ func (manager loginManager) saveClaudeCredentials(accountName string, credential
 		return err
 	}
 	return (claude.FileStore{Path: credentialsPath}).Write(credentials)
+}
+
+func takeCodexSlotCustody(slotPath, email string) error {
+	metadata, err := loadSlotMetadata(slotPath)
+	if err != nil {
+		return err
+	}
+	metadata.RefreshPolicy = managedRefreshPolicy
+	if email != "" {
+		metadata.Email = email
+	}
+	return writeSlotMetadata(slotPath, metadata)
 }
 
 func (manager loginManager) installCodexSlot(accountName, slotPath string, credentials codex.Credentials, email string) error {

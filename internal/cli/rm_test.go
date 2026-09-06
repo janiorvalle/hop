@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -160,5 +161,33 @@ func TestConcurrentActiveRemovalsDoNotResurrectState(t *testing.T) {
 	}
 	if len(loaded.ActiveAccounts) != 0 {
 		t.Fatalf("active accounts after concurrent removal = %v, want empty", loaded.ActiveAccounts)
+	}
+}
+
+func TestRemoveAccountKeepsSlotWithPendingReset(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	slotPath, err := accountVault.EnsureSlot("codex", "work")
+	if err != nil {
+		t.Fatalf("EnsureSlot() error = %v", err)
+	}
+	pendingPath := filepath.Join(slotPath, pendingResetFilename)
+	if err := writePendingReset(pendingPath, pendingReset{RedeemRequestID: "0f3c9a1e-7d2b-4c8e-9a1f-2b3c4d5e6f70", AccountID: "account"}); err != nil {
+		t.Fatalf("writePendingReset() error = %v", err)
+	}
+	remover := accountRemover{vault: accountVault, stdout: io.Discard}
+
+	err = remover.Remove("codex", "work")
+	if err == nil {
+		t.Fatal("Remove() succeeded with a pending reset record in the slot")
+	}
+	for _, want := range []string{"[RM_PENDING_RESET]", pendingPath, "id 0f3c9a1e...", "hop reset codex work", "hop ls"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Remove() error = %v, want it to mention %q", err, want)
+		}
+	}
+	if _, err := os.Stat(pendingPath); err != nil {
+		t.Fatalf("pending reset record after refusal: %v, want it kept", err)
 	}
 }

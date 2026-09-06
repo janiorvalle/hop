@@ -340,21 +340,23 @@ func TestFetchGlanceWarnsAtRefreshTokenThresholds(t *testing.T) {
 	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
 	for _, scenario := range []struct {
 		name         string
+		provider     provider.Name
 		expiresAt    time.Time
 		active       bool
 		wantSeverity string
 		wantAction   string
 	}{
-		{name: "thirty days out", expiresAt: now.Add(30 * 24 * time.Hour), wantSeverity: "normal"},
-		{name: "six days out", expiresAt: now.Add(6 * 24 * time.Hour), wantSeverity: "warning", wantAction: "Run 'hop rm claude work' and then 'hop login claude work' to renew it."},
-		{name: "one day out", expiresAt: now.Add(24 * time.Hour), wantSeverity: "critical", wantAction: "Run 'hop rm claude work' and then 'hop login claude work' to renew it."},
-		{name: "active account renews through its own CLI", expiresAt: now.Add(24 * time.Hour), active: true, wantSeverity: "critical", wantAction: "Run 'claude' and use /login to renew it."},
+		{name: "thirty days out", provider: provider.Claude, expiresAt: now.Add(30 * 24 * time.Hour), wantSeverity: "normal"},
+		{name: "six days out", provider: provider.Claude, expiresAt: now.Add(6 * 24 * time.Hour), wantSeverity: "warning", wantAction: "Run 'hop rm claude work' and then 'hop login claude work' to renew it."},
+		{name: "one day out", provider: provider.Claude, expiresAt: now.Add(24 * time.Hour), wantSeverity: "critical", wantAction: "Run 'hop rm claude work' and then 'hop login claude work' to renew it."},
+		{name: "codex slot renews in place", provider: provider.Codex, expiresAt: now.Add(24 * time.Hour), wantSeverity: "critical", wantAction: "Run 'hop login codex work' to renew it."},
+		{name: "active account renews through its own CLI", provider: provider.Claude, expiresAt: now.Add(24 * time.Hour), active: true, wantSeverity: "critical", wantAction: "Run 'claude' and use /login to renew it."},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			t.Parallel()
-			catalog := staticCatalog{{Provider: provider.Claude, Name: "work", Active: scenario.active, Source: enrolledSource{
+			catalog := staticCatalog{{Provider: scenario.provider, Name: "work", Active: scenario.active, Source: enrolledSource{
 				enrollment: provider.Enrollment{RefreshTokenExpiresAt: scenario.expiresAt},
-				fetch:      func(context.Context) (provider.Usage, error) { return provider.Usage{Provider: provider.Claude}, nil },
+				fetch:      func(context.Context) (provider.Usage, error) { return provider.Usage{Provider: scenario.provider}, nil },
 			}}}
 			document, err := fetchGlance(context.Background(), catalog, now)
 			if err != nil {

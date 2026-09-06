@@ -71,6 +71,9 @@ func (remover accountRemover) removeLocked(providerName, accountName string) err
 	if err != nil {
 		return err
 	}
+	if err := refuseRemovalWithPendingReset(providerName, accountName, slotPath); err != nil {
+		return err
+	}
 	releaseRefresh, err := acquireRefreshLock(context.Background(), slotPath)
 	if err != nil {
 		return fmt.Errorf("wait to remove %s account %q until its token refresh finishes: %w", providerName, accountName, err)
@@ -120,6 +123,19 @@ func (remover accountRemover) removeLocked(providerName, accountName string) err
 	}
 	_, err = fmt.Fprintln(remover.stdout, message)
 	return err
+}
+
+// refuseRemovalWithPendingReset keeps a slot whose reset request OpenAI has
+// not confirmed yet: a slot enrolled again would mint a new request id, and
+// that can spend a second credit once the first request lands.
+func refuseRemovalWithPendingReset(providerName, accountName, slotPath string) error {
+	pendingPath := filepath.Join(slotPath, pendingResetFilename)
+	pending, found, err := readPendingReset(pendingPath)
+	if err != nil || !found {
+		return err
+	}
+	requestID := pending.RedeemRequestID
+	return fmt.Errorf("[RM_PENDING_RESET] %s account %q holds a reset request (id %s...) that OpenAI has not confirmed, recorded at %s, so the slot was kept. Rerun 'hop reset %s %s' to finish that reset with the same request id. If 'hop ls' already shows the reset landed, delete that file by hand, then retry 'hop rm %s %s'", providerName, accountName, requestID[:min(8, len(requestID))], pendingPath, providerName, accountName, providerName, accountName)
 }
 
 // settledSlotPath resolves an enrolled slot that no login is still writing.
