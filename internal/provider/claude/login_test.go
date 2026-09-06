@@ -67,7 +67,7 @@ func TestLoginExchangesTheBrowserCodeForTokensAndIdentity(t *testing.T) {
 
 	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	browser := &fakeBrowser{t: t, answer: approve}
-	enrollment, err := New(Config{TokenURL: server.URL, Now: func() time.Time { return now }}).Login(context.Background(), Login{OpenBrowser: browser.Open})
+	enrollment, err := New(Config{TokenURL: server.URL, ProfileURL: unreachableProfileURL(t), Now: func() time.Time { return now }}).Login(context.Background(), Login{OpenBrowser: browser.Open})
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
@@ -107,6 +107,86 @@ func TestLoginExchangesTheBrowserCodeForTokensAndIdentity(t *testing.T) {
 	}
 	if enrollment.Profile != (Profile{AccountUUID: "account-uuid", Email: "person@example.com"}) {
 		t.Errorf("profile = %#v, want the account block", enrollment.Profile)
+	}
+}
+
+func unreachableProfileURL(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func TestLoginTakesThePlanFromTheProfileAndLeavesItBlankOtherwise(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		profileStatus int
+		profileBody   string
+		want          string
+	}{
+		{name: "max account", profileStatus: http.StatusOK, profileBody: `{"account":{"uuid":"account-uuid","email":"person@example.com","has_claude_max":true,"has_claude_pro":true}}`, want: "max"},
+		{name: "profile without plan flags", profileStatus: http.StatusOK, profileBody: `{"account":{"uuid":"account-uuid","email":"person@example.com"}}`, want: ""},
+		{name: "profile call fails", profileStatus: http.StatusInternalServerError, profileBody: `{"error":"boom"}`, want: ""},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			tokenServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":28800,"scope":"user:profile","account":{"uuid":"account-uuid","email_address":"person@example.com"}}`)
+			}))
+			t.Cleanup(tokenServer.Close)
+			var profileAuthorization string
+			profileServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				profileAuthorization = request.Header.Get("Authorization")
+				writer.WriteHeader(testCase.profileStatus)
+				_, _ = io.WriteString(writer, testCase.profileBody)
+			}))
+			t.Cleanup(profileServer.Close)
+
+			browser := &fakeBrowser{t: t, answer: approve}
+			enrollment, err := New(Config{TokenURL: tokenServer.URL, ProfileURL: profileServer.URL}).Login(context.Background(), Login{OpenBrowser: browser.Open})
+			if err != nil {
+				t.Fatalf("Login() error = %v, want the sign-in to succeed regardless of the profile", err)
+			}
+			if profileAuthorization != "Bearer new-access" {
+				t.Errorf("profile Authorization = %q, want the freshly exchanged access token", profileAuthorization)
+			}
+			if enrollment.Credentials.SubscriptionType != testCase.want {
+				t.Errorf("SubscriptionType = %q, want %q", enrollment.Credentials.SubscriptionType, testCase.want)
+			}
+			if enrollment.Credentials.AccessToken != "new-access" || enrollment.Profile.Email != "person@example.com" {
+				t.Errorf("enrollment = %#v, want the token response kept intact", enrollment)
+			}
+		})
+	}
+}
+
+func TestLoginStopsWhenCanceledDuringTheProfileLookup(t *testing.T) {
+	t.Parallel()
+
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":28800,"scope":"user:profile","account":{"uuid":"account-uuid","email_address":"person@example.com"}}`)
+	}))
+	t.Cleanup(tokenServer.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	profileServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		cancel()
+		<-request.Context().Done()
+	}))
+	t.Cleanup(profileServer.Close)
+
+	browser := &fakeBrowser{t: t, answer: approve}
+	enrollment, err := New(Config{TokenURL: tokenServer.URL, ProfileURL: profileServer.URL}).Login(ctx, Login{OpenBrowser: browser.Open})
+	if !errors.Is(err, ErrLogin) || !strings.Contains(err.Error(), "[CLAUDE_LOGIN_CANCELED]") {
+		t.Fatalf("Login() error = %v, want the cancellation to stop the sign-in", err)
+	}
+	if enrollment.Credentials.AccessToken != "" {
+		t.Fatalf("enrollment = %#v, want nothing handed back after a cancellation", enrollment)
 	}
 }
 
