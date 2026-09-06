@@ -226,3 +226,68 @@ func TestRefreshSkipsDisabledSlotWithoutTouchingIt(t *testing.T) {
 		t.Fatalf("output = %q", got)
 	}
 }
+
+func TestRefreshReportsSlotsThatBecameActiveSinceTheCatalogWasBuilt(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	tokenLog := &requestLog{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		tokenLog.record(request)
+		_, _ = writer.Write([]byte(`{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}`))
+	}))
+	t.Cleanup(server.Close)
+	accountVault, err := vault.New(filepath.Join(t.TempDir(), "hop-home"))
+	if err != nil {
+		t.Fatalf("vault.New() error = %v", err)
+	}
+	seedClaudeSlot(t, accountVault, "next", claude.Credentials{AccessToken: "next-access", RefreshToken: "next-refresh", ExpiresAt: now.Add(-time.Hour).UnixMilli()}, managedRefreshPolicy)
+	expiredPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1}`))
+	teamSlotPath, err := accountVault.EnsureSlot("codex", "team")
+	if err != nil {
+		t.Fatalf("EnsureSlot(codex, team) error = %v", err)
+	}
+	if err := (codex.FileStore{Path: slotCredentialsPath(t, accountVault, "codex", "team")}).Write(codex.Credentials{AccessToken: "header." + expiredPayload + ".signature", RefreshToken: "team-refresh", AccountID: "team"}); err != nil {
+		t.Fatalf("Write(team) error = %v", err)
+	}
+	if err := writeSlotMetadata(teamSlotPath, slotMetadata{RefreshPolicy: managedRefreshPolicy}); err != nil {
+		t.Fatalf("writeSlotMetadata(team) error = %v", err)
+	}
+	accountCatalog := vaultCatalog{
+		vault:         accountVault,
+		state:         state.New(),
+		claudeAdapter: claude.New(claude.Config{TokenURL: server.URL, Now: clock}),
+		codexAdapter:  codex.New(codex.Config{TokenURL: server.URL, Now: clock}),
+		now:           clock,
+	}
+	nextBefore := readSlotFile(t, accountVault, "claude", "next")
+	teamBefore := readSlotFile(t, accountVault, "codex", "team")
+	switchedState := state.New()
+	switchedState.SetActive("claude", "next")
+	switchedState.SetActive("codex", "team")
+	if err := switchedState.Save(accountVault.Root()); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	var stdout bytes.Buffer
+	err = refreshAccountsFrom(context.Background(), &stdout, accountCatalog)
+	t.Logf("hop refresh output:\n%s", stdout.String())
+	if err != nil {
+		t.Fatalf("refreshAccountsFrom() error = %v", err)
+	}
+	want := "claude next: skipped: became active, hop never rotates the live login\n" +
+		"codex team: skipped: became active, hop never rotates the live login\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+	if got := tokenLog.entries(); len(got) != 0 {
+		t.Fatalf("token server requests = %q, want none for slots that became active", got)
+	}
+	if nextAfter := readSlotFile(t, accountVault, "claude", "next"); !bytes.Equal(nextBefore, nextAfter) {
+		t.Fatalf("claude next changed on disk after it became the live login:\n%s", nextAfter)
+	}
+	if teamAfter := readSlotFile(t, accountVault, "codex", "team"); !bytes.Equal(teamBefore, teamAfter) {
+		t.Fatalf("codex team changed on disk after it became the live login:\n%s", teamAfter)
+	}
+}

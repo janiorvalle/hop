@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -171,7 +172,7 @@ func TestClaudeSlotFetcherRefreshesOnlyManagedSlots(t *testing.T) {
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: refreshAllowed, now: time.Now}
+			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: refreshAllowed, becameActive: neverActive, now: time.Now}
 			if err := fetcher.Prepare(context.Background()); err != nil {
 				t.Fatalf("Prepare() error = %v", err)
 			}
@@ -211,7 +212,7 @@ func TestCodexSlotFetcherRefreshesExpiredManagedJWT(t *testing.T) {
 		t.Fatalf("Write() error = %v", err)
 	}
 	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits", TokenURL: server.URL + "/token"})
-	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
+	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -239,7 +240,7 @@ func TestClaudeSlotFetcherRetriesSavingRotatedRecoveryCredentials(t *testing.T) 
 	t.Cleanup(server.Close)
 	store := &failFirstClaudeWriteStore{credentials: claude.Credentials{AccessToken: "old", RefreshToken: "refresh", ExpiresAt: 1}}
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
+	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
@@ -278,7 +279,7 @@ func TestClaudeFileRefreshJournalsRotationWhenPrimaryInstallFails(t *testing.T) 
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
+	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
@@ -318,7 +319,7 @@ func TestConcurrentClaudeGlancesSerializeOneManagedSlotRefresh(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
+	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for range 2 {
@@ -365,7 +366,7 @@ func TestManagedRefreshPersistsRotationAfterGlanceDeadline(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
+	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	ctx, cancel := context.WithCancel(context.Background())
 	type glanceResponse struct {
 		document glanceDocument
@@ -414,7 +415,7 @@ func TestManagedRefreshLockWaitHonorsGlanceDeadline(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL, TokenURL: server.URL})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
+	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
@@ -447,7 +448,7 @@ func TestCodexSlotFetcherRetriesSavingRotatedRecoveryCredentials(t *testing.T) {
 	expiredPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1}`))
 	store := &failFirstCodexWriteStore{credentials: codex.Credentials{AccessToken: "header." + expiredPayload + ".signature", RefreshToken: "refresh", AccountID: "account"}}
 	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits", TokenURL: server.URL + "/token"})
-	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: time.Now}
+	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
@@ -545,7 +546,7 @@ func TestClaudeSlotFetcherRotatesBeforeRefreshTokenExpires(t *testing.T) {
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := claude.New(claude.Config{TokenURL: server.URL, Now: clock})
-			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: scenario.refreshAllowed, now: clock}
+			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: scenario.refreshAllowed, becameActive: neverActive, now: clock}
 			if err := fetcher.Prepare(context.Background()); err != nil {
 				t.Fatalf("Prepare() error = %v", err)
 			}
@@ -600,7 +601,7 @@ func TestClaudeSlotFetcherKeepsUsableAccessTokenWhenEarlyRotationFails(t *testin
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token", Now: clock})
-			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: clock}
+			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
 			err := fetcher.Prepare(context.Background())
 			if (err != nil) != scenario.wantPrepareErr {
 				t.Fatalf("Prepare() error = %v, want error %t", err, scenario.wantPrepareErr)
@@ -635,7 +636,7 @@ func TestClaudeSlotFetcherSurfacesRotatedTokensItCouldNotSave(t *testing.T) {
 		RefreshTokenExpiresAt: now.Add(6 * 24 * time.Hour).UnixMilli(),
 	}}
 	adapter := claude.New(claude.Config{TokenURL: server.URL, Now: clock})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: clock}
+	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
 
 	err := fetcher.Prepare(context.Background())
 	if !errors.Is(err, errRotatedTokensLost) {
@@ -671,7 +672,7 @@ func TestCodexSlotFetcherRotatesWhenLastRefreshAgesOut(t *testing.T) {
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := codex.New(codex.Config{TokenURL: server.URL, Now: clock})
-			fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, now: clock}
+			fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
 			if err := fetcher.Prepare(context.Background()); err != nil {
 				t.Fatalf("Prepare() error = %v", err)
 			}
@@ -692,3 +693,172 @@ func TestCodexSlotFetcherRotatesWhenLastRefreshAgesOut(t *testing.T) {
 		})
 	}
 }
+
+func TestRotationSkipsSlotThatBecameActiveWhileWaitingForItsRefreshLock(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	var refreshCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		refreshCalls.Add(1)
+		_, _ = writer.Write([]byte(`{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}`))
+	}))
+	t.Cleanup(server.Close)
+	accountVault, err := vault.New(filepath.Join(t.TempDir(), "hop-home"))
+	if err != nil {
+		t.Fatalf("vault.New() error = %v", err)
+	}
+	writeClaudeSlot(t, accountVault, "old", claudeCredentials("old"))
+	writeClaudeSlot(t, accountVault, "next", claude.Credentials{AccessToken: "next-access", RefreshToken: "next-refresh", ExpiresAt: now.Add(-time.Hour).UnixMilli()})
+	recorded := state.New()
+	recorded.SetActive("claude", "old")
+	if err := recorded.Save(accountVault.Root()); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	accountCatalog := vaultCatalog{
+		vault:         accountVault,
+		state:         recorded,
+		claudeAdapter: claude.New(claude.Config{TokenURL: server.URL, Now: clock}),
+		codexAdapter:  codex.New(codex.Config{}),
+		now:           clock,
+	}
+	rotator, ok := findAccount(t, accountCatalog, "claude", "next").Fetcher.(slotRotator)
+	if !ok {
+		t.Fatal("idle managed slot is not rotatable")
+	}
+
+	claudeLive := &gatedClaudeKeychain{installing: make(chan struct{}), proceed: make(chan struct{})}
+	claudeLive.credentials = claudeCredentials("old")
+	manager := switchManager{
+		vault:       accountVault,
+		state:       fileActiveStateStore{root: accountVault.Root()},
+		claudeLive:  claudeLive,
+		codexLive:   &fakeCodexLiveStore{},
+		claudeEmail: func(context.Context) (string, error) { return "owner@example.test", nil },
+		claudeProfile: func(context.Context, claude.Credentials) (claude.Profile, error) {
+			return claude.Profile{}, errors.New("profile unavailable")
+		},
+		stdout: &bytes.Buffer{},
+	}
+	switched := make(chan error, 1)
+	go func() { switched <- manager.Switch(context.Background(), "claude", "next") }()
+	<-claudeLive.installing
+
+	rotated := make(chan rotationResult, 1)
+	go func() {
+		outcome, err := rotator.Rotate(context.Background())
+		rotated <- rotationResult{outcome: outcome, err: err}
+	}()
+	select {
+	case result := <-rotated:
+		t.Fatalf("Rotate() = %+v, %v before the switch released the refresh lock", result.outcome, result.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(claudeLive.proceed)
+	if err := <-switched; err != nil {
+		t.Fatalf("Switch() error = %v", err)
+	}
+	result := <-rotated
+	t.Logf("Rotate() after the switch = %+v, %v", result.outcome, result.err)
+	if result.err != nil || result.outcome.Outcome != rotationBecameActive {
+		t.Fatalf("Rotate() = %+v, %v; want the became-active outcome", result.outcome, result.err)
+	}
+	if got := refreshCalls.Load(); got != 0 {
+		t.Errorf("token server rotated the slot %d times after it became the live login", got)
+	}
+	slot, err := (claude.FileStore{Path: slotCredentialsPath(t, accountVault, "claude", "next")}).Read()
+	if err != nil {
+		t.Fatalf("Read(next) error = %v", err)
+	}
+	if slot.RefreshToken != claudeLive.credentials.RefreshToken {
+		t.Fatalf("slot next holds refresh token %q but the live login holds %q, which the rotation invalidated", slot.RefreshToken, claudeLive.credentials.RefreshToken)
+	}
+}
+
+func TestGlanceSilentlySkipsRotatingSlotThatBecameActive(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	var refreshCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/token":
+			refreshCalls.Add(1)
+			_, _ = writer.Write([]byte(`{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}`))
+		case "/usage":
+			_, _ = writer.Write([]byte(`{"five_hour":{"utilization":25,"resets_at":"2026-08-08T08:00:00Z"}}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	accountVault, err := vault.New(filepath.Join(t.TempDir(), "hop-home"))
+	if err != nil {
+		t.Fatalf("vault.New() error = %v", err)
+	}
+	seedClaudeSlot(t, accountVault, "next", claude.Credentials{AccessToken: "next-access", RefreshToken: "next-refresh", ExpiresAt: now.Add(-time.Hour).UnixMilli()}, managedRefreshPolicy)
+	accountCatalog := vaultCatalog{
+		vault:         accountVault,
+		state:         state.New(),
+		claudeAdapter: claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token", Now: clock}),
+		codexAdapter:  codex.New(codex.Config{}),
+		now:           clock,
+	}
+	before := readSlotFile(t, accountVault, "claude", "next")
+	switchedState := state.New()
+	switchedState.SetActive("claude", "next")
+	if err := switchedState.Save(accountVault.Root()); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	document, err := fetchGlance(context.Background(), accountCatalog, now)
+	if err != nil {
+		t.Fatalf("fetchGlance() error = %v", err)
+	}
+	if len(document.Accounts) != 1 || document.Accounts[0].Error != nil {
+		t.Fatalf("glance rows = %+v, want one row for next without an error", document.Accounts)
+	}
+	if got := refreshCalls.Load(); got != 0 {
+		t.Errorf("token server rotated the slot %d times after it became the live login", got)
+	}
+	if after := readSlotFile(t, accountVault, "claude", "next"); !bytes.Equal(before, after) {
+		t.Fatalf("slot next changed on disk after it became the live login:\n%s", after)
+	}
+}
+
+type rotationResult struct {
+	outcome rotation
+	err     error
+}
+
+type gatedClaudeKeychain struct {
+	fakeClaudeKeychain
+	installing chan struct{}
+	proceed    chan struct{}
+	once       sync.Once
+}
+
+func (store *gatedClaudeKeychain) Write(ctx context.Context, credentials claude.Credentials) error {
+	store.once.Do(func() { close(store.installing) })
+	<-store.proceed
+	return store.fakeClaudeKeychain.Write(ctx, credentials)
+}
+
+func findAccount(t *testing.T, accountCatalog catalog, providerName provider.Name, name string) account {
+	t.Helper()
+	accounts, err := accountCatalog.Accounts()
+	if err != nil {
+		t.Fatalf("Accounts() error = %v", err)
+	}
+	for _, current := range accounts {
+		if current.Provider == providerName && current.Name == name {
+			return current
+		}
+	}
+	t.Fatalf("account %s %s is not in the catalog", providerName, name)
+	return account{}
+}
+
+func neverActive() (bool, error) { return false, nil }

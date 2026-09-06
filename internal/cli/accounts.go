@@ -35,6 +35,10 @@ const (
 // persist: the token on disk is already revoked, so the row must say so now.
 var errRotatedTokensLost = errors.New("rotated tokens were not preserved")
 
+// errSlotBecameActive stops a rotation whose slot a switch made the live login
+// while the rotation waited for the refresh lock; hop never rotates the live login.
+var errSlotBecameActive = errors.New("slot became the active account while waiting for its refresh lock")
+
 type tokenLifetimes interface {
 	NeedsRefresh(now time.Time, skew time.Duration) bool
 	RefreshTokenExpiry() time.Time
@@ -43,9 +47,10 @@ type tokenLifetimes interface {
 type rotationOutcome string
 
 const (
-	rotationUnmanaged rotationOutcome = "unmanaged"
-	rotationFresh     rotationOutcome = "fresh"
-	rotationRotated   rotationOutcome = "rotated"
+	rotationUnmanaged    rotationOutcome = "unmanaged"
+	rotationFresh        rotationOutcome = "fresh"
+	rotationRotated      rotationOutcome = "rotated"
+	rotationBecameActive rotationOutcome = "became-active"
 )
 
 // rotation is what one idle slot reports after the refresh decision the glance
@@ -88,6 +93,7 @@ type claudeSlotFetcher struct {
 	adapter        claude.Adapter
 	store          claude.Store
 	refreshAllowed bool
+	becameActive   func() (bool, error)
 	now            func() time.Time
 }
 
@@ -95,6 +101,7 @@ type codexSlotFetcher struct {
 	adapter        codex.Adapter
 	store          codex.Store
 	refreshAllowed bool
+	becameActive   func() (bool, error)
 	now            func() time.Time
 }
 
@@ -189,7 +196,7 @@ func (catalog vaultCatalog) account(providerName provider.Name, name string) acc
 	return account{
 		Provider: providerName,
 		Name:     name,
-		Fetcher:  catalog.slotFetcher(providerName, credentialsPath, metadata.RefreshPolicy == managedRefreshPolicy),
+		Fetcher:  catalog.slotFetcher(providerName, name, credentialsPath, metadata.RefreshPolicy == managedRefreshPolicy),
 	}
 }
 
@@ -200,12 +207,13 @@ func (catalog vaultCatalog) liveFetcher(providerName provider.Name) provider.Fet
 	return codexLiveFetcher{adapter: catalog.codexAdapter, store: catalog.codexLive}
 }
 
-func (catalog vaultCatalog) slotFetcher(providerName provider.Name, credentialsPath string, refreshAllowed bool) provider.Fetcher {
+func (catalog vaultCatalog) slotFetcher(providerName provider.Name, name, credentialsPath string, refreshAllowed bool) provider.Fetcher {
 	if providerName == provider.Claude {
 		return claudeSlotFetcher{
 			adapter:        catalog.claudeAdapter,
 			store:          claude.FileStore{Path: credentialsPath},
 			refreshAllowed: refreshAllowed,
+			becameActive:   catalog.becameActive(providerName, name),
 			now:            catalog.now,
 		}
 	}
@@ -213,7 +221,21 @@ func (catalog vaultCatalog) slotFetcher(providerName provider.Name, credentialsP
 		adapter:        catalog.codexAdapter,
 		store:          codex.FileStore{Path: credentialsPath},
 		refreshAllowed: refreshAllowed,
+		becameActive:   catalog.becameActive(providerName, name),
 		now:            catalog.now,
+	}
+}
+
+// becameActive re-reads state.json instead of trusting the catalog's copy: a
+// switch may have committed between building the catalog and taking the lock.
+func (catalog vaultCatalog) becameActive(providerName provider.Name, name string) func() (bool, error) {
+	return func() (bool, error) {
+		current, err := state.Load(catalog.vault.Root())
+		if err != nil {
+			return false, err
+		}
+		activeName, found := current.Active(string(providerName))
+		return found && activeName == name, nil
 	}
 }
 
@@ -312,7 +334,10 @@ func (fetcher claudeSlotFetcher) Prepare(ctx context.Context) error {
 	if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
 		return err
 	}
-	_, err = refreshClaudeSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
+	_, err = fetcher.refresh(ctx)
+	if errors.Is(err, errSlotBecameActive) {
+		return nil
+	}
 	return rotationErrorFor(credentials, fetcher.now(), err)
 }
 
@@ -324,7 +349,10 @@ func (fetcher codexSlotFetcher) Prepare(ctx context.Context) error {
 	if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
 		return err
 	}
-	_, err = refreshCodexSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
+	_, err = fetcher.refresh(ctx)
+	if errors.Is(err, errSlotBecameActive) {
+		return nil
+	}
 	return rotationErrorFor(credentials, fetcher.now(), err)
 }
 
@@ -339,7 +367,10 @@ func (fetcher claudeSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
 	if !slotNeedsRotation(credentials, fetcher.now()) {
 		return rotation{Outcome: rotationFresh, RefreshTokenExpiry: credentials.RefreshTokenExpiry()}, nil
 	}
-	rotated, err := refreshClaudeSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
+	rotated, err := fetcher.refresh(ctx)
+	if errors.Is(err, errSlotBecameActive) {
+		return rotation{Outcome: rotationBecameActive}, nil
+	}
 	if err != nil {
 		return rotation{}, err
 	}
@@ -357,7 +388,10 @@ func (fetcher codexSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
 	if !slotNeedsRotation(credentials, fetcher.now()) {
 		return rotation{Outcome: rotationFresh, RefreshTokenExpiry: credentials.RefreshTokenExpiry()}, nil
 	}
-	rotated, err := refreshCodexSlot(ctx, fetcher.adapter, fetcher.store, fetcher.now())
+	rotated, err := fetcher.refresh(ctx)
+	if errors.Is(err, errSlotBecameActive) {
+		return rotation{Outcome: rotationBecameActive}, nil
+	}
 	if err != nil {
 		return rotation{}, err
 	}
@@ -397,53 +431,70 @@ func refreshTokenSeverity(expiry, now time.Time) string {
 	}
 }
 
-func refreshClaudeSlot(ctx context.Context, adapter claude.Adapter, store claude.Store, now time.Time) (claude.Credentials, error) {
-	if fileStore, ok := store.(claude.FileStore); ok {
+func (fetcher claudeSlotFetcher) refresh(ctx context.Context) (claude.Credentials, error) {
+	if fileStore, ok := fetcher.store.(claude.FileStore); ok {
 		release, err := acquireRefreshLock(ctx, filepath.Dir(fileStore.Path))
 		if err != nil {
 			return claude.Credentials{}, err
 		}
 		defer release()
+		if err := refuseIfSlotBecameActive(fetcher.becameActive); err != nil {
+			return claude.Credentials{}, err
+		}
 		credentials, err := fileStore.Read()
-		if err != nil || !slotNeedsRotation(credentials, now) {
+		if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
 			return credentials, err
 		}
 		if err := ctx.Err(); err != nil {
 			return claude.Credentials{}, fmt.Errorf("start Claude token refresh before the glance deadline; retry the command: %w", err)
 		}
-		return refreshClaudeFileSlot(ctx, adapter, fileStore)
+		return refreshClaudeFileSlot(ctx, fetcher.adapter, fileStore)
 	}
-	credentials, err := adapter.Refresh(ctx, store)
+	credentials, err := fetcher.adapter.Refresh(ctx, fetcher.store)
 	if err == nil || credentials.AccessToken == "" {
 		return credentials, err
 	}
-	if recoveryErr := store.Write(credentials); recoveryErr != nil {
+	if recoveryErr := fetcher.store.Write(credentials); recoveryErr != nil {
 		return claude.Credentials{}, fmt.Errorf("save rotated Claude tokens after two write attempts; run 'hop login claude <account>' before retrying because the slot could not retain the recovery copy: %v: %w: %w", recoveryErr, err, errRotatedTokensLost)
 	}
 	return credentials, nil
 }
 
-func refreshCodexSlot(ctx context.Context, adapter codex.Adapter, store codex.Store, now time.Time) (codex.Credentials, error) {
-	if fileStore, ok := store.(codex.FileStore); ok {
+func refuseIfSlotBecameActive(becameActive func() (bool, error)) error {
+	active, err := becameActive()
+	if err != nil {
+		return err
+	}
+	if active {
+		return errSlotBecameActive
+	}
+	return nil
+}
+
+func (fetcher codexSlotFetcher) refresh(ctx context.Context) (codex.Credentials, error) {
+	if fileStore, ok := fetcher.store.(codex.FileStore); ok {
 		release, err := acquireRefreshLock(ctx, filepath.Dir(fileStore.Path))
 		if err != nil {
 			return codex.Credentials{}, err
 		}
 		defer release()
+		if err := refuseIfSlotBecameActive(fetcher.becameActive); err != nil {
+			return codex.Credentials{}, err
+		}
 		credentials, err := fileStore.Read()
-		if err != nil || !slotNeedsRotation(credentials, now) {
+		if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
 			return credentials, err
 		}
 		if err := ctx.Err(); err != nil {
 			return codex.Credentials{}, fmt.Errorf("start Codex token refresh before the glance deadline; retry the command: %w", err)
 		}
-		return refreshCodexFileSlot(ctx, adapter, fileStore)
+		return refreshCodexFileSlot(ctx, fetcher.adapter, fileStore)
 	}
-	credentials, err := adapter.Refresh(ctx, store)
+	credentials, err := fetcher.adapter.Refresh(ctx, fetcher.store)
 	if err == nil || credentials.AccessToken == "" {
 		return credentials, err
 	}
-	if recoveryErr := store.Write(credentials); recoveryErr != nil {
+	if recoveryErr := fetcher.store.Write(credentials); recoveryErr != nil {
 		return codex.Credentials{}, fmt.Errorf("save rotated Codex tokens after two write attempts; run 'hop login codex <account>' before retrying because the slot could not retain the recovery copy: %v: %w: %w", recoveryErr, err, errRotatedTokensLost)
 	}
 	return credentials, nil
