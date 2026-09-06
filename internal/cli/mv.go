@@ -94,15 +94,6 @@ func (renamer accountRenamer) renameLocked(providerName, currentName, newName st
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect the enrollment state for %s account %q; check its permissions and retry: %w", providerName, currentName, err)
 	}
-	if providerName == "claude" {
-		transaction, found, err := readClaudeStagingRecord(renamer.vault.Root())
-		if err != nil {
-			return err
-		}
-		if found && transaction.ActiveAccount == currentName {
-			return fmt.Errorf("claude account %q is needed to restore an enrollment in progress; wait for process %d, or rerun 'hop login claude %s' to recover it before renaming", currentName, transaction.ProcessID, currentName)
-		}
-	}
 	releaseRefresh, err := acquireRefreshLock(context.Background(), currentSlot)
 	if err != nil {
 		return fmt.Errorf("wait to rename %s account %q until its token refresh finishes: %w", providerName, currentName, err)

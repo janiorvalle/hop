@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -160,30 +159,6 @@ func TestRenameAccountRefusesSlotBeingEnrolled(t *testing.T) {
 	err = renamer.Rename("codex", "work", "play")
 	if err == nil || !strings.Contains(err.Error(), "being enrolled") {
 		t.Fatalf("Rename() error = %v, want enrollment-in-progress guidance", err)
-	}
-}
-
-func TestRenameAccountPreservesClaudeStagingRecoverySlot(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	record, err := json.Marshal(claudeStagingRecord{ActiveAccount: "work", ProcessID: os.Getpid(), CreatedAt: time.Now().UTC()})
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(accountVault.Root(), claudeStagingFilename), record, 0o600); err != nil {
-		t.Fatalf("WriteFile(transaction) error = %v", err)
-	}
-	renamer := accountRenamer{vault: accountVault, stdout: io.Discard}
-
-	err = renamer.Rename("claude", "work", "play")
-	if err == nil || !strings.Contains(err.Error(), "needed to restore") {
-		t.Fatalf("Rename() error = %v, want staging recovery guard", err)
-	}
-	workPath, _ := accountVault.SlotPath("claude", "work")
-	if _, err := os.Stat(workPath); err != nil {
-		t.Fatalf("recovery slot was renamed away: %v", err)
 	}
 }
 

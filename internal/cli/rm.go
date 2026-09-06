@@ -71,15 +71,6 @@ func (remover accountRemover) removeLocked(providerName, accountName string) err
 	if err != nil {
 		return err
 	}
-	if providerName == "claude" {
-		transaction, found, err := readClaudeStagingRecord(remover.vault.Root())
-		if err != nil {
-			return err
-		}
-		if found && transaction.ActiveAccount == accountName {
-			return fmt.Errorf("claude account %q is needed to restore an enrollment in progress; wait for process %d, or rerun 'hop login claude %s' to recover it before removal", accountName, transaction.ProcessID, accountName)
-		}
-	}
 	releaseRefresh, err := acquireRefreshLock(context.Background(), slotPath)
 	if err != nil {
 		return fmt.Errorf("wait to remove %s account %q until its token refresh finishes: %w", providerName, accountName, err)
