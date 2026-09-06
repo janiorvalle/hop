@@ -28,6 +28,7 @@ func writeTable(writer io.Writer, document glanceDocument, options render.Option
 			Provider: account.Provider,
 			Account:  account.Account,
 			Active:   account.Active,
+			Disabled: account.Disabled,
 			Plan:     account.Plan,
 			Windows:  account.Windows,
 			Limits:   account.Limits,

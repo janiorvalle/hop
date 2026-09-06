@@ -24,6 +24,8 @@ func TestHelpShowsPlannedCommandSurface(t *testing.T) {
 		"hop <provider> <account>",
 		"hop login <provider> <account>",
 		"hop ls [--json]",
+		"hop disable <provider> <account>",
+		"hop enable <provider> <account>",
 		"hop rm <provider> <account>",
 		"hop mv <provider> <old> <new>",
 		"hop upgrade",

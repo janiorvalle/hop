@@ -329,6 +329,9 @@ func (manager switchManager) providersFor(providerName, accountName string) ([]s
 		if !exists {
 			return nil, fmt.Errorf("did you mean 'hop login %s %s'? %s account %q is not enrolled; enroll it, then retry", providerName, accountName, providerName, accountName)
 		}
+		if err := manager.refuseDisabledSlot(providerName, accountName); err != nil {
+			return nil, err
+		}
 		return []string{providerName}, nil
 	}
 
@@ -338,14 +341,33 @@ func (manager switchManager) providersFor(providerName, accountName string) ([]s
 		if err != nil {
 			return nil, err
 		}
-		if exists {
-			providers = append(providers, candidate)
+		if !exists {
+			continue
 		}
+		if err := manager.refuseDisabledSlot(candidate, accountName); err != nil {
+			return nil, err
+		}
+		providers = append(providers, candidate)
 	}
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("did you mean 'hop login claude %s' or 'hop login codex %s'? Account %q is not enrolled for either provider; enroll it, then retry", accountName, accountName, accountName)
 	}
 	return providers, nil
+}
+
+func (manager switchManager) refuseDisabledSlot(providerName, accountName string) error {
+	slotPath, err := manager.vault.SlotPath(providerName, accountName)
+	if err != nil {
+		return err
+	}
+	metadata, err := loadSlotMetadata(slotPath)
+	if err != nil {
+		return err
+	}
+	if metadata.Disabled {
+		return fmt.Errorf("[ACCOUNT_DISABLED] %s account %q is disabled; run 'hop enable %s %s', then retry", providerName, accountName, providerName, accountName)
+	}
+	return nil
 }
 
 func (manager switchManager) slotExists(providerName, accountName string) (bool, error) {

@@ -18,10 +18,15 @@ type accountRemover struct {
 }
 
 func removeAccount(providerName, accountName string, stdout io.Writer) error {
-	accountVault, err := defaultVault()
-	if err != nil {
-		return err
-	}
+	return withRecoveredVault(stdout, func(accountVault vault.Vault) error {
+		return (accountRemover{vault: accountVault, stdout: stdout}).removeLocked(providerName, accountName)
+	})
+}
+
+// withRecoveredVault runs operate while every provider, state, and switch
+// recovery lock is held, so a slot change never interleaves with a login or
+// an interrupted switch.
+func withRecoveredVault(stdout io.Writer, operate func(vault.Vault) error) error {
 	manager, err := defaultSwitchManager(stdout)
 	if err != nil {
 		return err
@@ -31,7 +36,7 @@ func removeAccount(providerName, accountName string, stdout io.Writer) error {
 		return err
 	}
 	defer releaseProviders()
-	releaseState, err := acquireStateLock(context.Background(), accountVault.Root())
+	releaseState, err := acquireStateLock(context.Background(), manager.vault.Root())
 	if err != nil {
 		return err
 	}
@@ -43,7 +48,7 @@ func removeAccount(providerName, accountName string, stdout io.Writer) error {
 	if recovered {
 		_, _ = fmt.Fprintln(stdout, "Recovered an interrupted account switch before continuing.")
 	}
-	return (accountRemover{vault: accountVault, stdout: stdout}).removeLocked(providerName, accountName)
+	return operate(manager.vault)
 }
 
 func (remover accountRemover) Remove(providerName, accountName string) error {
@@ -62,25 +67,9 @@ func (remover accountRemover) Remove(providerName, accountName string) error {
 }
 
 func (remover accountRemover) removeLocked(providerName, accountName string) error {
-	slotPath, err := remover.vault.SlotPath(providerName, accountName)
+	slotPath, err := settledSlotPath(remover.vault, providerName, accountName)
 	if err != nil {
 		return err
-	}
-	if _, err := os.Stat(slotPath); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%s account %q does not exist; run 'hop ls' to see enrolled accounts", providerName, accountName)
-	} else if err != nil {
-		return fmt.Errorf("inspect %s account %q before removal; check its permissions and retry: %w", providerName, accountName, err)
-	}
-	if _, err := os.Stat(filepath.Join(slotPath, slotReservationFilename)); err == nil {
-		_, active, inspectErr := inspectSlotReservation(slotPath)
-		if inspectErr != nil {
-			return fmt.Errorf("inspect the enrollment owner for %s account %q; fix or remove %s and retry: %w", providerName, accountName, filepath.Join(slotPath, slotReservationFilename), inspectErr)
-		}
-		if active {
-			return fmt.Errorf("%s account %q is being enrolled; wait for login to finish, then retry removal", providerName, accountName)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect the enrollment state for %s account %q; check its permissions and retry: %w", providerName, accountName, err)
 	}
 	if providerName == "claude" {
 		transaction, found, err := readClaudeStagingRecord(remover.vault.Root())
@@ -140,6 +129,31 @@ func (remover accountRemover) removeLocked(providerName, accountName string) err
 	}
 	_, err = fmt.Fprintln(remover.stdout, message)
 	return err
+}
+
+// settledSlotPath resolves an enrolled slot that no login is still writing.
+func settledSlotPath(accountVault vault.Vault, providerName, accountName string) (string, error) {
+	slotPath, err := accountVault.SlotPath(providerName, accountName)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(slotPath); errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("%s account %q does not exist; run 'hop ls' to see enrolled accounts", providerName, accountName)
+	} else if err != nil {
+		return "", fmt.Errorf("inspect %s account %q; check its permissions and retry: %w", providerName, accountName, err)
+	}
+	if _, err := os.Stat(filepath.Join(slotPath, slotReservationFilename)); err == nil {
+		_, active, inspectErr := inspectSlotReservation(slotPath)
+		if inspectErr != nil {
+			return "", fmt.Errorf("inspect the enrollment owner for %s account %q; fix or remove %s and retry: %w", providerName, accountName, filepath.Join(slotPath, slotReservationFilename), inspectErr)
+		}
+		if active {
+			return "", fmt.Errorf("%s account %q is being enrolled; wait for login to finish, then retry", providerName, accountName)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect the enrollment state for %s account %q; check its permissions and retry: %w", providerName, accountName, err)
+	}
+	return slotPath, nil
 }
 
 func renameSlotForRemoval(slotPath string) (string, error) {

@@ -30,15 +30,17 @@ const (
 )
 
 type slotMetadata struct {
-	RefreshPolicy string `json:"refresh_policy"`
+	RefreshPolicy string `json:"refresh_policy,omitempty"`
 	Email         string `json:"email,omitempty"`
 	AccountUUID   string `json:"account_uuid,omitempty"`
+	Disabled      bool   `json:"disabled,omitempty"`
 }
 
 type account struct {
 	Provider provider.Name
 	Name     string
 	Active   bool
+	Disabled bool
 	Fetcher  provider.Fetcher
 }
 
@@ -142,24 +144,26 @@ func (catalog vaultCatalog) Accounts() ([]account, error) {
 func (catalog vaultCatalog) account(providerName provider.Name, name string) account {
 	activeName, isActive := catalog.state.Active(string(providerName))
 	isActive = isActive && activeName == name
+	credentialsPath, err := catalog.vault.CredentialsPath(string(providerName), name)
+	if err != nil {
+		return account{Provider: providerName, Name: name, Active: isActive, Fetcher: failingFetcher{err: err}}
+	}
+	metadata, err := loadSlotMetadata(filepath.Dir(credentialsPath))
+	if err != nil {
+		return account{Provider: providerName, Name: name, Active: isActive, Fetcher: failingFetcher{err: err}}
+	}
+	if metadata.Disabled {
+		return account{Provider: providerName, Name: name, Active: isActive, Disabled: true}
+	}
 	if isActive {
 		// Live credentials belong to the provider CLI. A glance may read them,
 		// but only that CLI may rotate and persist its live refresh token.
 		return account{Provider: providerName, Name: name, Active: true, Fetcher: catalog.liveFetcher(providerName)}
 	}
-
-	credentialsPath, err := catalog.vault.CredentialsPath(string(providerName), name)
-	if err != nil {
-		return account{Provider: providerName, Name: name, Fetcher: failingFetcher{err: err}}
-	}
-	refreshAllowed, err := slotAllowsRefresh(filepath.Dir(credentialsPath))
-	if err != nil {
-		return account{Provider: providerName, Name: name, Fetcher: failingFetcher{err: err}}
-	}
 	return account{
 		Provider: providerName,
 		Name:     name,
-		Fetcher:  catalog.slotFetcher(providerName, credentialsPath, refreshAllowed),
+		Fetcher:  catalog.slotFetcher(providerName, credentialsPath, metadata.RefreshPolicy == managedRefreshPolicy),
 	}
 }
 
@@ -187,33 +191,36 @@ func (catalog vaultCatalog) slotFetcher(providerName provider.Name, credentialsP
 	}
 }
 
-func slotAllowsRefresh(slotPath string) (bool, error) {
+func loadSlotMetadata(slotPath string) (slotMetadata, error) {
 	metadataPath := filepath.Join(slotPath, slotMetadataFilename)
 	contents, err := os.ReadFile(metadataPath)
 	if errors.Is(err, os.ErrNotExist) {
 		// Manually seeded slots are read-only. The login flow opts a slot into
 		// rotation only after hop has taken custody of its refresh token.
-		return false, nil
+		return slotMetadata{}, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read slot metadata from %s; fix its permissions or run 'hop login' again: %w", metadataPath, err)
+		return slotMetadata{}, fmt.Errorf("read slot metadata from %s; fix its permissions or run 'hop login' again: %w", metadataPath, err)
 	}
 	var metadata slotMetadata
 	if err := json.Unmarshal(contents, &metadata); err != nil {
-		return false, fmt.Errorf("read slot metadata from %s; expected {\"refresh_policy\":\"managed\"}, fix the file or run 'hop login' again: %w", metadataPath, err)
+		return slotMetadata{}, fmt.Errorf("read slot metadata from %s; expected {\"refresh_policy\":\"managed\"}, fix the file or run 'hop login' again: %w", metadataPath, err)
 	}
-	if metadata.RefreshPolicy != managedRefreshPolicy {
-		return false, nil
-	}
-	return true, nil
+	return metadata, nil
 }
 
+// writeManagedSlotMetadata carries a parked slot's disabled flag through a
+// login rewrite, so only 'hop enable' brings an account back. A slot.json that
+// cannot be read is replaced, because login is its repair path.
 func writeManagedSlotMetadata(slotPath string, identity claude.Profile) error {
-	return writeSlotMetadata(slotPath, slotMetadata{
-		RefreshPolicy: managedRefreshPolicy,
-		Email:         identity.Email,
-		AccountUUID:   identity.AccountUUID,
-	})
+	metadata, err := loadSlotMetadata(slotPath)
+	if err != nil {
+		metadata = slotMetadata{}
+	}
+	metadata.RefreshPolicy = managedRefreshPolicy
+	metadata.Email = identity.Email
+	metadata.AccountUUID = identity.AccountUUID
+	return writeSlotMetadata(slotPath, metadata)
 }
 
 func writeSlotMetadata(slotPath string, metadata slotMetadata) error {

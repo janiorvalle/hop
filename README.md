@@ -22,6 +22,12 @@ else — provider settings, skills, and history stay where they are. One
 caveat: stop running Claude and Codex sessions before hopping, since a
 session already in flight can fail its next token refresh.
 
+An account you are not using right now can be parked instead of deleted:
+`hop disable codex old` stops the glance from fetching its usage and shows the
+row dimmed as `disabled`, and `hop old` refuses to switch to it until
+`hop enable codex old` brings it back. The credentials stay in the slot the
+whole time, so there is nothing to re-enroll.
+
 ## What hop touches (and what it never does)
 
 Hop talks to the same usage and OAuth endpoints the Claude Code and Codex CLIs
