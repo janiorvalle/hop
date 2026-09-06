@@ -364,27 +364,37 @@ func (manager loginManager) confirmClaudeLiveLogin(ctx context.Context, stdin io
 	if _, err := fmt.Fprint(manager.stderr, "Proceed? [y/N] "); err != nil {
 		return stdin, fmt.Errorf("show the Claude enrollment prompt; check the terminal and retry: %w", err)
 	}
+	approved, err := awaitConfirmation(ctx, stdin)
+	if err != nil && errors.Is(err, ctx.Err()) {
+		return stdin, fmt.Errorf("claude enrollment confirmation canceled; rerun 'hop login claude %s' when you are ready: %w", accountName, err)
+	}
+	if err == nil && approved {
+		return stdin, nil
+	}
+	return stdin, claudeLiveLoginRefusal(accountName)
+}
+
+// awaitConfirmation reads a y/N answer unless ctx ends first, so a signal at
+// the prompt unwinds the command and releases its locks.
+func awaitConfirmation(ctx context.Context, stdin io.Reader) (bool, error) {
 	type confirmationResult struct {
 		approved bool
 		err      error
 	}
 	result := make(chan confirmationResult, 1)
 	go func() {
-		approved, err := readClaudeConfirmation(stdin)
+		approved, err := readConfirmation(stdin)
 		result <- confirmationResult{approved: approved, err: err}
 	}()
 	select {
 	case <-ctx.Done():
-		return stdin, fmt.Errorf("claude enrollment confirmation canceled; rerun 'hop login claude %s' when you are ready: %w", accountName, ctx.Err())
+		return false, ctx.Err()
 	case confirmation := <-result:
-		if confirmation.err == nil && confirmation.approved {
-			return stdin, nil
-		}
-		return stdin, claudeLiveLoginRefusal(accountName)
+		return confirmation.approved, confirmation.err
 	}
 }
 
-func readClaudeConfirmation(reader io.Reader) (bool, error) {
+func readConfirmation(reader io.Reader) (bool, error) {
 	isYes := true
 	hasAnswer := false
 	var nextByte [1]byte

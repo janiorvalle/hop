@@ -23,6 +23,7 @@ Usage:
   hop enable <provider> <account>    Bring a parked account back
   hop rm <provider> <account>        Forget an account
   hop mv <provider> <old> <new>      Rename an account
+  hop reset codex <account>          Spend one manual reset on a Codex account
   hop upgrade                        Install the latest verified release
   hop --version                      Show the installed version
   hop help                           Show this help
@@ -40,6 +41,7 @@ Examples:
   hop refresh
   hop rm codex old
   hop mv claude work personal
+  hop reset codex work
 `
 
 // developmentVaultWarning is the one line an unreleased build prints when it is
@@ -130,6 +132,13 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return renameAccount(args[1], args[2], args[3], stdout)
+	case "reset":
+		if err := requireCodexReset(args[1:]); err != nil {
+			return err
+		}
+		resetContext, stopSignals := signal.NotifyContext(context.Background(), loginTerminationSignals()...)
+		defer stopSignals()
+		return resetCodexAccount(resetContext, args[2], os.Stdin, stdout, stderr)
 	case "upgrade":
 		if len(args) != 1 {
 			return fmt.Errorf("upgrade takes no arguments; try 'hop upgrade'")
@@ -189,6 +198,19 @@ func requireProviderRename(args []string) error {
 	}
 	if strings.TrimSpace(args[1]) == "" || strings.TrimSpace(args[2]) == "" {
 		return fmt.Errorf("account cannot be empty; try 'hop mv %s work personal'", args[0])
+	}
+	return nil
+}
+
+func requireCodexReset(args []string) error {
+	if len(args) == 2 && args[0] == "claude" {
+		return fmt.Errorf("[RESET_UNSUPPORTED_PROVIDER] Claude has no manual resets to spend; reset works for codex only, try 'hop reset codex %s'", args[1])
+	}
+	if len(args) != 2 || args[0] != "codex" {
+		return fmt.Errorf("reset needs the codex provider and an account; try 'hop reset codex work'")
+	}
+	if strings.TrimSpace(args[1]) == "" {
+		return fmt.Errorf("account cannot be empty; try 'hop reset codex work'")
 	}
 	return nil
 }

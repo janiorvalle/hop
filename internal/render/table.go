@@ -426,7 +426,7 @@ func narrowValue(usedPercent float64, resetsAt time.Time, options Options) strin
 	if resetsAt.IsZero() {
 		return value
 	}
-	return value + "/" + countdown(options.Now, resetsAt)
+	return value + "/" + Countdown(options.Now, resetsAt)
 }
 
 func writeProblemGuidance(out *strings.Builder, problem *Problem, options Options) {
@@ -443,7 +443,7 @@ func writeExpiryGuidance(out *strings.Builder, expiry *TokenExpiry, options Opti
 	}
 	notice := "Refresh token has expired."
 	if expiry.ExpiresAt.After(options.Now) {
-		notice = fmt.Sprintf("Refresh token expires in %s.", countdown(options.Now, expiry.ExpiresAt))
+		notice = fmt.Sprintf("Refresh token expires in %s.", Countdown(options.Now, expiry.ExpiresAt))
 	}
 	writeGuidance(out, notice+" "+expiry.Action, style, options)
 }
@@ -498,7 +498,7 @@ func windowCell(row Row, kind provider.WindowKind, options Options) string {
 	if window.ResetsAt.IsZero() {
 		return cell
 	}
-	return cell + " " + midDot(options) + " " + countdown(options.Now, window.ResetsAt)
+	return cell + " " + midDot(options) + " " + Countdown(options.Now, window.ResetsAt)
 }
 
 // bindingCell shows the tightest model-scoped limit; the scope name is
@@ -516,7 +516,7 @@ func bindingCell(row Row, uniformScope bool, options Options) string {
 	}
 	cell := fmt.Sprintf("%3d%%", leftPercent(tightest.UsedPercent))
 	if !tightest.ResetsAt.IsZero() {
-		cell += " " + midDot(options) + " " + countdown(options.Now, tightest.ResetsAt)
+		cell += " " + midDot(options) + " " + Countdown(options.Now, tightest.ResetsAt)
 	}
 	if uniformScope {
 		return cell
@@ -544,7 +544,7 @@ func extraLimitCells(row Row, options Options) []string {
 		}
 		cell := fmt.Sprintf("%s%s %d%%", scopeLabel(limit.Scope), limitTag(limit), leftPercent(limit.UsedPercent))
 		if !limit.ResetsAt.IsZero() {
-			cell += " " + midDot(options) + " " + countdown(options.Now, limit.ResetsAt)
+			cell += " " + midDot(options) + " " + Countdown(options.Now, limit.ResetsAt)
 		}
 		cells = append(cells, cell)
 	}
@@ -570,7 +570,7 @@ func resetCreditsLabel(credits provider.ResetCredits, joiner string, options Opt
 	if !ok {
 		return label
 	}
-	return label + joiner + expires + countdown(options.Now, expiry)
+	return label + joiner + expires + Countdown(options.Now, expiry)
 }
 
 func planCell(plan string, options Options) string {
@@ -771,7 +771,8 @@ func findWindow(windows []provider.Window, kind provider.WindowKind) (provider.W
 	return provider.Window{}, false
 }
 
-func countdown(now, resetsAt time.Time) string {
+// Countdown formats how long until resetsAt in the units the glance uses.
+func Countdown(now, resetsAt time.Time) string {
 	remaining := resetsAt.Sub(now)
 	if remaining <= 0 {
 		return "now"

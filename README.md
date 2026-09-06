@@ -28,6 +28,22 @@ row dimmed as `disabled`, and `hop old` refuses to switch to it until
 `hop enable codex old` brings it back. The credentials stay in the slot the
 whole time, so there is nothing to re-enroll.
 
+## Spending a Codex manual reset
+
+OpenAI grants some Codex plans a few manual quota resets. `hop` shows them on
+the account row, and `hop reset codex work` spends one without opening the
+ChatGPT app. It asks first, since a reset is gone once spent:
+
+```
+This spends 1 of 2 manual resets on codex account "work". Continue? [y/N]
+```
+
+Automation can answer with `HOP_CODEX_RESET=approved`. Hop records the request
+id in the account slot before it calls OpenAI and sends the same id again on a
+retry, so a dropped connection never spends two credits. An account with no
+credits left is refused with the count and when its weekly limit resets on its
+own. Claude has no manual resets, so `hop reset claude` is refused.
+
 ## What hop touches (and what it never does)
 
 Hop talks to the same usage and OAuth endpoints the Claude Code and Codex CLIs

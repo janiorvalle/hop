@@ -2,6 +2,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -48,6 +49,7 @@ var (
 	ErrCredentials = errors.New("codex credentials are invalid")
 	ErrRefresh     = errors.New("codex token refresh failed")
 	ErrUsage       = errors.New("codex usage request failed")
+	ErrReset       = errors.New("codex reset request failed")
 
 	windowKinds = map[int64]provider.WindowKind{
 		18_000:  provider.FiveHour,
@@ -182,9 +184,19 @@ func accountRequest(ctx context.Context, endpoint string, credentials Credential
 	if err != nil {
 		return nil, err
 	}
+	authorize(request, credentials)
+	return request, nil
+}
+
+func authorize(request *http.Request, credentials Credentials) {
 	request.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
 	request.Header.Set("chatgpt-account-id", credentials.AccountID)
-	return request, nil
+}
+
+// The reset credit endpoints only answer clients that identify as the Codex desktop app.
+func identifyAsCodexDesktop(request *http.Request) {
+	request.Header.Set("OpenAI-Beta", "codex-1")
+	request.Header.Set("Originator", "Codex Desktop")
 }
 
 func (adapter Adapter) fetchResetCredits(ctx context.Context, credentials Credentials) (provider.ResetCredits, error) {
@@ -194,8 +206,7 @@ func (adapter Adapter) fetchResetCredits(ctx context.Context, credentials Creden
 	if err != nil {
 		return provider.ResetCredits{}, fmt.Errorf("build Codex reset credits request: %w", err)
 	}
-	request.Header.Set("OpenAI-Beta", "codex-1")
-	request.Header.Set("Originator", "Codex Desktop")
+	identifyAsCodexDesktop(request)
 
 	response, err := adapter.client.Do(request)
 	if err != nil {
@@ -210,6 +221,46 @@ func (adapter Adapter) fetchResetCredits(ctx context.Context, credentials Creden
 		return provider.ResetCredits{}, fmt.Errorf("decode Codex reset credits response: %w", err)
 	}
 	return payload.normalize(), nil
+}
+
+// ConsumeResetCredit spends one manual reset. Sending the same redeemRequestID
+// again after a dropped connection lets OpenAI recognize the earlier request
+// instead of spending a second credit.
+func (adapter Adapter) ConsumeResetCredit(ctx context.Context, credentials Credentials, redeemRequestID string) error {
+	body, err := json.Marshal(map[string]string{"redeem_request_id": redeemRequestID})
+	if err != nil {
+		return fmt.Errorf("encode Codex reset request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, adapter.resetCreditsURL+"/consume", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build Codex reset request: %w", err)
+	}
+	authorize(request, credentials)
+	identifyAsCodexDesktop(request)
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := adapter.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("reach the Codex reset endpoint: %w: %w", err, ErrReset)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("codex reset endpoint returned HTTP %d; %s: %w", response.StatusCode, resetHTTPAction(response.StatusCode), ErrReset)
+	}
+	return nil
+}
+
+func resetHTTPAction(statusCode int) string {
+	switch {
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		return "run 'hop login codex <account>' and retry"
+	case statusCode == http.StatusTooManyRequests:
+		return "OpenAI rate-limited the request, wait and retry"
+	case statusCode >= http.StatusInternalServerError:
+		return "the OpenAI reset service is unavailable, retry later"
+	default:
+		return "check 'hop ls' before retrying, and update hop if this response persists"
+	}
 }
 
 // Refresh rotates OAuth tokens in a hop-owned store. Never pass the live auth.json store.
