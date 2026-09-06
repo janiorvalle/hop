@@ -82,11 +82,13 @@ What hop never does:
 - **Never refreshes tokens in a slot it doesn't manage.** Slots are
   default-deny: an account you seeded by hand is read-only until `hop login`
   enrolls it and takes custody of its refresh token.
-- **Never starts a Claude browser login behind your back.** Adding a second
-  Claude account has to borrow the live login while the browser flow runs, so
-  hop asks you to stop your Claude sessions and confirm before it proceeds.
-  Non-interactive automation can confirm with
-  `HOP_CLAUDE_LIVE_LOGIN=approved`.
+- **Never touches your live Claude login to add an account.** `hop login
+  claude <name>` opens your browser, catches the sign-in on
+  `http://localhost:54545/callback`, trades the code for tokens itself, and
+  writes them straight into the new slot. The Keychain item is never read or
+  written, so running Claude sessions keep going. Set `BROWSER` to pick the
+  opener and `HOP_CLAUDE_LOGIN_PORT` if something else holds the port. The
+  first Claude account still adopts the login you already have.
 - **Never restores a sandboxed switch into your real credentials.** If a
   switch is interrupted, recovery refuses any transaction that was recorded
   against different live targets than the ones in play now.

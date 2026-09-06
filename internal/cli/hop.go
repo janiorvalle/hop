@@ -20,6 +20,8 @@ const (
 	claudeCredentialsFileOverride = "HOP_CLAUDE_CREDENTIALS_FILE"
 	claudeAccountEmailOverride    = "HOP_CLAUDE_ACCOUNT_EMAIL"
 	codexAuthFileOverride         = "HOP_CODEX_AUTH_FILE"
+	claudeTokenURLOverride        = "HOP_CLAUDE_TOKEN_URL"
+	claudeLoginPortOverride       = "HOP_CLAUDE_LOGIN_PORT"
 	switchTransactionFilename     = ".switch-transaction.json"
 )
 
@@ -215,8 +217,12 @@ func defaultClaudeLiveDependencies() claudeLiveDependencies {
 	return claudeLiveDependencies{
 		store:   systemClaudeLiveStore{},
 		email:   claudeAccountEmail,
-		profile: claude.New(claude.Config{}).FetchProfile,
+		profile: defaultClaudeAdapter().FetchProfile,
 	}
+}
+
+func defaultClaudeAdapter() claude.Adapter {
+	return claude.New(claude.Config{TokenURL: strings.TrimSpace(os.Getenv(claudeTokenURLOverride))})
 }
 
 func defaultCodexSwitchStore() (codexLiveStore, string, error) {

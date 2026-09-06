@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1191,11 +1193,20 @@ func TestLoginClaudeSandboxStillConfirmsActiveAccount(t *testing.T) {
 	}
 	assertClaudeSlot(t, accountVault, "work", "rotated")
 
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+	t.Setenv(claudeLoginPortOverride, strconv.Itoa(occupied.Addr().(*net.TCPAddr).Port))
 	var stderr bytes.Buffer
 	if exitCode := Run([]string{"login", "claude", "personal"}, &bytes.Buffer{}, &stderr); exitCode == 0 {
-		t.Fatal("Run(login claude personal) succeeded, want sandbox refusal for a new account")
-	} else if !strings.Contains(stderr.String(), claudeCredentialsFileOverride) {
-		t.Fatalf("stderr = %q, want sandbox-override guidance", stderr.String())
+		t.Fatal("Run(login claude personal) succeeded, want the busy callback port refusal")
+	} else if !strings.Contains(stderr.String(), "[CLAUDE_LOGIN_PORT_IN_USE]") || !strings.Contains(stderr.String(), claudeLoginPortOverride) {
+		t.Fatalf("stderr = %q, want the busy-port code and the port override", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(hopHome, "claude", "personal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("slot remains after the refused login: %v", err)
 	}
 }
 

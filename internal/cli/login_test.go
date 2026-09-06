@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -482,7 +483,7 @@ func TestLoginClaudeEnrollsSecondAccountWithoutStatusEmailAfterTokenConfirmation
 		},
 	}
 
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+	if err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	newPath, _ := accountVault.CredentialsPath("claude", "personal")
@@ -507,7 +508,7 @@ func TestLoginClaudeRequiresExplicitQuietWindowBeforeLiveMutation(t *testing.T) 
 		getenv:     func(string) string { return "" },
 	}
 
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "stop Claude agents") || !strings.Contains(err.Error(), "HOP_CLAUDE_LIVE_LOGIN=approved") {
 		t.Fatalf("Login() error = %v, want quiet-window instructions", err)
 	}
@@ -687,7 +688,7 @@ func TestLoginClaudeStagesNewAccountAndRestoresActiveLogin(t *testing.T) {
 		},
 	}
 
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+	if err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	wantCommands := []string{"claude auth login"}
@@ -754,7 +755,7 @@ func TestLoginClaudeStagingPreservesReadOnlyActiveSlotPolicy(t *testing.T) {
 		},
 	}
 
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+	if err := manager.loginClaudeByStaging(context.Background(), "personal", "seeded", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	if metadata := readSlotMetadata(t, filepath.Dir(credentialsPath)); metadata.RefreshPolicy != "read-only" {
@@ -795,7 +796,7 @@ func TestLoginClaudeStagesNewAccountWhenStatusEmailIsStale(t *testing.T) {
 		},
 	}
 
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+	if err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v, want enrollment to trust the recorded credentials", err)
 	}
 	workPath, _ := accountVault.CredentialsPath("claude", "work")
@@ -854,7 +855,7 @@ func TestLoginClaudeStagesNewAccountAfterTheActiveTokensRotate(t *testing.T) {
 		},
 	}
 
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+	if err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v, want the fresh profile to confirm the rotated active login", err)
 	}
 	if profileReads != 1 {
@@ -903,7 +904,7 @@ func TestLoginClaudeLeavesAnEmailLessActiveSlotUnlabeledWhenStatusEmailIsStale(t
 		},
 	}
 
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+	if err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	if metadata := readSlotMetadata(t, filepath.Dir(workPath)); metadata.Email != "" {
@@ -940,7 +941,7 @@ func TestLoginClaudeRejectsReturningToAnEmailLessActiveIdentity(t *testing.T) {
 		claudeEmail: func(context.Context) (string, error) { return "work@example.com", nil },
 	}
 
-	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "duplicate", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "already-active identity") {
 		t.Fatalf("Login() error = %v, want duplicate-identity guidance", err)
 	}
@@ -1001,7 +1002,7 @@ func TestLoginClaudeRefusesToAdoptHandSeededActiveSlotOnMatchingTokens(t *testin
 				claudeEmail: func(context.Context) (string, error) { return "stale@example.com", nil },
 			}
 
-			err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+			err := manager.loginClaudeByStaging(context.Background(), "personal", "seeded", strings.NewReader(""))
 			if err == nil || !strings.Contains(err.Error(), "adopt the current live login") {
 				t.Fatalf("Login() error = %v, want the explicit-adoption instruction", err)
 			}
@@ -1072,7 +1073,7 @@ func TestLoginClaudeStagingClearsLiveLoginInsteadOfLoggingOut(t *testing.T) {
 		},
 	}
 
-	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+	if err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader("")); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
 	for _, step := range steps {
@@ -1115,7 +1116,7 @@ func TestLoginClaudeRestoresActiveAccountWhenClearingTheLiveLoginFails(t *testin
 		claudeEmail: func(context.Context) (string, error) { return "work@example.com", nil },
 	}
 
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "clear the live Claude login") {
 		t.Fatalf("Login() error = %v, want the failure to name the live login it could not clear", err)
 	}
@@ -1148,7 +1149,7 @@ func TestLoginClaudeRefusesToOverwriteSlotWhenLiveIdentityChanged(t *testing.T) 
 		},
 	}
 
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "restore the recorded account") {
 		t.Fatalf("Login() error = %v, want identity reconciliation step", err)
 	}
@@ -1188,7 +1189,7 @@ func TestLoginClaudeRejectsFreshTokensForAlreadyActiveIdentity(t *testing.T) {
 		},
 	}
 
-	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "duplicate", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "already-active identity") {
 		t.Fatalf("Login() error = %v, want duplicate-identity guidance", err)
 	}
@@ -1243,7 +1244,7 @@ func TestLoginClaudeRejectsIdentityAlreadyEnrolledUnderAnotherName(t *testing.T)
 		},
 	}
 
-	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "duplicate", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), `already enrolled as account "existing"`) {
 		t.Fatalf("Login() error = %v, want duplicate identity guidance", err)
 	}
@@ -1349,7 +1350,7 @@ func TestLoginClaudeRestoresActiveLoginWhenNewLoginFails(t *testing.T) {
 		},
 	}
 
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "previous login will be restored") {
 		t.Fatalf("Login() error = %v, want restoration guidance", err)
 	}
@@ -1389,7 +1390,7 @@ func TestLoginClaudeBoundsRestorationAfterFailedLogin(t *testing.T) {
 		},
 	}
 
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "restore active Claude account") || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Login() error = %v, want bounded restoration failure", err)
 	}
@@ -1424,7 +1425,7 @@ func TestLoginClaudeKeepsNewSlotWhenActiveRestorationFails(t *testing.T) {
 		},
 	}
 
-	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	err := manager.loginClaudeByStaging(context.Background(), "personal", "work", strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "could not restore active account") {
 		t.Fatalf("Login() error = %v, want restoration failure", err)
 	}
@@ -1517,4 +1518,165 @@ func readSlotMetadata(t *testing.T, slotPath string) slotMetadata {
 		t.Fatalf("decode slot metadata: %v", err)
 	}
 	return metadata
+}
+
+func TestLoginClaudeInBrowserEnrollsSecondAccountWithoutTouchingTheLiveLogin(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	live := &fakeClaudeLiveStore{credentials: claude.Credentials{AccessToken: "live", RefreshToken: "live-refresh"}}
+	enrolled := claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh", ExpiresAt: 1, RefreshTokenExpiresAt: 2, Scopes: []string{"user:profile"}}
+	var stdout bytes.Buffer
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: live,
+		runner:     loginRunnerFunc(func(context.Context, loginCommand) error { t.Fatal("runner called for a browser login"); return nil }),
+		stdout:     &stdout,
+		stderr:     io.Discard,
+		claudeEmail: func(context.Context) (string, error) {
+			t.Fatal("claude auth status consulted for a browser login")
+			return "", nil
+		},
+		claudeLogin: func(context.Context) (claude.Enrollment, error) {
+			return claude.Enrollment{Credentials: enrolled, Profile: claude.Profile{AccountUUID: "personal-uuid", Email: "personal@example.com"}}, nil
+		},
+	}
+
+	if err := manager.Login(context.Background(), "claude", "personal", strings.NewReader("")); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if live.reads != 0 || len(live.writes) != 0 || live.clears != 0 {
+		t.Fatalf("live reads = %d, writes = %d, clears = %d; want the live login untouched", live.reads, len(live.writes), live.clears)
+	}
+	newPath, _ := accountVault.CredentialsPath("claude", "personal")
+	got, err := (claude.FileStore{Path: newPath}).Read()
+	if err != nil || !reflect.DeepEqual(got, enrolled) {
+		t.Fatalf("new slot credentials = %#v, error = %v; want %#v", got, err, enrolled)
+	}
+	metadata := readSlotMetadata(t, filepath.Dir(newPath))
+	if metadata.RefreshPolicy != managedRefreshPolicy || metadata.Email != "personal@example.com" || metadata.AccountUUID != "personal-uuid" {
+		t.Fatalf("new slot metadata = %#v, want managed custody with the token response identity", metadata)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(newPath), slotReservationFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reservation marker remains after enrollment: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `Enrolled Claude account "personal" (personal@example.com).`) {
+		t.Fatalf("stdout = %q, want enrollment receipt", stdout.String())
+	}
+}
+
+func TestLoginClaudeInBrowserLeavesNoSlotWhenTheSignInFails(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		loginErr error
+		want     string
+	}{
+		{name: "state mismatch", loginErr: fmt.Errorf("[CLAUDE_LOGIN_STATE_MISMATCH] discarded: %w", claude.ErrLogin), want: "[CLAUDE_LOGIN_STATE_MISMATCH]"},
+		{name: "exchange rejected", loginErr: fmt.Errorf("[CLAUDE_LOGIN_EXCHANGE_FAILED] HTTP 400: %w", claude.ErrLogin), want: "[CLAUDE_LOGIN_EXCHANGE_FAILED]"},
+		{name: "port busy", loginErr: fmt.Errorf("[CLAUDE_LOGIN_PORT_IN_USE] taken: %w", claude.ErrCallbackPort), want: claudeLoginPortOverride},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			accountVault := newTestVault(t)
+			seedActiveClaudeAccount(t, accountVault, "work")
+			live := &fakeClaudeLiveStore{}
+			manager := loginManager{
+				vault:       accountVault,
+				claudeLive:  live,
+				stdout:      io.Discard,
+				stderr:      io.Discard,
+				claudeLogin: func(context.Context) (claude.Enrollment, error) { return claude.Enrollment{}, testCase.loginErr },
+			}
+
+			err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+			if err == nil || !strings.Contains(err.Error(), testCase.want) || !strings.Contains(err.Error(), "before anything was saved") {
+				t.Fatalf("Login() error = %v, want %s with the nothing-saved receipt", err, testCase.want)
+			}
+			slotPath, _ := accountVault.SlotPath("claude", "personal")
+			if _, err := os.Stat(slotPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("slot remains after a failed login: %v", err)
+			}
+			if live.reads != 0 || len(live.writes) != 0 || live.clears != 0 {
+				t.Fatalf("live reads = %d, writes = %d, clears = %d; want the live login untouched", live.reads, len(live.writes), live.clears)
+			}
+		})
+	}
+}
+
+func TestLoginClaudeInBrowserRefusesAnExistingAccountBeforeOpeningTheBrowser(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	personalPath, _ := accountVault.CredentialsPath("claude", "personal")
+	if err := (claude.FileStore{Path: personalPath}).Write(claude.Credentials{AccessToken: "kept", RefreshToken: "kept-refresh"}); err != nil {
+		t.Fatalf("seed existing slot: %v", err)
+	}
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: &fakeClaudeLiveStore{},
+		stdout:     io.Discard,
+		stderr:     io.Discard,
+		claudeLogin: func(context.Context) (claude.Enrollment, error) {
+			t.Fatal("browser login started for an existing account")
+			return claude.Enrollment{}, nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "claude", "personal", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), `claude account "personal" already exists`) {
+		t.Fatalf("Login() error = %v, want existing-account refusal", err)
+	}
+	if got, err := (claude.FileStore{Path: personalPath}).Read(); err != nil || got.RefreshToken != "kept-refresh" {
+		t.Fatalf("existing slot = %#v, error = %v; want it untouched", got, err)
+	}
+}
+
+func TestLoginClaudeInBrowserRejectsIdentityAlreadyEnrolledUnderAnotherName(t *testing.T) {
+	t.Parallel()
+
+	accountVault := newTestVault(t)
+	seedActiveClaudeAccount(t, accountVault, "work")
+	manager := loginManager{
+		vault:      accountVault,
+		claudeLive: &fakeClaudeLiveStore{},
+		stdout:     io.Discard,
+		stderr:     io.Discard,
+		claudeLogin: func(context.Context) (claude.Enrollment, error) {
+			return claude.Enrollment{Credentials: claude.Credentials{AccessToken: "new", RefreshToken: "new-refresh"}, Profile: claude.Profile{Email: "WORK@example.com"}}, nil
+		},
+	}
+
+	err := manager.Login(context.Background(), "claude", "duplicate", strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), `already enrolled as account "work"`) {
+		t.Fatalf("Login() error = %v, want duplicate identity refusal", err)
+	}
+	slotPath, _ := accountVault.SlotPath("claude", "duplicate")
+	if _, err := os.Stat(slotPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("slot remains after a duplicate refusal: %v", err)
+	}
+}
+
+func TestDefaultClaudeLoginRejectsAnUnusablePortOverride(t *testing.T) {
+	t.Setenv(claudeLoginPortOverride, "http")
+
+	_, err := defaultClaudeLogin(io.Discard)
+	if err == nil || !strings.Contains(err.Error(), claudeLoginPortOverride) || !strings.Contains(err.Error(), "between 1 and 65535") {
+		t.Fatalf("defaultClaudeLogin() error = %v, want port override guidance", err)
+	}
+}
+
+func TestBrowserCommandHonorsBROWSERBeforeThePlatformOpener(t *testing.T) {
+	t.Setenv("BROWSER", "my-browser --new-tab")
+
+	got := browserCommand("https://example.test/authorize").Args
+	want := []string{"my-browser", "--new-tab", "https://example.test/authorize"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("browserCommand().Args = %v, want %v", got, want)
+	}
 }

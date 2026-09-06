@@ -1,4 +1,4 @@
-// Package claude reads Claude credentials, refreshes slot tokens, and fetches usage.
+// Package claude signs Claude accounts in, reads Claude credentials, refreshes slot tokens, and fetches usage.
 package claude
 
 import (
