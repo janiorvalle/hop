@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +29,7 @@ const claudeStagingFilename = ".claude-login-transaction.json"
 const claudeLoginLockFilename = ".claude-login.lock"
 const codexLoginLockFilename = ".codex-login.lock"
 const claudeRestoreTimeout = 20 * time.Second
+const claudeLoginTimeout = 10 * time.Minute
 
 type loginCommand struct {
 	Name   string
@@ -57,6 +60,7 @@ type loginManager struct {
 	codexEmail    func(context.Context, codex.Credentials) (string, error)
 	claudeEmail   func(context.Context) (string, error)
 	claudeProfile func(context.Context, claude.Credentials) (claude.Profile, error)
+	claudeLogin   func(context.Context) (claude.Enrollment, error)
 	stdinIsTTY    func(io.Reader) bool
 	restoreWait   time.Duration
 	sandboxClaude bool
@@ -89,6 +93,10 @@ func loginAccount(ctx context.Context, providerName, accountName string, stdin i
 		return err
 	}
 	claudeDependencies := defaultClaudeLiveDependencies()
+	claudeLogin, err := defaultClaudeLogin(stderr)
+	if err != nil {
+		return err
+	}
 	manager := loginManager{
 		vault:      accountVault,
 		runner:     systemLoginRunner{},
@@ -102,10 +110,55 @@ func loginAccount(ctx context.Context, providerName, accountName string, stdin i
 		},
 		claudeEmail:   claudeDependencies.email,
 		claudeProfile: claudeDependencies.profile,
+		claudeLogin:   claudeLogin,
 		stdinIsTTY:    readerIsTerminal,
 		sandboxClaude: strings.TrimSpace(os.Getenv(claudeCredentialsFileOverride)) != "",
 	}
 	return manager.Login(ctx, providerName, accountName, stdin)
+}
+
+func defaultClaudeLogin(stderr io.Writer) (func(context.Context) (claude.Enrollment, error), error) {
+	port := claude.DefaultLoginPort
+	if override := strings.TrimSpace(os.Getenv(claudeLoginPortOverride)); override != "" {
+		parsed, err := strconv.Atoi(override)
+		if err != nil || parsed < 1 || parsed > 65535 {
+			return nil, fmt.Errorf("%s=%q is not a port between 1 and 65535; fix the override and retry", claudeLoginPortOverride, override)
+		}
+		port = parsed
+	}
+	login := claude.Login{Port: port, OpenBrowser: func(authorizeURL string) error {
+		_, _ = fmt.Fprintf(stderr, "Opening your browser to sign in to Claude. If nothing opens, paste this URL into a browser:\n%s\n", authorizeURL)
+		opener := browserCommand(authorizeURL)
+		if err := opener.Start(); err != nil {
+			_, _ = fmt.Fprintf(stderr, "hop: could not open a browser (%v); paste the URL above yourself\n", err)
+		} else {
+			go func() { _ = opener.Wait() }()
+		}
+		_, _ = fmt.Fprintln(stderr, "Waiting for the sign-in to finish. Press Ctrl-C to cancel.")
+		return nil
+	}}
+	adapter := defaultClaudeAdapter()
+	return func(ctx context.Context) (claude.Enrollment, error) {
+		loginContext, cancel := context.WithTimeout(ctx, claudeLoginTimeout)
+		defer cancel()
+		return adapter.Login(loginContext, login)
+	}, nil
+}
+
+// browserCommand honors BROWSER the way xdg-open, gh, and git do, then falls
+// back to the platform opener.
+func browserCommand(authorizeURL string) *exec.Cmd {
+	if browser := strings.Fields(os.Getenv("BROWSER")); len(browser) > 0 {
+		return exec.Command(browser[0], append(browser[1:], authorizeURL)...)
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", authorizeURL)
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", authorizeURL)
+	default:
+		return exec.Command("xdg-open", authorizeURL)
+	}
 }
 
 func (manager loginManager) Login(ctx context.Context, providerName, accountName string, stdin io.Reader) error {
@@ -118,7 +171,7 @@ func (manager loginManager) Login(ctx context.Context, providerName, accountName
 		defer reservation.Cleanup()
 		return manager.loginCodex(ctx, accountName, reservation, stdin)
 	case "claude":
-		return manager.loginClaude(ctx, accountName, stdin)
+		return manager.loginClaude(ctx, accountName)
 	default:
 		return fmt.Errorf("unknown provider %q; use claude or codex", providerName)
 	}
@@ -175,7 +228,7 @@ func (manager loginManager) loginCodex(ctx context.Context, accountName string, 
 	return err
 }
 
-func (manager loginManager) loginClaude(ctx context.Context, accountName string, stdin io.Reader) (returnErr error) {
+func (manager loginManager) loginClaude(ctx context.Context, accountName string) error {
 	releaseClaudeLogin, err := acquireClaudeLoginLock(ctx, manager.vault.Root())
 	if err != nil {
 		return err
@@ -245,10 +298,47 @@ func (manager loginManager) loginClaude(ctx context.Context, accountName string,
 	if accountName == activeAccount {
 		return manager.confirmActiveClaudeSlot(ctx, activeAccount)
 	}
+	return manager.loginClaudeInBrowser(ctx, accountName)
+}
+
+// loginClaudeInBrowser enrolls another Claude account through hop's own
+// browser sign-in, so the live login and every running session stay untouched.
+func (manager loginManager) loginClaudeInBrowser(ctx context.Context, accountName string) error {
+	reservation, err := manager.reserveNewSlot("claude", accountName)
+	if err != nil {
+		return err
+	}
+	defer reservation.Cleanup()
+	enrollment, err := manager.claudeLogin(ctx)
+	if errors.Is(err, claude.ErrCallbackPort) {
+		return fmt.Errorf("claude enrollment for account %q stopped before anything was saved; set %s to a free port and retry: %w", accountName, claudeLoginPortOverride, err)
+	}
+	if err != nil {
+		return fmt.Errorf("claude enrollment for account %q stopped before anything was saved: %w", accountName, err)
+	}
+	if duplicateAccount, err := manager.duplicateClaudeAccount(accountName, enrollment.Profile, enrollment.Credentials); err != nil {
+		return err
+	} else if duplicateAccount != "" {
+		return fmt.Errorf("claude identity is already enrolled as account %q; use that account or remove it before assigning a new name", duplicateAccount)
+	}
+	if err := manager.installClaudeSlot(accountName, reservation.path, enrollment.Profile, enrollment.Credentials); err != nil {
+		return err
+	}
+	if err := reservation.Commit(); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(manager.stdout, "Enrolled Claude account %q%s.\n", accountName, emailSuffix(enrollment.Profile.Email))
+	return err
+}
+
+// loginClaudeByStaging is the previous enrollment path: it borrows the live
+// Claude Code login for the browser sign-in and restores it afterwards.
+// Nothing calls it anymore; its tests keep it honest until it is deleted.
+func (manager loginManager) loginClaudeByStaging(ctx context.Context, accountName, activeAccount string, stdin io.Reader) (returnErr error) {
 	if manager.sandboxClaude {
 		return fmt.Errorf("cannot add another Claude account while %s is set because Claude's browser login would use the real Keychain; unset the override for a user-approved live login, or test loginManager with an injected fake runner", claudeCredentialsFileOverride)
 	}
-	stdin, err = manager.confirmClaudeLiveLogin(ctx, stdin, accountName)
+	stdin, err := manager.confirmClaudeLiveLogin(ctx, stdin, accountName)
 	if err != nil {
 		return err
 	}

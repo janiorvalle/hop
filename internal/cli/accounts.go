@@ -125,7 +125,7 @@ func defaultCatalog() (catalog, error) {
 	return vaultCatalog{
 		vault:         accountVault,
 		state:         activeState,
-		claudeAdapter: claude.New(claude.Config{}),
+		claudeAdapter: defaultClaudeAdapter(),
 		codexAdapter:  codex.New(codex.Config{}),
 		now:           time.Now,
 		claudeLive:    claudeDependencies.store,
