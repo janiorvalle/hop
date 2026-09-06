@@ -151,8 +151,11 @@ func TestCredentialFetcherImplementsSharedContract(t *testing.T) {
 	if usage.Provider != provider.Claude {
 		t.Errorf("Provider = %q, want claude", usage.Provider)
 	}
-	if usage.Plan != "Max 5x" {
-		t.Errorf("Plan = %q, want Max 5x from the stored rate limit tier", usage.Plan)
+	if usage.Plan != "" {
+		t.Errorf("usage Plan = %q, want the usage endpoint to leave the plan to the enrollment", usage.Plan)
+	}
+	if plan := fetcher.Enrollment().Plan; plan != "Max 5x" {
+		t.Errorf("Enrollment().Plan = %q, want Max 5x from the stored rate limit tier", plan)
 	}
 }
 

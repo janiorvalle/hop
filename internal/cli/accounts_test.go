@@ -63,12 +63,12 @@ func TestVaultCatalogDiscoversSortedAccountsAndUsesLiveSourceForActive(t *testin
 	if !accounts[1].Active {
 		t.Fatal("claude/work active = false, want true")
 	}
-	if _, ok := accounts[1].Fetcher.(claudeLiveFetcher); !ok {
-		t.Fatalf("claude/work fetcher = %T, want live read-only fetcher", accounts[1].Fetcher)
+	if _, ok := accounts[1].Source.(claudeLiveSource); !ok {
+		t.Fatalf("claude/work fetcher = %T, want live read-only source", accounts[1].Source)
 	}
-	alphaFetcher, ok := accounts[0].Fetcher.(claudeSlotFetcher)
+	alphaFetcher, ok := accounts[0].Source.(claudeSlotSource)
 	if !ok || alphaFetcher.refreshAllowed {
-		t.Fatalf("hand-seeded claude/alpha fetcher = %#v, want read-only slot fetcher", accounts[0].Fetcher)
+		t.Fatalf("hand-seeded claude/alpha fetcher = %#v, want read-only slot source", accounts[0].Source)
 	}
 }
 
@@ -172,11 +172,11 @@ func TestClaudeSlotFetcherRefreshesOnlyManagedSlots(t *testing.T) {
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: refreshAllowed, becameActive: neverActive, now: time.Now}
+			fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: refreshAllowed, becameActive: neverActive, now: time.Now}
 			if err := fetcher.Prepare(context.Background()); err != nil {
 				t.Fatalf("Prepare() error = %v", err)
 			}
-			if _, err := fetcher.FetchUsage(context.Background()); err != nil {
+			if _, err := fetchUsageFrom(fetcher); err != nil {
 				t.Fatalf("FetchUsage() error = %v", err)
 			}
 			wantCalls := int32(0)
@@ -212,11 +212,11 @@ func TestCodexSlotFetcherRefreshesExpiredManagedJWT(t *testing.T) {
 		t.Fatalf("Write() error = %v", err)
 	}
 	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits", TokenURL: server.URL + "/token"})
-	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
+	fetcher := codexSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if _, err := fetcher.FetchUsage(context.Background()); err != nil {
+	if _, err := fetchUsageFrom(fetcher); err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
 	if got := refreshCalls.Load(); got != 1 {
@@ -240,12 +240,12 @@ func TestClaudeSlotFetcherRetriesSavingRotatedRecoveryCredentials(t *testing.T) 
 	t.Cleanup(server.Close)
 	store := &failFirstClaudeWriteStore{credentials: claude.Credentials{AccessToken: "old", RefreshToken: "refresh", ExpiresAt: 1}}
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
+	fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if _, err := fetcher.FetchUsage(context.Background()); err != nil {
+	if _, err := fetchUsageFrom(fetcher); err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
 	if store.writes != 2 || store.credentials.RefreshToken != "rotated" {
@@ -279,12 +279,12 @@ func TestClaudeFileRefreshJournalsRotationWhenPrimaryInstallFails(t *testing.T) 
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
+	fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if _, err := fetcher.FetchUsage(context.Background()); err != nil {
+	if _, err := fetchUsageFrom(fetcher); err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
 	recovered, err := store.Read()
@@ -319,7 +319,7 @@ func TestConcurrentClaudeGlancesSerializeOneManagedSlotRefresh(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
+	fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for range 2 {
@@ -366,7 +366,7 @@ func TestManagedRefreshPersistsRotationAfterGlanceDeadline(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token"})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
+	fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	ctx, cancel := context.WithCancel(context.Background())
 	type glanceResponse struct {
 		document glanceDocument
@@ -374,7 +374,7 @@ func TestManagedRefreshPersistsRotationAfterGlanceDeadline(t *testing.T) {
 	}
 	result := make(chan glanceResponse, 1)
 	go func() {
-		document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "managed", Fetcher: fetcher}}, time.Now())
+		document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "managed", Source: fetcher}}, time.Now())
 		result <- glanceResponse{document: document, err: err}
 	}()
 	<-tokenStarted
@@ -415,11 +415,11 @@ func TestManagedRefreshLockWaitHonorsGlanceDeadline(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	adapter := claude.New(claude.Config{UsageURL: server.URL, TokenURL: server.URL})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
+	fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "locked", Fetcher: fetcher}}, time.Now())
+	document, err := fetchGlance(ctx, staticCatalog{{Provider: provider.Claude, Name: "locked", Source: fetcher}}, time.Now())
 	if err != nil {
 		t.Fatalf("fetchGlance() error = %v", err)
 	}
@@ -448,12 +448,12 @@ func TestCodexSlotFetcherRetriesSavingRotatedRecoveryCredentials(t *testing.T) {
 	expiredPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1}`))
 	store := &failFirstCodexWriteStore{credentials: codex.Credentials{AccessToken: "header." + expiredPayload + ".signature", RefreshToken: "refresh", AccountID: "account"}}
 	adapter := codex.New(codex.Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits", TokenURL: server.URL + "/token"})
-	fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
+	fetcher := codexSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: time.Now}
 
 	if err := fetcher.Prepare(context.Background()); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if _, err := fetcher.FetchUsage(context.Background()); err != nil {
+	if _, err := fetchUsageFrom(fetcher); err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
 	if store.writes != 2 || store.credentials.RefreshToken != "rotated" {
@@ -509,8 +509,8 @@ func (store *failFirstCodexWriteStore) Write(credentials codex.Credentials) erro
 	return nil
 }
 
-var _ provider.Fetcher = claudeSlotFetcher{}
-var _ provider.Fetcher = codexSlotFetcher{}
+var _ provider.Source = claudeSlotSource{}
+var _ provider.Source = codexSlotSource{}
 
 func TestClaudeSlotFetcherRotatesBeforeRefreshTokenExpires(t *testing.T) {
 	t.Parallel()
@@ -546,7 +546,7 @@ func TestClaudeSlotFetcherRotatesBeforeRefreshTokenExpires(t *testing.T) {
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := claude.New(claude.Config{TokenURL: server.URL, Now: clock})
-			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: scenario.refreshAllowed, becameActive: neverActive, now: clock}
+			fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: scenario.refreshAllowed, becameActive: neverActive, now: clock}
 			if err := fetcher.Prepare(context.Background()); err != nil {
 				t.Fatalf("Prepare() error = %v", err)
 			}
@@ -601,7 +601,7 @@ func TestClaudeSlotFetcherKeepsUsableAccessTokenWhenEarlyRotationFails(t *testin
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := claude.New(claude.Config{UsageURL: server.URL + "/usage", TokenURL: server.URL + "/token", Now: clock})
-			fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
+			fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
 			err := fetcher.Prepare(context.Background())
 			if (err != nil) != scenario.wantPrepareErr {
 				t.Fatalf("Prepare() error = %v, want error %t", err, scenario.wantPrepareErr)
@@ -609,12 +609,15 @@ func TestClaudeSlotFetcherKeepsUsableAccessTokenWhenEarlyRotationFails(t *testin
 			if scenario.wantPrepareErr {
 				return
 			}
-			usage, err := fetcher.FetchUsage(context.Background())
+			opened, err := fetcher.Open(context.Background())
 			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			if _, err := opened.FetchUsage(context.Background()); err != nil {
 				t.Fatalf("FetchUsage() error = %v", err)
 			}
-			if !usage.RefreshTokenExpiresAt.Equal(now.Add(6 * 24 * time.Hour)) {
-				t.Fatalf("usage refresh token expiry = %s, want the unrotated six-day expiry", usage.RefreshTokenExpiresAt)
+			if expiresAt := opened.Enrollment().RefreshTokenExpiresAt; !expiresAt.Equal(now.Add(6 * 24 * time.Hour)) {
+				t.Fatalf("enrollment refresh token expiry = %s, want the unrotated six-day expiry", expiresAt)
 			}
 		})
 	}
@@ -636,7 +639,7 @@ func TestClaudeSlotFetcherSurfacesRotatedTokensItCouldNotSave(t *testing.T) {
 		RefreshTokenExpiresAt: now.Add(6 * 24 * time.Hour).UnixMilli(),
 	}}
 	adapter := claude.New(claude.Config{TokenURL: server.URL, Now: clock})
-	fetcher := claudeSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
+	fetcher := claudeSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
 
 	err := fetcher.Prepare(context.Background())
 	if !errors.Is(err, errRotatedTokensLost) {
@@ -672,7 +675,7 @@ func TestCodexSlotFetcherRotatesWhenLastRefreshAgesOut(t *testing.T) {
 				t.Fatalf("Write() error = %v", err)
 			}
 			adapter := codex.New(codex.Config{TokenURL: server.URL, Now: clock})
-			fetcher := codexSlotFetcher{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
+			fetcher := codexSlotSource{adapter: adapter, store: store, refreshAllowed: true, becameActive: neverActive, now: clock}
 			if err := fetcher.Prepare(context.Background()); err != nil {
 				t.Fatalf("Prepare() error = %v", err)
 			}
@@ -723,7 +726,7 @@ func TestRotationSkipsSlotThatBecameActiveWhileWaitingForItsRefreshLock(t *testi
 		codexAdapter:  codex.New(codex.Config{}),
 		now:           clock,
 	}
-	rotator, ok := findAccount(t, accountCatalog, "claude", "next").Fetcher.(slotRotator)
+	rotator, ok := findAccount(t, accountCatalog, "claude", "next").Source.(slotRotator)
 	if !ok {
 		t.Fatal("idle managed slot is not rotatable")
 	}
@@ -862,3 +865,11 @@ func findAccount(t *testing.T, accountCatalog catalog, providerName provider.Nam
 }
 
 func neverActive() (bool, error) { return false, nil }
+
+func fetchUsageFrom(source provider.Source) (provider.Usage, error) {
+	fetcher, err := source.Open(context.Background())
+	if err != nil {
+		return provider.Usage{}, err
+	}
+	return fetcher.FetchUsage(context.Background())
+}

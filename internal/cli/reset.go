@@ -202,7 +202,8 @@ func (resetter codexResetter) reportSpentCredit(ctx context.Context, accountName
 		_, _ = fmt.Fprintf(resetter.stderr, "hop: the refreshed usage for codex account %q could not be read: %s. Run 'hop ls' to see it.\n", accountName, strings.ReplaceAll(err.Error(), "<account>", accountName))
 		return
 	}
-	row := resultFor(account{Provider: provider.Codex, Name: accountName, Active: isActive}, refreshed, nil)
+	row := newAccountResult(account{Provider: provider.Codex, Name: accountName, Active: isActive})
+	row.recordUsage(refreshed)
 	_ = writeTable(resetter.stdout, glanceDocument{Schema: listSchema, Accounts: []accountResult{row}}, terminalOptions(resetter.stdout, resetter.now()))
 }
 

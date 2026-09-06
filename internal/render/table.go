@@ -201,11 +201,14 @@ func newSection(rows []Row) section {
 	dataRows := 0
 	fiveHourCap := false
 	for _, row := range sorted {
-		if row.Problem != nil || row.Disabled {
+		if row.Disabled {
+			continue
+		}
+		plans[row.Plan] = true
+		if row.Problem != nil {
 			continue
 		}
 		dataRows++
-		plans[row.Plan] = true
 		if _, ok := findWindow(row.Windows, provider.FiveHour); ok {
 			built.showFiveHour = true
 		}
@@ -220,7 +223,7 @@ func newSection(rows []Row) section {
 			}
 		}
 	}
-	if dataRows > 0 && len(plans) == 1 && !plans[""] {
+	if len(plans) == 1 && !plans[""] {
 		for plan := range plans {
 			built.hoisted = append(built.hoisted, plan)
 		}
@@ -314,15 +317,21 @@ func writeWideSection(out *strings.Builder, built section, options Options) {
 	}
 }
 
-// wideCells builds one row's column values in header order; error rows fill
-// only the account and headroom columns.
+// wideCells builds one row's column values in header order. An error row
+// leaves everything it does not know blank, because ERROR already says why,
+// and keeps the plan its credentials named.
 func wideCells(row Row, built section, options Options) []string {
 	name := shorten(row.Account, maxNameRunes, options.Plain)
 	if row.Disabled {
 		return []string{name, fmt.Sprintf("%*s", headroomCellWidth, "disabled")}
 	}
 	if row.Problem != nil {
-		return []string{name, fmt.Sprintf("%*s", headroomCellWidth, "ERROR")}
+		cells := []string{name, fmt.Sprintf("%*s", headroomCellWidth, "ERROR")}
+		if built.showPlan && row.Plan != "" {
+			cells = append(cells, make([]string, built.usageColumns())...)
+			cells = append(cells, planCell(row.Plan, options))
+		}
+		return cells
 	}
 	cells := []string{name, fmt.Sprintf("%3d%% LEFT", headroomPercent(row))}
 	if built.showFiveHour {
@@ -338,6 +347,16 @@ func wideCells(row Row, built section, options Options) []string {
 		cells = append(cells, planCell(row.Plan, options))
 	}
 	return cells
+}
+
+func (built section) usageColumns() int {
+	count := 0
+	for _, shown := range []bool{built.showFiveHour, built.showWeekly, built.showBinding} {
+		if shown {
+			count++
+		}
+	}
+	return count
 }
 
 func wideLine(row Row, cells []string, widths []int, options Options) string {
@@ -382,6 +401,7 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 			line := rowPrefix(row, options) + name + "  " +
 				paint(fmt.Sprintf("%*s", headroomCellWidth, "ERROR"), styleRed, options)
 			out.WriteString(strings.TrimRight(line, " ") + "\n")
+			writeNarrowDetail(out, row, built.showPlan, options)
 			writeProblemGuidance(out, row.Problem, options)
 			writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
 			continue
@@ -393,11 +413,15 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 			line += paint("  ACTIVE", styleBold, options)
 		}
 		out.WriteString(line + "\n")
-		parts := narrowDetailParts(row, built.showPlan, options)
-		for _, detail := range flow(parts, " "+midDot(options)+" ", options.Width-len(guidanceIndent)) {
-			out.WriteString(guidanceIndent + paint(detail, styleDim, options) + "\n")
-		}
+		writeNarrowDetail(out, row, built.showPlan, options)
 		writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
+	}
+}
+
+func writeNarrowDetail(out *strings.Builder, row Row, showPlan bool, options Options) {
+	parts := narrowDetailParts(row, showPlan, options)
+	for _, detail := range flow(parts, " "+midDot(options)+" ", options.Width-len(guidanceIndent)) {
+		out.WriteString(guidanceIndent + paint(detail, styleDim, options) + "\n")
 	}
 }
 

@@ -145,6 +145,10 @@ func (adapter Adapter) Fetcher(credentials Credentials) provider.Fetcher {
 	return credentialFetcher{adapter: adapter, credentials: credentials}
 }
 
+func (fetcher credentialFetcher) Enrollment() provider.Enrollment {
+	return provider.Enrollment{Plan: fetcher.credentials.Plan(), RefreshTokenExpiresAt: fetcher.credentials.RefreshTokenExpiry()}
+}
+
 func (fetcher credentialFetcher) FetchUsage(ctx context.Context) (provider.Usage, error) {
 	return fetcher.adapter.FetchUsage(ctx, fetcher.credentials)
 }
@@ -175,13 +179,7 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 	if err != nil {
 		return provider.Usage{}, fmt.Errorf("read Claude usage response; retry the command: %w: %w", err, ErrUsage)
 	}
-	usage, err := parseUsage(body)
-	if err != nil {
-		return provider.Usage{}, err
-	}
-	usage.Plan = credentials.Plan()
-	usage.RefreshTokenExpiresAt = credentials.RefreshTokenExpiry()
-	return usage, nil
+	return parseUsage(body)
 }
 
 // FetchProfile returns the account that owns the supplied live access token.

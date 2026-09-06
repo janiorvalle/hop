@@ -72,7 +72,7 @@ type account struct {
 	Name     string
 	Active   bool
 	Disabled bool
-	Fetcher  provider.Fetcher
+	Source   provider.Source
 }
 
 type catalog interface {
@@ -89,7 +89,7 @@ type vaultCatalog struct {
 	now           func() time.Time
 }
 
-type claudeSlotFetcher struct {
+type claudeSlotSource struct {
 	adapter        claude.Adapter
 	store          claude.Store
 	refreshAllowed bool
@@ -97,7 +97,7 @@ type claudeSlotFetcher struct {
 	now            func() time.Time
 }
 
-type codexSlotFetcher struct {
+type codexSlotSource struct {
 	adapter        codex.Adapter
 	store          codex.Store
 	refreshAllowed bool
@@ -105,15 +105,15 @@ type codexSlotFetcher struct {
 	now            func() time.Time
 }
 
-type claudeLiveFetcher struct {
+type claudeLiveSource struct {
 	adapter claude.Adapter
 	store   claudeLiveStore
 }
-type codexLiveFetcher struct {
+type codexLiveSource struct {
 	adapter codex.Adapter
 	store   codexLiveStore
 }
-type failingFetcher struct{ err error }
+type failingSource struct{ err error }
 
 func defaultCatalog() (catalog, error) {
 	accountVault, err := defaultVault()
@@ -179,11 +179,11 @@ func (catalog vaultCatalog) account(providerName provider.Name, name string) acc
 	isActive = isActive && activeName == name
 	credentialsPath, err := catalog.vault.CredentialsPath(string(providerName), name)
 	if err != nil {
-		return account{Provider: providerName, Name: name, Active: isActive, Fetcher: failingFetcher{err: err}}
+		return account{Provider: providerName, Name: name, Active: isActive, Source: failingSource{err: err}}
 	}
 	metadata, err := loadSlotMetadata(filepath.Dir(credentialsPath))
 	if err != nil {
-		return account{Provider: providerName, Name: name, Active: isActive, Fetcher: failingFetcher{err: err}}
+		return account{Provider: providerName, Name: name, Active: isActive, Source: failingSource{err: err}}
 	}
 	if metadata.Disabled {
 		return account{Provider: providerName, Name: name, Active: isActive, Disabled: true}
@@ -191,25 +191,25 @@ func (catalog vaultCatalog) account(providerName provider.Name, name string) acc
 	if isActive {
 		// Live credentials belong to the provider CLI. A glance may read them,
 		// but only that CLI may rotate and persist its live refresh token.
-		return account{Provider: providerName, Name: name, Active: true, Fetcher: catalog.liveFetcher(providerName)}
+		return account{Provider: providerName, Name: name, Active: true, Source: catalog.liveSource(providerName)}
 	}
 	return account{
 		Provider: providerName,
 		Name:     name,
-		Fetcher:  catalog.slotFetcher(providerName, name, credentialsPath, metadata.RefreshPolicy == managedRefreshPolicy),
+		Source:   catalog.slotSource(providerName, name, credentialsPath, metadata.RefreshPolicy == managedRefreshPolicy),
 	}
 }
 
-func (catalog vaultCatalog) liveFetcher(providerName provider.Name) provider.Fetcher {
+func (catalog vaultCatalog) liveSource(providerName provider.Name) provider.Source {
 	if providerName == provider.Claude {
-		return claudeLiveFetcher{adapter: catalog.claudeAdapter, store: catalog.claudeLive}
+		return claudeLiveSource{adapter: catalog.claudeAdapter, store: catalog.claudeLive}
 	}
-	return codexLiveFetcher{adapter: catalog.codexAdapter, store: catalog.codexLive}
+	return codexLiveSource{adapter: catalog.codexAdapter, store: catalog.codexLive}
 }
 
-func (catalog vaultCatalog) slotFetcher(providerName provider.Name, name, credentialsPath string, refreshAllowed bool) provider.Fetcher {
+func (catalog vaultCatalog) slotSource(providerName provider.Name, name, credentialsPath string, refreshAllowed bool) provider.Source {
 	if providerName == provider.Claude {
-		return claudeSlotFetcher{
+		return claudeSlotSource{
 			adapter:        catalog.claudeAdapter,
 			store:          claude.FileStore{Path: credentialsPath},
 			refreshAllowed: refreshAllowed,
@@ -217,7 +217,7 @@ func (catalog vaultCatalog) slotFetcher(providerName provider.Name, name, creden
 			now:            catalog.now,
 		}
 	}
-	return codexSlotFetcher{
+	return codexSlotSource{
 		adapter:        catalog.codexAdapter,
 		store:          codex.FileStore{Path: credentialsPath},
 		refreshAllowed: refreshAllowed,
@@ -310,64 +310,64 @@ func writeSlotMetadata(slotPath string, metadata slotMetadata) error {
 	return nil
 }
 
-func (fetcher claudeSlotFetcher) FetchUsage(ctx context.Context) (provider.Usage, error) {
-	credentials, err := fetcher.store.Read()
+func (source claudeSlotSource) Open(context.Context) (provider.Fetcher, error) {
+	credentials, err := source.store.Read()
 	if err != nil {
-		return provider.Usage{}, err
+		return nil, err
 	}
-	return fetcher.adapter.FetchUsage(ctx, credentials)
+	return source.adapter.Fetcher(credentials), nil
 }
 
-func (fetcher codexSlotFetcher) FetchUsage(ctx context.Context) (provider.Usage, error) {
-	credentials, err := fetcher.store.Read()
+func (source codexSlotSource) Open(context.Context) (provider.Fetcher, error) {
+	credentials, err := source.store.Read()
 	if err != nil {
-		return provider.Usage{}, err
+		return nil, err
 	}
-	return fetcher.adapter.FetchUsage(ctx, credentials)
+	return source.adapter.Fetcher(credentials), nil
 }
 
-func (fetcher claudeSlotFetcher) Prepare(ctx context.Context) error {
-	if !fetcher.refreshAllowed {
+func (source claudeSlotSource) Prepare(ctx context.Context) error {
+	if !source.refreshAllowed {
 		return nil
 	}
-	credentials, err := fetcher.store.Read()
-	if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
+	credentials, err := source.store.Read()
+	if err != nil || !slotNeedsRotation(credentials, source.now()) {
 		return err
 	}
-	_, err = fetcher.refresh(ctx)
+	_, err = source.refresh(ctx)
 	if errors.Is(err, errSlotBecameActive) {
 		return nil
 	}
-	return rotationErrorFor(credentials, fetcher.now(), err)
+	return rotationErrorFor(credentials, source.now(), err)
 }
 
-func (fetcher codexSlotFetcher) Prepare(ctx context.Context) error {
-	if !fetcher.refreshAllowed {
+func (source codexSlotSource) Prepare(ctx context.Context) error {
+	if !source.refreshAllowed {
 		return nil
 	}
-	credentials, err := fetcher.store.Read()
-	if err != nil || !slotNeedsRotation(credentials, fetcher.now()) {
+	credentials, err := source.store.Read()
+	if err != nil || !slotNeedsRotation(credentials, source.now()) {
 		return err
 	}
-	_, err = fetcher.refresh(ctx)
+	_, err = source.refresh(ctx)
 	if errors.Is(err, errSlotBecameActive) {
 		return nil
 	}
-	return rotationErrorFor(credentials, fetcher.now(), err)
+	return rotationErrorFor(credentials, source.now(), err)
 }
 
-func (fetcher claudeSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
-	if !fetcher.refreshAllowed {
+func (source claudeSlotSource) Rotate(ctx context.Context) (rotation, error) {
+	if !source.refreshAllowed {
 		return rotation{Outcome: rotationUnmanaged}, nil
 	}
-	credentials, err := fetcher.store.Read()
+	credentials, err := source.store.Read()
 	if err != nil {
 		return rotation{}, err
 	}
-	if !slotNeedsRotation(credentials, fetcher.now()) {
+	if !slotNeedsRotation(credentials, source.now()) {
 		return rotation{Outcome: rotationFresh, RefreshTokenExpiry: credentials.RefreshTokenExpiry()}, nil
 	}
-	rotated, err := fetcher.refresh(ctx)
+	rotated, err := source.refresh(ctx)
 	if errors.Is(err, errSlotBecameActive) {
 		return rotation{Outcome: rotationBecameActive}, nil
 	}
@@ -377,18 +377,18 @@ func (fetcher claudeSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
 	return rotation{Outcome: rotationRotated, RefreshTokenExpiry: rotated.RefreshTokenExpiry()}, nil
 }
 
-func (fetcher codexSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
-	if !fetcher.refreshAllowed {
+func (source codexSlotSource) Rotate(ctx context.Context) (rotation, error) {
+	if !source.refreshAllowed {
 		return rotation{Outcome: rotationUnmanaged}, nil
 	}
-	credentials, err := fetcher.store.Read()
+	credentials, err := source.store.Read()
 	if err != nil {
 		return rotation{}, err
 	}
-	if !slotNeedsRotation(credentials, fetcher.now()) {
+	if !slotNeedsRotation(credentials, source.now()) {
 		return rotation{Outcome: rotationFresh, RefreshTokenExpiry: credentials.RefreshTokenExpiry()}, nil
 	}
-	rotated, err := fetcher.refresh(ctx)
+	rotated, err := source.refresh(ctx)
 	if errors.Is(err, errSlotBecameActive) {
 		return rotation{Outcome: rotationBecameActive}, nil
 	}
@@ -398,8 +398,8 @@ func (fetcher codexSlotFetcher) Rotate(ctx context.Context) (rotation, error) {
 	return rotation{Outcome: rotationRotated, RefreshTokenExpiry: rotated.RefreshTokenExpiry()}, nil
 }
 
-func (fetcher failingFetcher) Rotate(context.Context) (rotation, error) {
-	return rotation{}, fetcher.err
+func (source failingSource) Rotate(context.Context) (rotation, error) {
+	return rotation{}, source.err
 }
 
 // A rotation that only ran early, while the access token still works and the
@@ -431,7 +431,7 @@ func refreshTokenSeverity(expiry, now time.Time) string {
 	}
 }
 
-func (fetcher claudeSlotFetcher) refresh(ctx context.Context) (claude.Credentials, error) {
+func (fetcher claudeSlotSource) refresh(ctx context.Context) (claude.Credentials, error) {
 	if fileStore, ok := fetcher.store.(claude.FileStore); ok {
 		release, err := acquireRefreshLock(ctx, filepath.Dir(fileStore.Path))
 		if err != nil {
@@ -471,7 +471,7 @@ func refuseIfSlotBecameActive(becameActive func() (bool, error)) error {
 	return nil
 }
 
-func (fetcher codexSlotFetcher) refresh(ctx context.Context) (codex.Credentials, error) {
+func (fetcher codexSlotSource) refresh(ctx context.Context) (codex.Credentials, error) {
 	if fileStore, ok := fetcher.store.(codex.FileStore); ok {
 		release, err := acquireRefreshLock(ctx, filepath.Dir(fileStore.Path))
 		if err != nil {
@@ -647,22 +647,22 @@ func acquireStateLock(ctx context.Context, root string) (func(), error) {
 	}
 }
 
-func (fetcher claudeLiveFetcher) FetchUsage(ctx context.Context) (provider.Usage, error) {
-	credentials, err := fetcher.store.Read(ctx)
+func (source claudeLiveSource) Open(ctx context.Context) (provider.Fetcher, error) {
+	credentials, err := source.store.Read(ctx)
 	if err != nil {
-		return provider.Usage{}, err
+		return nil, err
 	}
-	return fetcher.adapter.FetchUsage(ctx, credentials)
+	return source.adapter.Fetcher(credentials), nil
 }
 
-func (fetcher codexLiveFetcher) FetchUsage(ctx context.Context) (provider.Usage, error) {
-	credentials, err := fetcher.store.Read()
+func (source codexLiveSource) Open(context.Context) (provider.Fetcher, error) {
+	credentials, err := source.store.Read()
 	if err != nil {
-		return provider.Usage{}, err
+		return nil, err
 	}
-	return fetcher.adapter.FetchUsage(ctx, credentials)
+	return source.adapter.Fetcher(credentials), nil
 }
 
-func (fetcher failingFetcher) FetchUsage(context.Context) (provider.Usage, error) {
-	return provider.Usage{}, fetcher.err
+func (source failingSource) Open(context.Context) (provider.Fetcher, error) {
+	return nil, source.err
 }
