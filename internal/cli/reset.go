@@ -226,11 +226,11 @@ func (resetter codexResetter) slotCredentials(ctx context.Context, accountName s
 	if err != nil || !credentials.NeedsRefresh(resetter.now(), refreshSkew) {
 		return credentials, err
 	}
-	refreshAllowed, err := slotAllowsRefresh(filepath.Dir(store.Path))
+	metadata, err := loadSlotMetadata(filepath.Dir(store.Path))
 	if err != nil {
 		return codex.Credentials{}, err
 	}
-	if !refreshAllowed {
+	if metadata.RefreshPolicy != managedRefreshPolicy {
 		return codex.Credentials{}, fmt.Errorf("its access token has expired and hop does not manage this slot's refresh token; run 'hop login codex %s' and retry", accountName)
 	}
 	return refreshCodexFileSlot(ctx, resetter.adapter, store)
