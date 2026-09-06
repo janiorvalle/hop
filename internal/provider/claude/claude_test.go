@@ -143,13 +143,42 @@ func TestCredentialFetcherImplementsSharedContract(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	fetcher := New(Config{UsageURL: server.URL}).Fetcher(Credentials{AccessToken: "access"})
+	fetcher := New(Config{UsageURL: server.URL}).Fetcher(Credentials{AccessToken: "access", RateLimitTier: "default_claude_max_5x"})
 	usage, err := fetcher.FetchUsage(context.Background())
 	if err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
 	if usage.Provider != provider.Claude {
 		t.Errorf("Provider = %q, want claude", usage.Provider)
+	}
+	if usage.Plan != "Max 5x" {
+		t.Errorf("Plan = %q, want Max 5x from the stored rate limit tier", usage.Plan)
+	}
+}
+
+func TestPlanLabelsTierAndFallsBackToSubscriptionType(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		credentials Credentials
+		want        string
+	}{
+		{name: "max 5x tier", credentials: Credentials{RateLimitTier: "default_claude_max_5x", SubscriptionType: "max"}, want: "Max 5x"},
+		{name: "max 20x tier", credentials: Credentials{RateLimitTier: "default_claude_max_20x", SubscriptionType: "max"}, want: "Max 20x"},
+		{name: "pro tier", credentials: Credentials{RateLimitTier: "default_claude_pro", SubscriptionType: "pro"}, want: "Pro"},
+		{name: "missing tier uses subscription type", credentials: Credentials{SubscriptionType: "team"}, want: "Team"},
+		{name: "unknown tier shows raw value", credentials: Credentials{RateLimitTier: "default_claude_max_50x", SubscriptionType: "max"}, want: "default_claude_max_50x"},
+		{name: "unknown subscription type shows raw value", credentials: Credentials{SubscriptionType: "founder"}, want: "founder"},
+		{name: "nothing stored", credentials: Credentials{}, want: ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := testCase.credentials.Plan(); got != testCase.want {
+				t.Errorf("Plan() = %q, want %q", got, testCase.want)
+			}
+		})
 	}
 }
 

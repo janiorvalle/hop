@@ -51,6 +51,30 @@ type Profile struct {
 	Email       string
 }
 
+var planLabels = map[string]string{
+	"default_claude_pro":     "Pro",
+	"default_claude_max_5x":  "Max 5x",
+	"default_claude_max_20x": "Max 20x",
+	"free":                   "Free",
+	"pro":                    "Pro",
+	"max":                    "Max",
+	"team":                   "Team",
+	"enterprise":             "Enterprise",
+}
+
+// Plan names the subscription the way Anthropic sells it, from the rate limit
+// tier when the envelope carries one and the subscription type otherwise.
+func (credentials Credentials) Plan() string {
+	identifier := credentials.RateLimitTier
+	if identifier == "" {
+		identifier = credentials.SubscriptionType
+	}
+	if label, ok := planLabels[identifier]; ok {
+		return label
+	}
+	return identifier
+}
+
 // Store reads and writes credentials in a hop-owned account slot.
 type Store interface {
 	Read() (Credentials, error)
@@ -152,6 +176,7 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 	if err != nil {
 		return provider.Usage{}, err
 	}
+	usage.Plan = credentials.Plan()
 	return usage, nil
 }
 
