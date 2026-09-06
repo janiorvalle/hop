@@ -1,4 +1,4 @@
-// Package claude reads Claude credentials, refreshes slot tokens, and fetches usage.
+// Package claude signs Claude accounts in, reads Claude credentials, refreshes slot tokens, and fetches usage.
 package claude
 
 import (
@@ -45,10 +45,37 @@ type Credentials struct {
 	Scopes                []string `json:"scopes,omitempty"`
 }
 
-// Profile identifies the Claude account that owns an OAuth access token.
+// Profile identifies the Claude account that owns an OAuth access token and
+// names its plan the way the credential envelope's subscriptionType does, or
+// leaves it blank when the profile did not report one.
 type Profile struct {
-	AccountUUID string
-	Email       string
+	AccountUUID      string
+	Email            string
+	SubscriptionType string
+}
+
+var planLabels = map[string]string{
+	"default_claude_pro":     "Pro",
+	"default_claude_max_5x":  "Max 5x",
+	"default_claude_max_20x": "Max 20x",
+	"free":                   "Free",
+	"pro":                    "Pro",
+	"max":                    "Max",
+	"team":                   "Team",
+	"enterprise":             "Enterprise",
+}
+
+// Plan names the subscription the way Anthropic sells it, from the rate limit
+// tier when the envelope carries one and the subscription type otherwise.
+func (credentials Credentials) Plan() string {
+	identifier := credentials.RateLimitTier
+	if identifier == "" {
+		identifier = credentials.SubscriptionType
+	}
+	if label, ok := planLabels[identifier]; ok {
+		return label
+	}
+	return identifier
 }
 
 // Store reads and writes credentials in a hop-owned account slot.
@@ -118,6 +145,10 @@ func (adapter Adapter) Fetcher(credentials Credentials) provider.Fetcher {
 	return credentialFetcher{adapter: adapter, credentials: credentials}
 }
 
+func (fetcher credentialFetcher) Enrollment() provider.Enrollment {
+	return provider.Enrollment{Plan: fetcher.credentials.Plan(), RefreshTokenExpiresAt: fetcher.credentials.RefreshTokenExpiry()}
+}
+
 func (fetcher credentialFetcher) FetchUsage(ctx context.Context) (provider.Usage, error) {
 	return fetcher.adapter.FetchUsage(ctx, fetcher.credentials)
 }
@@ -148,11 +179,7 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 	if err != nil {
 		return provider.Usage{}, fmt.Errorf("read Claude usage response; retry the command: %w: %w", err, ErrUsage)
 	}
-	usage, err := parseUsage(body)
-	if err != nil {
-		return provider.Usage{}, err
-	}
-	return usage, nil
+	return parseUsage(body)
 }
 
 // FetchProfile returns the account that owns the supplied live access token.
@@ -183,8 +210,9 @@ func (adapter Adapter) FetchProfile(ctx context.Context, credentials Credentials
 		return Profile{}, fmt.Errorf("decode Claude profile response; retry the command: %w: %w", err, ErrProfile)
 	}
 	profile := Profile{
-		AccountUUID: strings.TrimSpace(responseProfile.Account.UUID),
-		Email:       strings.TrimSpace(responseProfile.Account.Email),
+		AccountUUID:      strings.TrimSpace(responseProfile.Account.UUID),
+		Email:            strings.TrimSpace(responseProfile.Account.Email),
+		SubscriptionType: responseProfile.subscriptionType(),
 	}
 	if profile.AccountUUID == "" || profile.Email == "" {
 		return Profile{}, fmt.Errorf("claude profile omitted account.uuid or account.email; retry with a refreshed Claude login: %w", ErrProfile)
@@ -237,10 +265,10 @@ func (adapter Adapter) Refresh(ctx context.Context, store Store) (Credentials, e
 
 	credentials.AccessToken = refreshed.AccessToken
 	credentials.RefreshToken = refreshed.RefreshToken
-	credentials.ExpiresAt = adapter.now().Add(time.Duration(refreshed.ExpiresIn) * time.Second).UnixMilli()
-	if refreshed.RefreshTokenExpiresIn > 0 {
-		credentials.RefreshTokenExpiresAt = adapter.now().Add(time.Duration(refreshed.RefreshTokenExpiresIn) * time.Second).UnixMilli()
-	}
+	// The old refresh token is gone with this rotation, so its expiry must not
+	// survive it: a stale value would rotate this slot on every glance.
+	credentials.ExpiresAt = expiryMilli(adapter.now(), refreshed.ExpiresIn)
+	credentials.RefreshTokenExpiresAt = expiryMilli(adapter.now(), refreshed.RefreshTokenExpiresIn)
 	if err := store.Write(credentials); err != nil {
 		return credentials, fmt.Errorf("save rotated Claude tokens; the returned credentials are the recovery copy and must be saved before retrying: %w: %w", err, ErrRefresh)
 	}
@@ -250,6 +278,21 @@ func (adapter Adapter) Refresh(ctx context.Context, store Store) (Credentials, e
 // NeedsRefresh reports whether an access token expires within skew.
 func (credentials Credentials) NeedsRefresh(now time.Time, skew time.Duration) bool {
 	return credentials.ExpiresAt <= now.Add(skew).UnixMilli()
+}
+
+// RefreshTokenExpiry is when the refresh token stops working, or zero when unknown.
+func (credentials Credentials) RefreshTokenExpiry() time.Time {
+	if credentials.RefreshTokenExpiresAt <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(credentials.RefreshTokenExpiresAt).UTC()
+}
+
+func expiryMilli(now time.Time, lifetimeSeconds int64) int64 {
+	if lifetimeSeconds <= 0 {
+		return 0
+	}
+	return now.Add(time.Duration(lifetimeSeconds) * time.Second).UnixMilli()
 }
 
 // HasScope reports whether Anthropic granted a named OAuth scope.
@@ -277,9 +320,44 @@ type refreshResponse struct {
 
 type profileResponse struct {
 	Account struct {
-		UUID  string `json:"uuid"`
-		Email string `json:"email"`
+		UUID         string `json:"uuid"`
+		Email        string `json:"email"`
+		HasClaudeMax *bool  `json:"has_claude_max"`
+		HasClaudePro *bool  `json:"has_claude_pro"`
 	} `json:"account"`
+	Organization struct {
+		Type               string `json:"organization_type"`
+		SubscriptionStatus string `json:"subscription_status"`
+	} `json:"organization"`
+}
+
+// subscriptionTypeRules run in order because one profile can satisfy several:
+// the first match names the plan, the way CLIProxyAPI reads the same payload.
+var subscriptionTypeRules = []struct {
+	subscriptionType string
+	applies          func(profileResponse) bool
+}{
+	{"max", func(profile profileResponse) bool { return flagSet(profile.Account.HasClaudeMax) }},
+	{"pro", func(profile profileResponse) bool { return flagSet(profile.Account.HasClaudePro) }},
+	{"team", func(profile profileResponse) bool {
+		return strings.EqualFold(profile.Organization.Type, "claude_team") && strings.EqualFold(profile.Organization.SubscriptionStatus, "active")
+	}},
+	{"free", func(profile profileResponse) bool {
+		return profile.Account.HasClaudeMax != nil && profile.Account.HasClaudePro != nil
+	}},
+}
+
+func (profile profileResponse) subscriptionType() string {
+	for _, rule := range subscriptionTypeRules {
+		if rule.applies(profile) {
+			return rule.subscriptionType
+		}
+	}
+	return ""
+}
+
+func flagSet(flag *bool) bool {
+	return flag != nil && *flag
 }
 
 type usageResponse struct {

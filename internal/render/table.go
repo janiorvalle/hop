@@ -39,15 +39,27 @@ type Problem struct {
 	Action  string
 }
 
+// TokenExpiry warns that the refresh token behind a row is near the end of its life.
+type TokenExpiry struct {
+	ExpiresAt time.Time
+	Severity  string
+	Action    string
+}
+
+var expiryStyles = map[string]string{"warning": styleAmber, "critical": styleRed}
+
 // Row is one account in the rendered glance.
 type Row struct {
-	Provider provider.Name
-	Account  string
-	Active   bool
-	Plan     string
-	Windows  []provider.Window
-	Limits   []provider.Limit
-	Problem  *Problem
+	Provider           provider.Name
+	Account            string
+	Active             bool
+	Disabled           bool
+	Plan               string
+	Windows            []provider.Window
+	Limits             []provider.Limit
+	ResetCredits       provider.ResetCredits
+	Problem            *Problem
+	RefreshTokenExpiry *TokenExpiry
 }
 
 // Options controls terminal capabilities without tying rendering to os.Stdout.
@@ -63,9 +75,12 @@ type Options struct {
 // The glance answers "which account can I use right now": every percentage is
 // capacity LEFT (100 - used), the headline is the headroom at the tightest
 // binding limit, and accounts sort most-usable first with error rows last.
+// NoAccountsEnrolled is the whole output of any account listing before the first login.
+const NoAccountsEnrolled = "No accounts enrolled. Run 'hop login claude work' or 'hop login codex work'.\n"
+
 func Table(writer io.Writer, rows []Row, options Options) error {
 	if len(rows) == 0 {
-		_, err := io.WriteString(writer, "No accounts enrolled. Run 'hop login claude work' or 'hop login codex work'.\n")
+		_, err := io.WriteString(writer, NoAccountsEnrolled)
 		return err
 	}
 	if options.Width <= 0 {
@@ -174,8 +189,8 @@ func newSection(rows []Row) section {
 	copy(sorted, rows)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		left, right := sorted[i], sorted[j]
-		if (left.Problem == nil) != (right.Problem == nil) {
-			return left.Problem == nil
+		if rowRank(left) != rowRank(right) {
+			return rowRank(left) < rowRank(right)
 		}
 		return headroomPercent(left) > headroomPercent(right)
 	})
@@ -186,26 +201,29 @@ func newSection(rows []Row) section {
 	dataRows := 0
 	fiveHourCap := false
 	for _, row := range sorted {
+		if row.Disabled {
+			continue
+		}
+		plans[row.Plan] = true
 		if row.Problem != nil {
 			continue
 		}
 		dataRows++
-		plans[row.Plan] = true
 		if _, ok := findWindow(row.Windows, provider.FiveHour); ok {
 			built.showFiveHour = true
 		}
 		if _, ok := findWindow(row.Windows, provider.Weekly); ok {
 			built.showWeekly = true
 		}
-		for _, limit := range activeLimits(row) {
+		for _, limit := range scopedLimits(row) {
 			built.showBinding = true
-			scopes[scopeLabel(limit.Scope)+" / "+limitKindLabel(limit.Kind)] = true
+			scopes[limitHeader(limit)] = true
 			if strings.Contains(limit.Kind, "five_hour") {
 				fiveHourCap = true
 			}
 		}
 	}
-	if dataRows > 0 && len(plans) == 1 && !plans[""] {
+	if len(plans) == 1 && !plans[""] {
 		for plan := range plans {
 			built.hoisted = append(built.hoisted, plan)
 		}
@@ -226,6 +244,19 @@ func newSection(rows []Row) section {
 		built.uniformScope = true
 	}
 	return built
+}
+
+// rowRank orders usable accounts first, then errors that need a hand, then
+// accounts parked on purpose.
+func rowRank(row Row) int {
+	switch {
+	case row.Disabled:
+		return 2
+	case row.Problem != nil:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func writeSectionTitle(out *strings.Builder, built section, options Options) {
@@ -280,17 +311,27 @@ func writeWideSection(out *strings.Builder, built section, options Options) {
 	for index, row := range built.rows {
 		out.WriteString(wideLine(row, cellsByRow[index], widths, options))
 		if row.Problem != nil {
-			writeGuidance(out, row.Problem, options)
+			writeProblemGuidance(out, row.Problem, options)
 		}
+		writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
 	}
 }
 
-// wideCells builds one row's column values in header order; error rows fill
-// only the account and headroom columns.
+// wideCells builds one row's column values in header order. An error row
+// leaves everything it does not know blank, because ERROR already says why,
+// and keeps the plan its credentials named.
 func wideCells(row Row, built section, options Options) []string {
 	name := shorten(row.Account, maxNameRunes, options.Plain)
+	if row.Disabled {
+		return []string{name, fmt.Sprintf("%*s", headroomCellWidth, "disabled")}
+	}
 	if row.Problem != nil {
-		return []string{name, fmt.Sprintf("%*s", headroomCellWidth, "ERROR")}
+		cells := []string{name, fmt.Sprintf("%*s", headroomCellWidth, "ERROR")}
+		if built.showPlan && row.Plan != "" {
+			cells = append(cells, make([]string, built.usageColumns())...)
+			cells = append(cells, planCell(row.Plan, options))
+		}
+		return cells
 	}
 	cells := []string{name, fmt.Sprintf("%3d%% LEFT", headroomPercent(row))}
 	if built.showFiveHour {
@@ -308,6 +349,16 @@ func wideCells(row Row, built section, options Options) []string {
 	return cells
 }
 
+func (built section) usageColumns() int {
+	count := 0
+	for _, shown := range []bool{built.showFiveHour, built.showWeekly, built.showBinding} {
+		if shown {
+			count++
+		}
+	}
+	return count
+}
+
 func wideLine(row Row, cells []string, widths []int, options Options) string {
 	line := rowPrefix(row, options)
 	for column, cell := range cells {
@@ -320,7 +371,7 @@ func wideLine(row Row, cells []string, widths []int, options Options) string {
 		}
 		line += paint(padded, cellStyle(row, column), options)
 	}
-	for _, extra := range extraLimitCells(row, options) {
+	for _, extra := range trailingCells(row, options) {
 		line += columnGap + paint(extra, styleDim, options)
 	}
 	return strings.TrimRight(line, " ") + "\n"
@@ -338,11 +389,21 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 
 	for _, row := range built.rows {
 		name := padCell(shorten(row.Account, maxNameRunes, options.Plain), nameWidth, false)
+		if row.Disabled {
+			line := name + "  " + fmt.Sprintf("%*s", headroomCellWidth, "disabled")
+			if row.Active {
+				line += "  ACTIVE"
+			}
+			out.WriteString(rowPrefix(row, options) + paint(line, styleDim, options) + "\n")
+			continue
+		}
 		if row.Problem != nil {
 			line := rowPrefix(row, options) + name + "  " +
 				paint(fmt.Sprintf("%*s", headroomCellWidth, "ERROR"), styleRed, options)
 			out.WriteString(strings.TrimRight(line, " ") + "\n")
-			writeGuidance(out, row.Problem, options)
+			writeNarrowDetail(out, row, built.showPlan, options)
+			writeProblemGuidance(out, row.Problem, options)
+			writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
 			continue
 		}
 		headroom := fmt.Sprintf("%3d%% LEFT", headroomPercent(row))
@@ -352,10 +413,15 @@ func writeNarrowSection(out *strings.Builder, built section, options Options) {
 			line += paint("  ACTIVE", styleBold, options)
 		}
 		out.WriteString(line + "\n")
-		parts := narrowDetailParts(row, built.showPlan, options)
-		for _, detail := range flow(parts, " "+midDot(options)+" ", options.Width-len(guidanceIndent)) {
-			out.WriteString(guidanceIndent + paint(detail, styleDim, options) + "\n")
-		}
+		writeNarrowDetail(out, row, built.showPlan, options)
+		writeExpiryGuidance(out, row.RefreshTokenExpiry, options)
+	}
+}
+
+func writeNarrowDetail(out *strings.Builder, row Row, showPlan bool, options Options) {
+	parts := narrowDetailParts(row, showPlan, options)
+	for _, detail := range flow(parts, " "+midDot(options)+" ", options.Width-len(guidanceIndent)) {
+		out.WriteString(guidanceIndent + paint(detail, styleDim, options) + "\n")
 	}
 }
 
@@ -367,11 +433,14 @@ func narrowDetailParts(row Row, showPlan bool, options Options) []string {
 	if window, ok := findWindow(row.Windows, provider.Weekly); ok {
 		parts = append(parts, "week "+narrowValue(window.UsedPercent, window.ResetsAt, options))
 	}
-	for _, limit := range activeLimits(row) {
-		parts = append(parts, scopeLabel(limit.Scope)+"*"+limitKindTag(limit.Kind)+" "+narrowValue(limit.UsedPercent, limit.ResetsAt, options))
+	for _, limit := range scopedLimits(row) {
+		parts = append(parts, scopeLabel(limit.Scope)+"*"+limitTag(limit)+" "+narrowValue(limit.UsedPercent, limit.ResetsAt, options))
 	}
 	if showPlan && row.Plan != "" {
 		parts = append(parts, row.Plan)
+	}
+	if row.ResetCredits.Count > 0 {
+		parts = append(parts, resetCreditsLabel(row.ResetCredits, ", ", options))
 	}
 	return parts
 }
@@ -381,17 +450,35 @@ func narrowValue(usedPercent float64, resetsAt time.Time, options Options) strin
 	if resetsAt.IsZero() {
 		return value
 	}
-	return value + "/" + countdown(options.Now, resetsAt)
+	return value + "/" + Countdown(options.Now, resetsAt)
 }
 
-func writeGuidance(out *strings.Builder, problem *Problem, options Options) {
-	text := strings.TrimSpace(problem.Message + " " + problem.Action)
+func writeProblemGuidance(out *strings.Builder, problem *Problem, options Options) {
+	writeGuidance(out, strings.TrimSpace(problem.Message+" "+problem.Action), styleRed, options)
+}
+
+func writeExpiryGuidance(out *strings.Builder, expiry *TokenExpiry, options Options) {
+	if expiry == nil {
+		return
+	}
+	style, warned := expiryStyles[expiry.Severity]
+	if !warned {
+		return
+	}
+	notice := "Refresh token has expired."
+	if expiry.ExpiresAt.After(options.Now) {
+		notice = fmt.Sprintf("Refresh token expires in %s.", Countdown(options.Now, expiry.ExpiresAt))
+	}
+	writeGuidance(out, notice+" "+expiry.Action, style, options)
+}
+
+func writeGuidance(out *strings.Builder, text, style string, options Options) {
 	width := options.Width
 	if width > maxGuidanceWidth {
 		width = maxGuidanceWidth
 	}
 	for _, line := range wrap(text, width-len(guidanceIndent)) {
-		out.WriteString(guidanceIndent + paint(line, styleRed, options) + "\n")
+		out.WriteString(guidanceIndent + paint(line, style, options) + "\n")
 	}
 }
 
@@ -399,6 +486,9 @@ func rowPrefix(row Row, options Options) string {
 	marker := " "
 	if row.Active {
 		marker = ">"
+	}
+	if row.Disabled {
+		return marker + "   "
 	}
 	if row.Problem != nil {
 		return marker + " " + paint("!", styleRed, options) + " "
@@ -408,6 +498,9 @@ func rowPrefix(row Row, options Options) string {
 }
 
 func cellStyle(row Row, column int) string {
+	if row.Disabled {
+		return styleDim
+	}
 	if column == 0 {
 		return ""
 	}
@@ -429,13 +522,13 @@ func windowCell(row Row, kind provider.WindowKind, options Options) string {
 	if window.ResetsAt.IsZero() {
 		return cell
 	}
-	return cell + " " + midDot(options) + " " + countdown(options.Now, window.ResetsAt)
+	return cell + " " + midDot(options) + " " + Countdown(options.Now, window.ResetsAt)
 }
 
-// bindingCell shows the tightest active model-scoped limit; the scope name is
+// bindingCell shows the tightest model-scoped limit; the scope name is
 // omitted when the section header already carries it.
 func bindingCell(row Row, uniformScope bool, options Options) string {
-	limits := activeLimits(row)
+	limits := scopedLimits(row)
 	if len(limits) == 0 {
 		return dash(options)
 	}
@@ -447,18 +540,18 @@ func bindingCell(row Row, uniformScope bool, options Options) string {
 	}
 	cell := fmt.Sprintf("%3d%%", leftPercent(tightest.UsedPercent))
 	if !tightest.ResetsAt.IsZero() {
-		cell += " " + midDot(options) + " " + countdown(options.Now, tightest.ResetsAt)
+		cell += " " + midDot(options) + " " + Countdown(options.Now, tightest.ResetsAt)
 	}
 	if uniformScope {
 		return cell
 	}
-	return scopeLabel(tightest.Scope) + limitKindTag(tightest.Kind) + " " + cell
+	return scopeLabel(tightest.Scope) + limitTag(tightest) + " " + cell
 }
 
-// extraLimitCells renders active limits beyond the tightest so a row with
+// extraLimitCells renders scoped limits beyond the tightest so a row with
 // several model caps still loses nothing in the wide layout.
 func extraLimitCells(row Row, options Options) []string {
-	limits := activeLimits(row)
+	limits := scopedLimits(row)
 	if len(limits) < 2 {
 		return nil
 	}
@@ -473,13 +566,35 @@ func extraLimitCells(row Row, options Options) []string {
 		if index == tightest {
 			continue
 		}
-		cell := fmt.Sprintf("%s%s %d%%", scopeLabel(limit.Scope), limitKindTag(limit.Kind), leftPercent(limit.UsedPercent))
+		cell := fmt.Sprintf("%s%s %d%%", scopeLabel(limit.Scope), limitTag(limit), leftPercent(limit.UsedPercent))
 		if !limit.ResetsAt.IsZero() {
-			cell += " " + midDot(options) + " " + countdown(options.Now, limit.ResetsAt)
+			cell += " " + midDot(options) + " " + Countdown(options.Now, limit.ResetsAt)
 		}
 		cells = append(cells, cell)
 	}
 	return cells
+}
+
+// trailingCells hang off the end of a wide row without a column: the extra
+// scoped limits, then the manual resets an account still holds.
+func trailingCells(row Row, options Options) []string {
+	cells := extraLimitCells(row, options)
+	if row.ResetCredits.Count > 0 {
+		cells = append(cells, resetCreditsLabel(row.ResetCredits, " "+midDot(options)+" ", options))
+	}
+	return cells
+}
+
+func resetCreditsLabel(credits provider.ResetCredits, joiner string, options Options) string {
+	label, expires := fmt.Sprintf("%d resets", credits.Count), "next expires "
+	if credits.Count == 1 {
+		label, expires = "1 reset", "expires "
+	}
+	expiry, ok := credits.SoonestExpiry()
+	if !ok {
+		return label
+	}
+	return label + joiner + expires + Countdown(options.Now, expiry)
 }
 
 func planCell(plan string, options Options) string {
@@ -489,10 +604,13 @@ func planCell(plan string, options Options) string {
 	return "(" + plan + ")"
 }
 
-func activeLimits(row Row) []provider.Limit {
+// scopedLimits keeps every model-scoped limit, active or not: usage on an
+// inactive cap is still real capacity spent, and hiding it once masked an
+// account sitting at 98% used. Only headroomPercent binds on Active.
+func scopedLimits(row Row) []provider.Limit {
 	limits := make([]provider.Limit, 0, len(row.Limits))
 	for _, limit := range row.Limits {
-		if limit.Active && limit.Scope != "" {
+		if limit.Scope != "" {
 			limits = append(limits, limit)
 		}
 	}
@@ -551,6 +669,16 @@ func severityStyle(left int) string {
 	}
 }
 
+// limitHeader names a section's only scope once; an account-level window is
+// its own scope, so its duration is not repeated as a kind.
+func limitHeader(limit provider.Limit) string {
+	scope := scopeLabel(limit.Scope)
+	if kindDuration(limit.Kind) == scope {
+		return scope
+	}
+	return scope + " / " + limitKindLabel(limit.Kind)
+}
+
 func limitKindLabel(kind string) string {
 	if strings.Contains(kind, "five_hour") {
 		return "5 HOUR"
@@ -558,16 +686,30 @@ func limitKindLabel(kind string) string {
 	if strings.Contains(kind, "weekly") {
 		return "WEEKLY"
 	}
-	return strings.ToUpper(kind)
+	return strings.ToUpper(kindDuration(kind))
 }
 
-// limitKindTag marks a cap's window kind wherever no column header carries it;
-// weekly is the design's unmarked default.
-func limitKindTag(kind string) string {
-	if strings.Contains(kind, "five_hour") {
+// limitTag marks a cap's window kind wherever no column header carries it;
+// weekly is the design's unmarked default, and a scope that already names
+// its own duration is not marked twice.
+func limitTag(limit provider.Limit) string {
+	if strings.Contains(limit.Kind, "five_hour") {
 		return "(5h)"
 	}
-	return ""
+	duration := kindDuration(limit.Kind)
+	if duration == "" || duration == scopeLabel(limit.Scope) {
+		return ""
+	}
+	return "(" + duration + ")"
+}
+
+// kindDuration is the label a provider appends to a limit kind hop has no
+// fixed meter for, such as the 30d in account_30d or model_30d.
+func kindDuration(kind string) string {
+	if strings.Contains(kind, "five_hour") || strings.Contains(kind, "weekly") {
+		return ""
+	}
+	return kind[strings.LastIndex(kind, "_")+1:]
 }
 
 func midDot(options Options) string {
@@ -653,7 +795,8 @@ func findWindow(windows []provider.Window, kind provider.WindowKind) (provider.W
 	return provider.Window{}, false
 }
 
-func countdown(now, resetsAt time.Time) string {
+// Countdown formats how long until resetsAt in the units the glance uses.
+func Countdown(now, resetsAt time.Time) string {
 	remaining := resetsAt.Sub(now)
 	if remaining <= 0 {
 		return "now"

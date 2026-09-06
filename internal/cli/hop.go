@@ -20,6 +20,8 @@ const (
 	claudeCredentialsFileOverride = "HOP_CLAUDE_CREDENTIALS_FILE"
 	claudeAccountEmailOverride    = "HOP_CLAUDE_ACCOUNT_EMAIL"
 	codexAuthFileOverride         = "HOP_CODEX_AUTH_FILE"
+	claudeTokenURLOverride        = "HOP_CLAUDE_TOKEN_URL"
+	claudeLoginPortOverride       = "HOP_CLAUDE_LOGIN_PORT"
 	switchTransactionFilename     = ".switch-transaction.json"
 )
 
@@ -128,6 +130,15 @@ func recoverDefaultSwitch(ctx context.Context, stdout io.Writer) error {
 }
 
 func showAccountsSafely(ctx context.Context, stdout, stderr io.Writer, asJSON bool) error {
+	return withRecoveredSwitch(ctx, stdout, stderr, func(ctx context.Context) error {
+		return showAccounts(ctx, stdout, asJSON)
+	})
+}
+
+// withRecoveredSwitch holds both provider locks and the state lock while run
+// reads the vault, after finishing any switch that was interrupted mid-flight,
+// so run never sees a slot whose tokens are also the live login.
+func withRecoveredSwitch(ctx context.Context, stdout, stderr io.Writer, run func(context.Context) error) error {
 	manager, err := defaultSwitchManager(stdout)
 	if err != nil {
 		return err
@@ -149,7 +160,7 @@ func showAccountsSafely(ctx context.Context, stdout, stderr io.Writer, asJSON bo
 	if recovered {
 		_, _ = io.WriteString(stderr, "hop: recovered an interrupted account switch before continuing\n")
 	}
-	return showAccounts(ctx, stdout, asJSON)
+	return run(ctx)
 }
 
 func defaultSwitchManager(stdout io.Writer) (switchManager, error) {
@@ -206,8 +217,12 @@ func defaultClaudeLiveDependencies() claudeLiveDependencies {
 	return claudeLiveDependencies{
 		store:   systemClaudeLiveStore{},
 		email:   claudeAccountEmail,
-		profile: claude.New(claude.Config{}).FetchProfile,
+		profile: defaultClaudeAdapter().FetchProfile,
 	}
+}
+
+func defaultClaudeAdapter() claude.Adapter {
+	return claude.New(claude.Config{TokenURL: strings.TrimSpace(os.Getenv(claudeTokenURLOverride))})
 }
 
 func defaultCodexSwitchStore() (codexLiveStore, string, error) {
@@ -329,6 +344,9 @@ func (manager switchManager) providersFor(providerName, accountName string) ([]s
 		if !exists {
 			return nil, fmt.Errorf("did you mean 'hop login %s %s'? %s account %q is not enrolled; enroll it, then retry", providerName, accountName, providerName, accountName)
 		}
+		if err := manager.refuseDisabledSlot(providerName, accountName); err != nil {
+			return nil, err
+		}
 		return []string{providerName}, nil
 	}
 
@@ -338,14 +356,33 @@ func (manager switchManager) providersFor(providerName, accountName string) ([]s
 		if err != nil {
 			return nil, err
 		}
-		if exists {
-			providers = append(providers, candidate)
+		if !exists {
+			continue
 		}
+		if err := manager.refuseDisabledSlot(candidate, accountName); err != nil {
+			return nil, err
+		}
+		providers = append(providers, candidate)
 	}
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("did you mean 'hop login claude %s' or 'hop login codex %s'? Account %q is not enrolled for either provider; enroll it, then retry", accountName, accountName, accountName)
 	}
 	return providers, nil
+}
+
+func (manager switchManager) refuseDisabledSlot(providerName, accountName string) error {
+	slotPath, err := manager.vault.SlotPath(providerName, accountName)
+	if err != nil {
+		return err
+	}
+	metadata, err := loadSlotMetadata(slotPath)
+	if err != nil {
+		return err
+	}
+	if metadata.Disabled {
+		return fmt.Errorf("[ACCOUNT_DISABLED] %s account %q is disabled; run 'hop enable %s %s', then retry", providerName, accountName, providerName, accountName)
+	}
+	return nil
 }
 
 func (manager switchManager) slotExists(providerName, accountName string) (bool, error) {
@@ -1113,10 +1150,6 @@ func (store claudeFileLiveStore) Read(context.Context) (claude.Credentials, erro
 
 func (store claudeFileLiveStore) Write(_ context.Context, credentials claude.Credentials) error {
 	return store.store.Write(credentials)
-}
-
-func (store claudeFileLiveStore) Clear(context.Context) error {
-	return store.store.Clear()
 }
 
 func (store claudeFileLiveStore) ClearIfMatches(_ context.Context, expected claude.Credentials) error {

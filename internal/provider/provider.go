@@ -42,6 +42,37 @@ type Limit struct {
 	Active      bool      `json:"active"`
 }
 
+// ResetCredit is one manual quota reset an account can spend before it expires.
+type ResetCredit struct {
+	GrantedAt time.Time `json:"granted_at,omitzero"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// ResetCredits is the manual resets an account has available right now.
+type ResetCredits struct {
+	Count   int           `json:"count"`
+	Credits []ResetCredit `json:"credits"`
+}
+
+// NoResetCredits is the value for an account that has no credit left to spend.
+func NoResetCredits() ResetCredits {
+	return ResetCredits{Credits: make([]ResetCredit, 0)}
+}
+
+// SoonestExpiry returns the earliest expiry among the credits, if any carries one.
+func (credits ResetCredits) SoonestExpiry() (time.Time, bool) {
+	var soonest time.Time
+	for _, credit := range credits.Credits {
+		if credit.ExpiresAt.IsZero() {
+			continue
+		}
+		if soonest.IsZero() || credit.ExpiresAt.Before(soonest) {
+			soonest = credit.ExpiresAt
+		}
+	}
+	return soonest, !soonest.IsZero()
+}
+
 // UsageHTTPAction gives the caller a status-specific next step.
 func UsageHTTPAction(providerName Name, statusCode int) string {
 	switch {
@@ -56,16 +87,36 @@ func UsageHTTPAction(providerName Name, statusCode int) string {
 	}
 }
 
-// Usage is the provider-neutral response consumed by the glance command.
+// Usage is what the provider's usage endpoint said about one account.
 type Usage struct {
-	Provider Name     `json:"provider"`
-	Email    string   `json:"email,omitempty"`
-	Plan     string   `json:"plan,omitempty"`
-	Windows  []Window `json:"windows"`
-	Limits   []Limit  `json:"limits"`
+	Provider Name   `json:"provider"`
+	Email    string `json:"email,omitempty"`
+	// Plan is set only by providers whose usage endpoint names the plan; the
+	// enrollment carries the plan the credentials were issued for.
+	Plan    string   `json:"plan,omitempty"`
+	Windows []Window `json:"windows"`
+	Limits  []Limit  `json:"limits"`
+	// ResetCredits is nil when the provider has no manual resets or the count is unknown.
+	ResetCredits *ResetCredits `json:"reset_credits,omitempty"`
 }
 
-// Fetcher retrieves normalized usage for one account.
+// Enrollment is what stored credentials say about an account before any
+// request goes out. It outlives a failed usage fetch.
+type Enrollment struct {
+	Plan string
+	// RefreshTokenExpiresAt is zero when the provider never said.
+	RefreshTokenExpiresAt time.Time
+}
+
+// Fetcher is one account's credentials bound to their provider: what they say
+// up front, and the usage request they authorize.
 type Fetcher interface {
+	Enrollment() Enrollment
 	FetchUsage(context.Context) (Usage, error)
+}
+
+// Source opens an account's stored credentials, so the glance reads them once
+// and learns the enrollment before spending a request on them.
+type Source interface {
+	Open(context.Context) (Fetcher, error)
 }

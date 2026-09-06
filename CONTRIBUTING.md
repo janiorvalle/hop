@@ -53,6 +53,13 @@ HOP_HOME=/tmp/hop-sandbox ./dist/hop-dev ls
   writes the real `~/.codex/auth.json` and Keychain item unless you also set
   `HOP_CODEX_AUTH_FILE`, `HOP_CLAUDE_CREDENTIALS_FILE`, and
   `HOP_CLAUDE_ACCOUNT_EMAIL` — the same overrides the test policy below uses.
+- `hop login claude` for a second account talks to the real Anthropic token
+  endpoint and opens the real browser. Point `HOP_CLAUDE_TOKEN_URL` at a fake
+  token server and `BROWSER` at a script that answers the callback to run it
+  sandboxed. The sign-in then asks the profile endpoint for the plan once;
+  with a fake token that call fails and the new row shows no plan. The public
+  client id is pre-authorized on any account that is signed in to claude.ai,
+  so a dev run that skips this signs in for real without a click.
 
 ## Test Policy
 

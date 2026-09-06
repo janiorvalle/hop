@@ -143,13 +143,45 @@ func TestCredentialFetcherImplementsSharedContract(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	fetcher := New(Config{UsageURL: server.URL}).Fetcher(Credentials{AccessToken: "access"})
+	fetcher := New(Config{UsageURL: server.URL}).Fetcher(Credentials{AccessToken: "access", RateLimitTier: "default_claude_max_5x"})
 	usage, err := fetcher.FetchUsage(context.Background())
 	if err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
 	if usage.Provider != provider.Claude {
 		t.Errorf("Provider = %q, want claude", usage.Provider)
+	}
+	if usage.Plan != "" {
+		t.Errorf("usage Plan = %q, want the usage endpoint to leave the plan to the enrollment", usage.Plan)
+	}
+	if plan := fetcher.Enrollment().Plan; plan != "Max 5x" {
+		t.Errorf("Enrollment().Plan = %q, want Max 5x from the stored rate limit tier", plan)
+	}
+}
+
+func TestPlanLabelsTierAndFallsBackToSubscriptionType(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		credentials Credentials
+		want        string
+	}{
+		{name: "max 5x tier", credentials: Credentials{RateLimitTier: "default_claude_max_5x", SubscriptionType: "max"}, want: "Max 5x"},
+		{name: "max 20x tier", credentials: Credentials{RateLimitTier: "default_claude_max_20x", SubscriptionType: "max"}, want: "Max 20x"},
+		{name: "pro tier", credentials: Credentials{RateLimitTier: "default_claude_pro", SubscriptionType: "pro"}, want: "Pro"},
+		{name: "missing tier uses subscription type", credentials: Credentials{SubscriptionType: "team"}, want: "Team"},
+		{name: "unknown tier shows raw value", credentials: Credentials{RateLimitTier: "default_claude_max_50x", SubscriptionType: "max"}, want: "default_claude_max_50x"},
+		{name: "unknown subscription type shows raw value", credentials: Credentials{SubscriptionType: "founder"}, want: "founder"},
+		{name: "nothing stored", credentials: Credentials{}, want: ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := testCase.credentials.Plan(); got != testCase.want {
+				t.Errorf("Plan() = %q, want %q", got, testCase.want)
+			}
+		})
 	}
 }
 
@@ -177,6 +209,40 @@ func TestFetchProfileIdentifiesTheBearerTokenOwner(t *testing.T) {
 	}
 	if profile.AccountUUID != "account-uuid" || profile.Email != "owner@example.com" {
 		t.Fatalf("FetchProfile() = %#v, want the account identity", profile)
+	}
+}
+
+func TestFetchProfileNamesThePlanFromTheProfileFlags(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "max outranks pro", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":true,"has_claude_pro":true}}`, want: "max"},
+		{name: "pro", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":true}}`, want: "pro"},
+		{name: "team seat", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_team","subscription_status":"active"}}`, want: "team"},
+		{name: "lapsed team is free", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_team","subscription_status":"canceled"}}`, want: "free"},
+		{name: "free", body: `{"account":{"uuid":"u","email":"e@example.com","has_claude_max":false,"has_claude_pro":false}}`, want: "free"},
+		{name: "flags absent", body: `{"account":{"uuid":"u","email":"e@example.com"}}`, want: ""},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, testCase.body)
+			}))
+			t.Cleanup(server.Close)
+
+			profile, err := New(Config{ProfileURL: server.URL}).FetchProfile(context.Background(), Credentials{AccessToken: "live-access"})
+			if err != nil {
+				t.Fatalf("FetchProfile() error = %v", err)
+			}
+			if profile.SubscriptionType != testCase.want {
+				t.Fatalf("FetchProfile().SubscriptionType = %q, want %q", profile.SubscriptionType, testCase.want)
+			}
+		})
 	}
 }
 

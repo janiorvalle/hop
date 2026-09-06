@@ -28,12 +28,23 @@ func writeTable(writer io.Writer, document glanceDocument, options render.Option
 			Provider: account.Provider,
 			Account:  account.Account,
 			Active:   account.Active,
+			Disabled: account.Disabled,
 			Plan:     account.Plan,
 			Windows:  account.Windows,
 			Limits:   account.Limits,
 		}
+		if account.ResetCredits != nil {
+			row.ResetCredits = *account.ResetCredits
+		}
 		if account.Error != nil {
 			row.Problem = &render.Problem{Message: account.Error.Message, Action: account.Error.Action}
+		}
+		if account.RefreshTokenExpiry != nil {
+			row.RefreshTokenExpiry = &render.TokenExpiry{
+				ExpiresAt: account.RefreshTokenExpiry.ExpiresAt,
+				Severity:  account.RefreshTokenExpiry.Severity,
+				Action:    account.RefreshTokenExpiry.Action,
+			}
 		}
 		rows = append(rows, row)
 	}

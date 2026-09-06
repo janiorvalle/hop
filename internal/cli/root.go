@@ -13,16 +13,20 @@ import (
 const helpText = `hop - glance at and switch between Claude and Codex accounts
 
 Usage:
-  hop                              Show usage for every account
-  hop <account>                    Switch both providers with that account
-  hop <provider> <account>         Switch one provider
-  hop login <provider> <account>   Add an account
-  hop ls [--json]                  List accounts
-  hop rm <provider> <account>      Forget an account
-  hop mv <provider> <old> <new>    Rename an account
-  hop upgrade                      Install the latest verified release
-  hop --version                    Show the installed version
-  hop help                         Show this help
+  hop                                Show usage for every account
+  hop <account>                      Switch both providers with that account
+  hop <provider> <account>           Switch one provider
+  hop login <provider> <account>     Add an account, or renew a Codex one
+  hop ls [--json]                    List accounts
+  hop refresh                        Rotate idle account tokens, for cron
+  hop disable <provider> <account>   Park an account: no usage fetch, no switching
+  hop enable <provider> <account>    Bring a parked account back
+  hop rm <provider> <account>        Forget an account
+  hop mv <provider> <old> <new>      Rename an account
+  hop reset codex <account>          Spend one manual reset on a Codex account
+  hop upgrade                        Install the latest verified release
+  hop --version                      Show the installed version
+  hop help                           Show this help
 
 Providers:
   claude, codex
@@ -32,8 +36,12 @@ Examples:
   hop claude personal
   hop login codex work
   hop ls --json
+  hop disable codex paused
+  hop enable codex paused
+  hop refresh
   hop rm codex old
   hop mv claude work personal
+  hop reset codex work
 `
 
 // developmentVaultWarning is the one line an unreleased build prints when it is
@@ -97,6 +105,23 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("ls accepts only --json; try 'hop ls --json'")
 		}
 		return showAccountsSafely(context.Background(), stdout, stderr, len(args) == 2)
+	case "disable":
+		if err := requireProviderAccount("disable", args[1:]); err != nil {
+			return err
+		}
+		return disableAccount(args[1], args[2], stdout)
+	case "enable":
+		if err := requireProviderAccount("enable", args[1:]); err != nil {
+			return err
+		}
+		return enableAccount(args[1], args[2], stdout)
+	case "refresh":
+		if len(args) != 1 {
+			return fmt.Errorf("refresh takes no arguments; try 'hop refresh'")
+		}
+		return withRecoveredSwitch(context.Background(), stdout, stderr, func(ctx context.Context) error {
+			return refreshAccounts(ctx, stdout)
+		})
 	case "rm":
 		if err := requireProviderAccount("rm", args[1:]); err != nil {
 			return err
@@ -107,6 +132,13 @@ func execute(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return renameAccount(args[1], args[2], args[3], stdout)
+	case "reset":
+		if err := requireCodexReset(args[1:]); err != nil {
+			return err
+		}
+		resetContext, stopSignals := signal.NotifyContext(context.Background(), loginTerminationSignals()...)
+		defer stopSignals()
+		return resetCodexAccount(resetContext, args[2], os.Stdin, stdout, stderr)
 	case "upgrade":
 		if len(args) != 1 {
 			return fmt.Errorf("upgrade takes no arguments; try 'hop upgrade'")
@@ -134,7 +166,7 @@ func showAccounts(ctx context.Context, stdout io.Writer, asJSON bool) error {
 }
 
 func showAccountsFrom(ctx context.Context, stdout io.Writer, asJSON bool, accountCatalog catalog, now time.Time) error {
-	document, err := fetchGlance(ctx, accountCatalog)
+	document, err := fetchGlance(ctx, accountCatalog, now)
 	if err != nil {
 		return err
 	}
@@ -166,6 +198,19 @@ func requireProviderRename(args []string) error {
 	}
 	if strings.TrimSpace(args[1]) == "" || strings.TrimSpace(args[2]) == "" {
 		return fmt.Errorf("account cannot be empty; try 'hop mv %s work personal'", args[0])
+	}
+	return nil
+}
+
+func requireCodexReset(args []string) error {
+	if len(args) == 2 && args[0] == "claude" {
+		return fmt.Errorf("[RESET_UNSUPPORTED_PROVIDER] Claude has no manual resets to spend; reset works for codex only, try 'hop reset codex %s'", args[1])
+	}
+	if len(args) != 2 || args[0] != "codex" {
+		return fmt.Errorf("reset needs the codex provider and an account; try 'hop reset codex work'")
+	}
+	if strings.TrimSpace(args[1]) == "" {
+		return fmt.Errorf("account cannot be empty; try 'hop reset codex work'")
 	}
 	return nil
 }

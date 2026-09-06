@@ -17,21 +17,21 @@ func lockedDesignRows(now time.Time) []Row {
 			Message: `Usage could not be loaded for claude account "jvalle1".`,
 			Action:  `decode Claude session limit; resets_at may be null only while percent is zero and the limit is inactive, update hop before retrying: claude usage request failed`,
 		}},
-		{Provider: provider.Claude, Account: "work1",
+		{Provider: provider.Claude, Account: "work1", Plan: "Max 5x",
 			Windows: []provider.Window{
 				{Kind: provider.FiveHour, UsedPercent: 66, ResetsAt: now.Add(48 * time.Minute)},
 				{Kind: provider.Weekly, UsedPercent: 66, ResetsAt: now.Add(107 * time.Hour)},
 			},
 			Limits: []provider.Limit{{Kind: "weekly", Scope: "Fable", UsedPercent: 97, ResetsAt: now.Add(107 * time.Hour), Active: true}},
 		},
-		{Provider: provider.Claude, Account: "work2", Active: true,
+		{Provider: provider.Claude, Account: "work2", Active: true, Plan: "Max 20x",
 			Windows: []provider.Window{
 				{Kind: provider.FiveHour, UsedPercent: 7, ResetsAt: now.Add(4*time.Hour + 38*time.Minute)},
 				{Kind: provider.Weekly, UsedPercent: 49, ResetsAt: now.Add(83 * time.Hour)},
 			},
 			Limits: []provider.Limit{{Kind: "weekly", Scope: "Fable", UsedPercent: 68, ResetsAt: now.Add(83 * time.Hour), Active: true}},
 		},
-		{Provider: provider.Claude, Account: "work3",
+		{Provider: provider.Claude, Account: "work3", Plan: "Pro",
 			Windows: []provider.Window{
 				{Kind: provider.FiveHour, UsedPercent: 1, ResetsAt: now.Add(4*time.Hour + 48*time.Minute)},
 				{Kind: provider.Weekly, UsedPercent: 60, ResetsAt: now.Add(76 * time.Hour)},
@@ -63,10 +63,10 @@ func TestTableWidePlainSnapshotMatchesLockedDesign(t *testing.T) {
 		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
 		"\n" +
 		"CLAUDE\n" +
-		"    ACCOUNT    HEADROOM   5 HOUR         WEEKLY         BINDING: Fable / WEEKLY\n" +
-		"> ~ work2      32% LEFT    93% . 4h38m    51% . 3d11h    32% . 3d11h\n" +
-		"  o work1       3% LEFT    34% . 48m      34% . 4d11h     3% . 4d11h\n" +
-		"  o work3       0% LEFT    99% . 4h48m    40% . 3d04h     0% . 3d04h\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         WEEKLY         BINDING: Fable / WEEKLY   PLAN\n" +
+		"> ~ work2      32% LEFT    93% . 4h38m    51% . 3d11h    32% . 3d11h              (Max 20x)\n" +
+		"  o work1       3% LEFT    34% . 48m      34% . 4d11h     3% . 4d11h              (Max 5x)\n" +
+		"  o work3       0% LEFT    99% . 4h48m    40% . 3d04h     0% . 3d04h              (Pro)\n" +
 		"  ! jvalle1       ERROR\n" +
 		"    Usage could not be loaded for claude account \"jvalle1\". decode Claude session limit;\n" +
 		"    resets_at may be null only while percent is zero and the limit is inactive, update hop\n" +
@@ -95,11 +95,11 @@ func TestTableNarrowPlainSnapshotMatchesLockedDesign(t *testing.T) {
 		"\n" +
 		"CLAUDE\n" +
 		"> ~ work2     32% LEFT  ACTIVE\n" +
-		"    5h 93%/4h38m . week 51%/3d11h . Fable* 32%/3d11h\n" +
+		"    5h 93%/4h38m . week 51%/3d11h . Fable* 32%/3d11h . Max 20x\n" +
 		"  o work1      3% LEFT\n" +
-		"    5h 34%/48m . week 34%/4d11h . Fable* 3%/4d11h\n" +
+		"    5h 34%/48m . week 34%/4d11h . Fable* 3%/4d11h . Max 5x\n" +
 		"  o work3      0% LEFT\n" +
-		"    5h 99%/4h48m . week 40%/3d04h . Fable* 0%/3d04h\n" +
+		"    5h 99%/4h48m . week 40%/3d04h . Fable* 0%/3d04h . Pro\n" +
 		"  ! jvalle1      ERROR\n" +
 		"    Usage could not be loaded for claude account \"jvalle1\". decode Claude\n" +
 		"    session limit; resets_at may be null only while percent is zero and the\n" +
@@ -278,6 +278,190 @@ func TestTableFallsBackToNarrowWhenWideDoesNotFit(t *testing.T) {
 	}
 }
 
+func TestTableShowsCodexDurationAndCodeReviewLimits(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{{
+		Provider: provider.Codex,
+		Account:  "work",
+		Plan:     "pro",
+		Windows:  []provider.Window{{Kind: provider.FiveHour, UsedPercent: 62, ResetsAt: now.Add(2*time.Hour + 10*time.Minute)}},
+		Limits: []provider.Limit{
+			{Kind: "account_30d", Group: "account", Scope: "30d", UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour), Active: true},
+			{Kind: "code_review_weekly", Group: "code_review", Scope: "code review", UsedPercent: 10, ResetsAt: now.Add(10 * time.Minute), Active: true},
+		},
+	}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CODEX  .  pro\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         BINDING\n" +
+		"  ~ work       38% LEFT    38% . 2h10m   30d  80% . 1d00h   code review 90% . 10m\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+
+	output.Reset()
+	if err := Table(&output, rows, Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	for _, detail := range []string{"30d* 80%/1d00h", "code review* 90%/10m"} {
+		if !strings.Contains(output.String(), detail) {
+			t.Errorf("narrow detail missing %q: %q", detail, output.String())
+		}
+	}
+}
+
+func TestTableNamesUnknownDurationsOnce(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	testCases := []struct {
+		name       string
+		limit      provider.Limit
+		wantHeader string
+		wantNarrow string
+	}{
+		{
+			name:       "account window is its own scope",
+			limit:      provider.Limit{Kind: "account_30d", Scope: "30d", UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour), Active: true},
+			wantHeader: "BINDING: 30d\n",
+			wantNarrow: "30d* 80%/1d00h",
+		},
+		{
+			name:       "model cap carries its duration",
+			limit:      provider.Limit{Kind: "model_30d", Scope: "GPT", UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour), Active: true},
+			wantHeader: "BINDING: GPT / 30D\n",
+			wantNarrow: "GPT*(30d) 80%/1d00h",
+		},
+	}
+	for _, testCase := range testCases {
+		rows := []Row{{Provider: provider.Codex, Account: "work", Limits: []provider.Limit{testCase.limit}}}
+		var output bytes.Buffer
+		if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+			t.Fatalf("%s: Table() error = %v", testCase.name, err)
+		}
+		if !strings.Contains(output.String(), testCase.wantHeader) {
+			t.Errorf("%s: wide header missing %q: %q", testCase.name, testCase.wantHeader, output.String())
+		}
+		output.Reset()
+		if err := Table(&output, rows, Options{Plain: true, Width: 60, Now: now}); err != nil {
+			t.Fatalf("%s: Table() error = %v", testCase.name, err)
+		}
+		if !strings.Contains(output.String(), testCase.wantNarrow) {
+			t.Errorf("%s: narrow detail missing %q: %q", testCase.name, testCase.wantNarrow, output.String())
+		}
+	}
+}
+
+func TestTableShowsManualResetCreditsAfterTheRow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{
+		{
+			Provider: provider.Codex,
+			Account:  "work",
+			Plan:     "pro",
+			Windows:  []provider.Window{{Kind: provider.Weekly, UsedPercent: 57, ResetsAt: now.Add(141 * time.Hour)}},
+			ResetCredits: provider.ResetCredits{Count: 2, Credits: []provider.ResetCredit{
+				{ExpiresAt: now.Add(30 * 24 * time.Hour)},
+				{ExpiresAt: now.Add(16*24*time.Hour + 5*time.Hour)},
+			}},
+		},
+		{
+			Provider:     provider.Codex,
+			Account:      "spent",
+			Plan:         "pro",
+			Windows:      []provider.Window{{Kind: provider.Weekly, UsedPercent: 4, ResetsAt: now.Add(141 * time.Hour)}},
+			ResetCredits: provider.NoResetCredits(),
+		},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CODEX  .  pro  .  no 5-hour window\n" +
+		"    ACCOUNT    HEADROOM   WEEKLY\n" +
+		"  + spent      96% LEFT    96% . 5d21h\n" +
+		"  ~ work       43% LEFT    43% . 5d21h   2 resets . next expires 16d05h\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+
+	output.Reset()
+	if err := Table(&output, rows, Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if !strings.Contains(output.String(), "2 resets, next expires 16d05h") {
+		t.Errorf("narrow detail missing the resets: %q", output.String())
+	}
+	if strings.Count(output.String(), " resets,") != 1 {
+		t.Errorf("a spent account must show nothing about resets: %q", output.String())
+	}
+}
+
+func TestResetCreditsLabelSingularAndWithoutExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	options := Options{Plain: true, Now: now}
+	one := provider.ResetCredits{Count: 1, Credits: []provider.ResetCredit{{ExpiresAt: now.Add(3 * 24 * time.Hour)}}}
+	if got := resetCreditsLabel(one, " . ", options); got != "1 reset . expires 3d00h" {
+		t.Errorf("one credit = %q", got)
+	}
+	countOnly := provider.ResetCredits{Count: 3, Credits: []provider.ResetCredit{}}
+	if got := resetCreditsLabel(countOnly, " . ", options); got != "3 resets" {
+		t.Errorf("count without expiries = %q", got)
+	}
+}
+
+func TestTableShowsInactiveScopedLimitUsage(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	rows := []Row{
+		{Provider: provider.Claude, Account: "capped",
+			Windows: []provider.Window{{Kind: provider.FiveHour, UsedPercent: 40, ResetsAt: now.Add(3 * time.Hour)}},
+			Limits: []provider.Limit{
+				{Kind: "session", UsedPercent: 40, Active: true},
+				{Kind: "weekly", Scope: "Fable", UsedPercent: 98, ResetsAt: now.Add(76 * time.Hour), Active: false},
+			},
+		},
+		{Provider: provider.Claude, Account: "bare",
+			Windows: []provider.Window{{Kind: provider.FiveHour, UsedPercent: 40, ResetsAt: now.Add(3 * time.Hour)}},
+		},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	got := output.String()
+	if !strings.Contains(got, "2% . 3d04h") {
+		t.Errorf("inactive Fable weekly limit at 98%% used renders no usage: %q", got)
+	}
+	if strings.Contains(got, "2% LEFT") {
+		t.Errorf("headroom must stay bound to active limits, not the inactive cap: %q", got)
+	}
+	bareLine := ""
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "bare") {
+			bareLine = line
+		}
+	}
+	if !strings.HasSuffix(bareLine, "-") {
+		t.Errorf("account with no scoped limit data lost its dash: %q", bareLine)
+	}
+}
+
 func TestTableHeadroomBindsOnScopelessActiveLimits(t *testing.T) {
 	t.Parallel()
 
@@ -304,5 +488,273 @@ func TestScopeLabelExtractsClaudeModelDisplayName(t *testing.T) {
 	scope := `{"model":{"id":null,"display_name":"Fable"},"surface":null}`
 	if got := scopeLabel(scope); got != "Fable" {
 		t.Fatalf("scopeLabel() = %q, want Fable", got)
+	}
+}
+
+// disabledDesignRows adds a parked slot to each provider: one alongside data
+// and error rows, one that is the active account and the only row.
+func disabledDesignRows(now time.Time) []Row {
+	return []Row{
+		{Provider: provider.Claude, Account: "paused", Disabled: true},
+		{Provider: provider.Claude, Account: "broken", Problem: &Problem{Message: "Usage is unavailable.", Action: "Run 'hop login claude broken', then retry."}},
+		{Provider: provider.Claude, Account: "work", Active: true,
+			Windows: []provider.Window{
+				{Kind: provider.FiveHour, UsedPercent: 7, ResetsAt: now.Add(4*time.Hour + 38*time.Minute)},
+				{Kind: provider.Weekly, UsedPercent: 49, ResetsAt: now.Add(83 * time.Hour)},
+			},
+		},
+		{Provider: provider.Codex, Account: "work2", Active: true, Disabled: true},
+	}
+}
+
+func TestTableWideDisabledRowSortsLastAndShowsDisabledAsHeadroom(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, disabledDesignRows(now), Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         WEEKLY\n" +
+		"> + work       51% LEFT    93% . 4h38m    51% . 3d11h\n" +
+		"  ! broken        ERROR\n" +
+		"    Usage is unavailable. Run 'hop login claude broken', then retry.\n" +
+		"    paused     disabled\n" +
+		"\n" +
+		"CODEX\n" +
+		"    ACCOUNT    HEADROOM\n" +
+		">   work2      disabled\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableNarrowDisabledRowKeepsActiveTag(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, disabledDesignRows(now), Options{Plain: true, Width: 80, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = left at binding cap   detail = left / resets in   * binding\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"> + work     51% LEFT  ACTIVE\n" +
+		"    5h 93%/4h38m . week 51%/3d11h\n" +
+		"  ! broken      ERROR\n" +
+		"    Usage is unavailable. Run 'hop login claude broken', then retry.\n" +
+		"    paused   disabled\n" +
+		"\n" +
+		"CODEX\n" +
+		">   work2   disabled  ACTIVE\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableDimsDisabledRowInColor(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{{Provider: provider.Codex, Account: "work2", Active: true, Disabled: true}}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Color: true, Width: 120}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if got := output.String(); !strings.HasSuffix(got, ">   \x1b[2mwork2  \x1b[0m   \x1b[2m disabled\x1b[0m\n") {
+		t.Fatalf("output = %q, want the name and disabled cells dimmed", got)
+	}
+}
+
+func refreshWarningRows(now time.Time) []Row {
+	windows := []provider.Window{{Kind: provider.FiveHour, UsedPercent: 12, ResetsAt: now.Add(time.Hour)}}
+	return []Row{
+		{Provider: provider.Claude, Account: "quiet", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(6 * 24 * time.Hour), Severity: "warning", Action: "Run 'hop rm claude quiet' and then 'hop login claude quiet' to renew it."}},
+		{Provider: provider.Claude, Account: "urgent", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(36 * time.Hour), Severity: "critical", Action: "Run 'hop rm claude urgent' and then 'hop login claude urgent' to renew it."}},
+		{Provider: provider.Claude, Account: "dead", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(-time.Hour), Severity: "critical", Action: "Run 'hop rm claude dead' and then 'hop login claude dead' to renew it."}},
+		{Provider: provider.Claude, Account: "fine", Windows: windows, RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(30 * 24 * time.Hour), Severity: "normal"}},
+	}
+}
+
+func TestTableWideRefreshTokenWarningSnapshot(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, refreshWarningRows(now), Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR\n" +
+		"  + quiet      88% LEFT    88% . 1h00m\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude quiet' and then 'hop login claude quiet'\n" +
+		"    to renew it.\n" +
+		"  + urgent     88% LEFT    88% . 1h00m\n" +
+		"    Refresh token expires in 1d12h. Run 'hop rm claude urgent' and then 'hop login claude\n" +
+		"    urgent' to renew it.\n" +
+		"  + dead       88% LEFT    88% . 1h00m\n" +
+		"    Refresh token has expired. Run 'hop rm claude dead' and then 'hop login claude dead' to\n" +
+		"    renew it.\n" +
+		"  + fine       88% LEFT    88% . 1h00m\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableNarrowRefreshTokenWarningSnapshot(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, refreshWarningRows(now), Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = left at binding cap   detail = left / resets in\n" +
+		"* binding\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full\n" +
+		"! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"  + quiet    88% LEFT\n" +
+		"    5h 88%/1h00m\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude\n" +
+		"    quiet' and then 'hop login claude quiet' to renew it.\n" +
+		"  + urgent   88% LEFT\n" +
+		"    5h 88%/1h00m\n" +
+		"    Refresh token expires in 1d12h. Run 'hop rm claude\n" +
+		"    urgent' and then 'hop login claude urgent' to renew it.\n" +
+		"  + dead     88% LEFT\n" +
+		"    5h 88%/1h00m\n" +
+		"    Refresh token has expired. Run 'hop rm claude dead' and\n" +
+		"    then 'hop login claude dead' to renew it.\n" +
+		"  + fine     88% LEFT\n" +
+		"    5h 88%/1h00m\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableColorsRefreshTokenWarningAmberAndRed(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	rows := []Row{
+		{Provider: provider.Codex, Account: "amber", RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(5 * 24 * time.Hour), Severity: "warning", Action: "Renew it."}},
+		{Provider: provider.Codex, Account: "red", RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(24 * time.Hour), Severity: "critical", Action: "Renew it."}},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Color: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	for _, line := range []string{styleAmber + "Refresh token expires in 5d00h. Renew it." + styleReset, styleRed + "Refresh token expires in 1d00h. Renew it." + styleReset} {
+		if !strings.Contains(output.String(), line) {
+			t.Errorf("output missing %q: %q", line, output.String())
+		}
+	}
+}
+
+// errorRowRows pairs a healthy account with two failed fetches: one whose
+// credentials still name a plan and a refresh token six days from expiry, and
+// one that knows neither.
+func errorRowRows(now time.Time) []Row {
+	problem := &Problem{
+		Message: `Usage could not be loaded for claude account "stale".`,
+		Action:  "claude usage returned HTTP 502; the provider usage service is unavailable, retry 'hop ls' later",
+	}
+	return []Row{
+		{Provider: provider.Claude, Account: "work", Plan: "Max 20x",
+			Windows: []provider.Window{{Kind: provider.FiveHour, UsedPercent: 12, ResetsAt: now.Add(time.Hour)}},
+		},
+		{Provider: provider.Claude, Account: "stale", Plan: "Pro", Problem: problem,
+			RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(6 * 24 * time.Hour), Severity: "warning", Action: "Run 'hop rm claude stale' and then 'hop login claude stale' to renew it."},
+		},
+		{Provider: provider.Claude, Account: "blank", Problem: &Problem{
+			Message: `Usage could not be loaded for claude account "blank".`,
+			Action:  "read Claude credentials from the slot; check the slot path and permissions",
+		}},
+	}
+}
+
+func TestTableWideErrorRowKeepsPlanAndRefreshWarning(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, errorRowRows(now), Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         PLAN\n" +
+		"  + work       88% LEFT    88% . 1h00m   (Max 20x)\n" +
+		"  ! stale         ERROR                  (Pro)\n" +
+		"    Usage could not be loaded for claude account \"stale\". claude usage returned HTTP 502; the\n" +
+		"    provider usage service is unavailable, retry 'hop ls' later\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude stale' and then 'hop login claude stale'\n" +
+		"    to renew it.\n" +
+		"  ! blank         ERROR\n" +
+		"    Usage could not be loaded for claude account \"blank\". read Claude credentials from the slot;\n" +
+		"    check the slot path and permissions\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableNarrowErrorRowKeepsPlanAndRefreshWarning(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, errorRowRows(now), Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = left at binding cap   detail = left / resets in\n" +
+		"* binding\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full\n" +
+		"! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"  + work    88% LEFT\n" +
+		"    5h 88%/1h00m . Max 20x\n" +
+		"  ! stale      ERROR\n" +
+		"    Pro\n" +
+		"    Usage could not be loaded for claude account \"stale\".\n" +
+		"    claude usage returned HTTP 502; the provider usage\n" +
+		"    service is unavailable, retry 'hop ls' later\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude\n" +
+		"    stale' and then 'hop login claude stale' to renew it.\n" +
+		"  ! blank      ERROR\n" +
+		"    Usage could not be loaded for claude account \"blank\".\n" +
+		"    read Claude credentials from the slot; check the slot\n" +
+		"    path and permissions\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableHoistsThePlanAnErrorRowShares(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	rows := []Row{
+		{Provider: provider.Codex, Account: "work", Plan: "pro", Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 10, ResetsAt: now.Add(time.Hour)}}},
+		{Provider: provider.Codex, Account: "stale", Plan: "pro", Problem: &Problem{Message: "Usage could not be loaded.", Action: "retry 'hop ls' later"}},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if !strings.HasPrefix(output.String(), "HEADROOM") || !strings.Contains(output.String(), "CODEX  .  pro  .  no 5-hour window\n") || strings.Contains(output.String(), "PLAN") {
+		t.Fatalf("shared plan was not hoisted into the title:\n%s", output.String())
 	}
 }
