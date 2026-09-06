@@ -660,3 +660,101 @@ func TestTableColorsRefreshTokenWarningAmberAndRed(t *testing.T) {
 		}
 	}
 }
+
+// errorRowRows pairs a healthy account with two failed fetches: one whose
+// credentials still name a plan and a refresh token six days from expiry, and
+// one that knows neither.
+func errorRowRows(now time.Time) []Row {
+	problem := &Problem{
+		Message: `Usage could not be loaded for claude account "stale".`,
+		Action:  "claude usage returned HTTP 502; the provider usage service is unavailable, retry 'hop ls' later",
+	}
+	return []Row{
+		{Provider: provider.Claude, Account: "work", Plan: "Max 20x",
+			Windows: []provider.Window{{Kind: provider.FiveHour, UsedPercent: 12, ResetsAt: now.Add(time.Hour)}},
+		},
+		{Provider: provider.Claude, Account: "stale", Plan: "Pro", Problem: problem,
+			RefreshTokenExpiry: &TokenExpiry{ExpiresAt: now.Add(6 * 24 * time.Hour), Severity: "warning", Action: "Run 'hop rm claude stale' and then 'hop login claude stale' to renew it."},
+		},
+		{Provider: provider.Claude, Account: "blank", Problem: &Problem{
+			Message: `Usage could not be loaded for claude account "blank".`,
+			Action:  "read Claude credentials from the slot; check the slot path and permissions",
+		}},
+	}
+}
+
+func TestTableWideErrorRowKeepsPlanAndRefreshWarning(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, errorRowRows(now), Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = capacity left at the binding limit\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"    ACCOUNT    HEADROOM   5 HOUR         PLAN\n" +
+		"  + work       88% LEFT    88% . 1h00m   (Max 20x)\n" +
+		"  ! stale         ERROR                  (Pro)\n" +
+		"    Usage could not be loaded for claude account \"stale\". claude usage returned HTTP 502; the\n" +
+		"    provider usage service is unavailable, retry 'hop ls' later\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude stale' and then 'hop login claude stale'\n" +
+		"    to renew it.\n" +
+		"  ! blank         ERROR\n" +
+		"    Usage could not be loaded for claude account \"blank\". read Claude credentials from the slot;\n" +
+		"    check the slot path and permissions\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableNarrowErrorRowKeepsPlanAndRefreshWarning(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	var output bytes.Buffer
+	if err := Table(&output, errorRowRows(now), Options{Plain: true, Width: 60, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	want := "HEADROOM = left at binding cap   detail = left / resets in\n" +
+		"* binding\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full\n" +
+		"! error   > active\n" +
+		"\n" +
+		"CLAUDE\n" +
+		"  + work    88% LEFT\n" +
+		"    5h 88%/1h00m . Max 20x\n" +
+		"  ! stale      ERROR\n" +
+		"    Pro\n" +
+		"    Usage could not be loaded for claude account \"stale\".\n" +
+		"    claude usage returned HTTP 502; the provider usage\n" +
+		"    service is unavailable, retry 'hop ls' later\n" +
+		"    Refresh token expires in 6d00h. Run 'hop rm claude\n" +
+		"    stale' and then 'hop login claude stale' to renew it.\n" +
+		"  ! blank      ERROR\n" +
+		"    Usage could not be loaded for claude account \"blank\".\n" +
+		"    read Claude credentials from the slot; check the slot\n" +
+		"    path and permissions\n"
+	if got := output.String(); got != want {
+		t.Fatalf("snapshot mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestTableHoistsThePlanAnErrorRowShares(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 6, 0, 0, 0, time.UTC)
+	rows := []Row{
+		{Provider: provider.Codex, Account: "work", Plan: "pro", Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 10, ResetsAt: now.Add(time.Hour)}}},
+		{Provider: provider.Codex, Account: "stale", Plan: "pro", Problem: &Problem{Message: "Usage could not be loaded.", Action: "retry 'hop ls' later"}},
+	}
+	var output bytes.Buffer
+	if err := Table(&output, rows, Options{Plain: true, Width: 120, Now: now}); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	if !strings.HasPrefix(output.String(), "HEADROOM") || !strings.Contains(output.String(), "CODEX  .  pro  .  no 5-hour window\n") || strings.Contains(output.String(), "PLAN") {
+		t.Fatalf("shared plan was not hoisted into the title:\n%s", output.String())
+	}
+}

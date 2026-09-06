@@ -266,7 +266,7 @@ func TestShowAccountsJSONCarriesDisabledOnEveryAccount(t *testing.T) {
 	t.Parallel()
 
 	catalog := staticCatalog{
-		{Provider: provider.Claude, Name: "on", Fetcher: fetchFunc(func(context.Context) (provider.Usage, error) { return provider.Usage{}, nil })},
+		{Provider: provider.Claude, Name: "on", Source: fetchFunc(func(context.Context) (provider.Usage, error) { return provider.Usage{}, nil })},
 		{Provider: provider.Claude, Name: "off", Disabled: true},
 	}
 	var output bytes.Buffer

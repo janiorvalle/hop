@@ -495,3 +495,43 @@ func TestConsumeResetCreditReportsAnUnreachableEndpoint(t *testing.T) {
 		t.Fatalf("ConsumeResetCredit() error = %v, want an unreachable-endpoint ErrReset", err)
 	}
 }
+
+func TestCredentialsPlanReadsTheChatGPTPlanClaim(t *testing.T) {
+	t.Parallel()
+
+	encode := func(payload string) string {
+		return "header." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".signature"
+	}
+	testCases := []struct {
+		name    string
+		idToken string
+		want    string
+	}{
+		{name: "plan claim", idToken: encode(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"pro","chatgpt_account_id":"account"}}`), want: "pro"},
+		{name: "claim missing", idToken: encode(`{"email":"owner@example.com"}`), want: ""},
+		{name: "opaque token", idToken: "id", want: ""},
+		{name: "no token", idToken: "", want: ""},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := (Credentials{IDToken: testCase.idToken}).Plan(); got != testCase.want {
+				t.Errorf("Plan() = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestFetcherEnrollmentComesFromTheCredentials(t *testing.T) {
+	t.Parallel()
+
+	idToken := "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}`)) + ".signature"
+	fetcher := New(Config{}).Fetcher(Credentials{IDToken: idToken, AccessToken: "access", AccountID: "account", LastRefresh: "2026-08-08T05:00:00Z"})
+	enrollment := fetcher.Enrollment()
+	if enrollment.Plan != "plus" {
+		t.Errorf("Plan = %q, want plus from the ID token", enrollment.Plan)
+	}
+	if want := time.Date(2026, time.August, 8, 5, 0, 0, 0, time.UTC).Add(refreshTokenLifetime); !enrollment.RefreshTokenExpiresAt.Equal(want) {
+		t.Errorf("RefreshTokenExpiresAt = %s, want %s", enrollment.RefreshTokenExpiresAt, want)
+	}
+}

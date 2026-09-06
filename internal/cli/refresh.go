@@ -54,7 +54,7 @@ func refreshStatus(ctx context.Context, current account) (string, error) {
 	if current.Active {
 		return "skipped: active account, hop never rotates the live login", nil
 	}
-	rotator, ok := current.Fetcher.(slotRotator)
+	rotator, ok := current.Source.(slotRotator)
 	if !ok {
 		return unmanagedStatus(current), nil
 	}

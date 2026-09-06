@@ -65,23 +65,12 @@ func fetchGlance(ctx context.Context, accountCatalog catalog, now time.Time) (gl
 	fetching := 0
 	for index, currentAccount := range accounts {
 		if currentAccount.Disabled {
-			document.Accounts[index] = resultFor(currentAccount, provider.Usage{}, nil)
+			document.Accounts[index] = newAccountResult(currentAccount)
 			continue
 		}
 		fetching++
 		go func() {
-			if preparer, ok := currentAccount.Fetcher.(accountPreparer); ok {
-				if err := preparer.Prepare(ctx); err != nil {
-					results <- indexedResult{index: index, result: resultFor(currentAccount, provider.Usage{}, err)}
-					return
-				}
-			}
-			usageCtx, cancel := context.WithTimeout(ctx, usageTimeout)
-			defer cancel()
-			usage, fetchErr := currentAccount.Fetcher.FetchUsage(usageCtx)
-			result := resultFor(currentAccount, usage, fetchErr)
-			result.RefreshTokenExpiry = refreshTokenExpiryFor(currentAccount, usage.RefreshTokenExpiresAt, now)
-			results <- indexedResult{index: index, result: result}
+			results <- indexedResult{index: index, result: fetchAccount(ctx, currentAccount, now)}
 		}()
 	}
 	for range fetching {
@@ -91,28 +80,58 @@ func fetchGlance(ctx context.Context, accountCatalog catalog, now time.Time) (gl
 	return document, nil
 }
 
-func resultFor(account account, usage provider.Usage, err error) accountResult {
-	result := accountResult{
-		Provider: account.Provider,
-		Account:  account.Name,
-		Active:   account.Active,
-		Disabled: account.Disabled,
+// fetchAccount learns what the credentials say before spending the usage
+// request, so a failed fetch costs the row only its usage columns.
+func fetchAccount(ctx context.Context, current account, now time.Time) accountResult {
+	result := newAccountResult(current)
+	if preparer, ok := current.Source.(accountPreparer); ok {
+		if err := preparer.Prepare(ctx); err != nil {
+			result.Error = usageProblem(current, err)
+			return result
+		}
+	}
+	usageCtx, cancel := context.WithTimeout(ctx, usageTimeout)
+	defer cancel()
+	fetcher, err := current.Source.Open(usageCtx)
+	if err != nil {
+		result.Error = usageProblem(current, err)
+		return result
+	}
+	enrollment := fetcher.Enrollment()
+	result.Plan = enrollment.Plan
+	result.RefreshTokenExpiry = refreshTokenExpiryFor(current, enrollment.RefreshTokenExpiresAt, now)
+	usage, err := fetcher.FetchUsage(usageCtx)
+	if err != nil {
+		result.Error = usageProblem(current, err)
+		return result
+	}
+	result.recordUsage(usage)
+	return result
+}
+
+func newAccountResult(current account) accountResult {
+	return accountResult{
+		Provider: current.Provider,
+		Account:  current.Name,
+		Active:   current.Active,
+		Disabled: current.Disabled,
 		Windows:  make([]provider.Window, 0),
 		Limits:   make([]provider.Limit, 0),
 	}
-	if err != nil {
-		result.Error = usageProblem(account, err)
-		return result
-	}
+}
+
+func (result *accountResult) recordUsage(usage provider.Usage) {
 	result.Email = usage.Email
-	result.Plan = usage.Plan
-	result.Windows = usage.Windows
-	result.Limits = usage.Limits
-	if result.Windows == nil {
-		result.Windows = make([]provider.Window, 0)
+	// Codex names the current plan in its usage response; the credentials only
+	// know the plan from the last login.
+	if usage.Plan != "" {
+		result.Plan = usage.Plan
 	}
-	if result.Limits == nil {
-		result.Limits = make([]provider.Limit, 0)
+	if usage.Windows != nil {
+		result.Windows = usage.Windows
+	}
+	if usage.Limits != nil {
+		result.Limits = usage.Limits
 	}
 	if usage.ResetCredits != nil {
 		credits := *usage.ResetCredits
@@ -121,7 +140,6 @@ func resultFor(account account, usage provider.Usage, err error) accountResult {
 		}
 		result.ResetCredits = &credits
 	}
-	return result
 }
 
 // Only the provider CLI can renew the live login; hop login would adopt it unchanged.

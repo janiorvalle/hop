@@ -138,6 +138,10 @@ func (adapter Adapter) Fetcher(credentials Credentials) provider.Fetcher {
 	return credentialFetcher{adapter: adapter, credentials: credentials}
 }
 
+func (fetcher credentialFetcher) Enrollment() provider.Enrollment {
+	return provider.Enrollment{Plan: fetcher.credentials.Plan(), RefreshTokenExpiresAt: fetcher.credentials.RefreshTokenExpiry()}
+}
+
 func (fetcher credentialFetcher) FetchUsage(ctx context.Context) (provider.Usage, error) {
 	return fetcher.adapter.FetchUsage(ctx, fetcher.credentials)
 }
@@ -175,7 +179,6 @@ func (adapter Adapter) FetchUsage(ctx context.Context, credentials Credentials) 
 			usage.ResetCredits = &credits
 		}
 	}
-	usage.RefreshTokenExpiresAt = credentials.RefreshTokenExpiry()
 	return usage, nil
 }
 
@@ -325,21 +328,39 @@ type refreshResponse struct {
 // NeedsRefresh reports whether the access token is a JWT that expires within skew.
 // Opaque tokens are left alone so a read-only glance can still try them safely.
 func (credentials Credentials) NeedsRefresh(now time.Time, skew time.Duration) bool {
-	parts := strings.Split(credentials.AccessToken, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return false
-	}
 	var claims struct {
 		ExpiresAt int64 `json:"exp"`
 	}
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.ExpiresAt <= 0 {
+	if err := decodeClaims(credentials.AccessToken, &claims); err != nil || claims.ExpiresAt <= 0 {
 		return false
 	}
 	return time.Unix(claims.ExpiresAt, 0).Before(now.Add(skew))
+}
+
+// Plan is the ChatGPT plan the ID token was issued for, or empty when the
+// token is opaque or predates the claim. The usage endpoint names the current one.
+func (credentials Credentials) Plan() string {
+	var claims struct {
+		Auth struct {
+			PlanType string `json:"chatgpt_plan_type"`
+		} `json:"https://api.openai.com/auth"`
+	}
+	if err := decodeClaims(credentials.IDToken, &claims); err != nil {
+		return ""
+	}
+	return claims.Auth.PlanType
+}
+
+func decodeClaims(token string, claims any) error {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return fmt.Errorf("token is not a JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(payload, claims)
 }
 
 // RefreshTokenExpiry is when hop stops trusting the refresh token: last_refresh
