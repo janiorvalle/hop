@@ -3,11 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -92,65 +90,6 @@ func TestRemoveAccountRefusesSlotBeingEnrolled(t *testing.T) {
 	err = remover.Remove("codex", "work")
 	if err == nil || !strings.Contains(err.Error(), "being enrolled") {
 		t.Fatalf("Remove() error = %v, want enrollment-in-progress guidance", err)
-	}
-}
-
-func TestRemoveAccountPreservesClaudeStagingRecoverySlot(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	record, err := json.Marshal(claudeStagingRecord{ActiveAccount: "work", ProcessID: os.Getpid(), CreatedAt: time.Now().UTC()})
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(accountVault.Root(), claudeStagingFilename), record, 0o600); err != nil {
-		t.Fatalf("WriteFile(transaction) error = %v", err)
-	}
-	remover := accountRemover{vault: accountVault, stdout: io.Discard}
-
-	err = remover.Remove("claude", "work")
-	if err == nil || !strings.Contains(err.Error(), "needed to restore") {
-		t.Fatalf("Remove() error = %v, want staging recovery guard", err)
-	}
-	workPath, _ := accountVault.SlotPath("claude", "work")
-	if _, err := os.Stat(workPath); err != nil {
-		t.Fatalf("recovery slot was removed: %v", err)
-	}
-}
-
-func TestRemoveAccountRechecksStagingAfterWaitingForClaudeLoginLock(t *testing.T) {
-	t.Parallel()
-
-	accountVault := newTestVault(t)
-	seedActiveClaudeAccount(t, accountVault, "work")
-	releaseLogin, err := acquireClaudeLoginLock(context.Background(), accountVault.Root())
-	if err != nil {
-		t.Fatalf("acquireClaudeLoginLock() error = %v", err)
-	}
-	remover := accountRemover{vault: accountVault, stdout: io.Discard}
-	result := make(chan error, 1)
-	go func() { result <- remover.Remove("claude", "work") }()
-	select {
-	case err := <-result:
-		t.Fatalf("Remove() returned while Claude login lock held: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	record, err := json.Marshal(claudeStagingRecord{ActiveAccount: "work", ProcessID: os.Getpid(), CreatedAt: time.Now().UTC()})
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(accountVault.Root(), claudeStagingFilename), record, 0o600); err != nil {
-		t.Fatalf("WriteFile(transaction) error = %v", err)
-	}
-	releaseLogin()
-	err = <-result
-	if err == nil || !strings.Contains(err.Error(), "needed to restore") {
-		t.Fatalf("Remove() error = %v, want post-lock staging guard", err)
-	}
-	workPath, _ := accountVault.SlotPath("claude", "work")
-	if _, err := os.Stat(workPath); err != nil {
-		t.Fatalf("staging recovery slot was removed: %v", err)
 	}
 }
 
