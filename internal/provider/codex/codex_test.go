@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -61,7 +62,7 @@ func TestFetchUsageClassifiesWindowsByDurationAndParsesEmail(t *testing.T) {
 	t.Cleanup(server.Close)
 	fixedNow := time.Date(2026, 8, 8, 5, 0, 0, 0, time.UTC)
 
-	usage, err := New(Config{UsageURL: server.URL, Now: func() time.Time { return fixedNow }}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token", AccountID: "account-id"})
+	usage, err := New(Config{UsageURL: server.URL, ResetCreditsURL: server.URL, Now: func() time.Time { return fixedNow }}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token", AccountID: "account-id"})
 	if err != nil {
 		t.Fatalf("FetchUsage() error = %v", err)
 	}
@@ -76,6 +77,34 @@ func TestFetchUsageClassifiesWindowsByDurationAndParsesEmail(t *testing.T) {
 	}
 	if got := usage.Limits[0]; got.Scope != "gpt-5-codex" || got.Kind != "model_five_hour" || !got.Active {
 		t.Errorf("first model limit = %+v, want active five-hour limit", got)
+	}
+}
+
+func TestFetchUsageStatusMatchesTheRecoveryStep(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		statusCode int
+		want       string
+	}{
+		{name: "authentication", statusCode: http.StatusUnauthorized, want: "hop login codex <account>"},
+		{name: "rate limit", statusCode: http.StatusTooManyRequests, want: "wait and retry 'hop ls'"},
+		{name: "provider outage", statusCode: http.StatusServiceUnavailable, want: "usage service is unavailable"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.statusCode)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access-token", AccountID: "account-id"})
+			if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("FetchUsage() error = %v, want %q recovery", err, testCase.want)
+			}
+		})
 	}
 }
 
@@ -155,17 +184,215 @@ func TestRefreshWriteFailureReturnsRecoveryCopy(t *testing.T) {
 	}
 }
 
-func TestFetchUsageRejectsUnknownWindowDuration(t *testing.T) {
+func TestFetchUsageKeepsUnknownWindowsAsScopedLimits(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(writer, `{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":3600,"reset_after_seconds":60}}}`)
+		_, _ = io.WriteString(writer, `{
+			"plan_type": "pro",
+			"rate_limit": {
+				"primary_window": {"used_percent": 45, "limit_window_seconds": 604800, "reset_after_seconds": 1200},
+				"secondary_window": {"used_percent": 20, "limit_window_seconds": 2592000, "reset_after_seconds": 86400}
+			},
+			"code_review_rate_limit": {
+				"primary_window": {"used_percent": 10, "limit_window_seconds": 604800, "reset_after_seconds": 600}
+			},
+			"additional_rate_limits": [{
+				"limit_name": "gpt-5-codex",
+				"rate_limit": {"primary_window": {"used_percent": 5, "limit_window_seconds": 2592000, "reset_after_seconds": 600}}
+			}]
+		}`)
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
-	if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), "3600-second") {
-		t.Fatalf("FetchUsage() error = %v, want actionable unknown-window error", err)
+	usage, err := New(Config{UsageURL: server.URL, ResetCreditsURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	if len(usage.Windows) != 1 || usage.Windows[0].Kind != provider.Weekly {
+		t.Fatalf("Windows = %+v, want only the weekly window", usage.Windows)
+	}
+	if len(usage.Limits) != 3 {
+		t.Fatalf("Limits = %+v, want monthly, code review, and model limits", usage.Limits)
+	}
+	monthly := usage.Limits[0]
+	if monthly.Kind != "account_30d" || monthly.Group != "account" || monthly.Scope != "30d" || !monthly.Active || monthly.UsedPercent != 20 {
+		t.Errorf("monthly limit = %+v, want active account_30d scoped 30d", monthly)
+	}
+	codeReview := usage.Limits[1]
+	if codeReview.Kind != "code_review_weekly" || codeReview.Group != "code_review" || codeReview.Scope != "code review" || !codeReview.Active {
+		t.Errorf("code review limit = %+v, want active code_review_weekly even below the account's weekly usage", codeReview)
+	}
+	model := usage.Limits[2]
+	if model.Kind != "model_30d" || model.Scope != "gpt-5-codex" || model.Active {
+		t.Errorf("model limit = %+v, want inactive model_30d below the account's monthly usage", model)
+	}
+}
+
+func TestFetchUsageRejectsMalformedWindow(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "empty window", body: `{"rate_limit":{"primary_window":{}}}`, want: "limit_window_seconds is missing"},
+		{name: "missing reset", body: `{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000}}}`, want: "reset_at and reset_after_seconds are missing"},
+	}
+	for _, testCase := range testCases {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(writer, testCase.body)
+		}))
+		t.Cleanup(server.Close)
+
+		_, err := New(Config{UsageURL: server.URL}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+		if !errors.Is(err, ErrUsage) || !strings.Contains(err.Error(), testCase.want) || !strings.Contains(err.Error(), "update hop") {
+			t.Errorf("%s: FetchUsage() error = %v, want ErrUsage naming %q with a next step", testCase.name, err, testCase.want)
+		}
+	}
+}
+
+const usageWithCredits = `{
+	"plan_type": "pro",
+	"rate_limit": {"primary_window": {"used_percent": 45, "limit_window_seconds": 604800, "reset_after_seconds": 1200}},
+	"rate_limit_reset_credits": {
+		"available_count": 2,
+		"credits": [
+			{"id": "a", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-01T00:00:00Z", "expires_at": "2026-08-30T00:00:00Z"},
+			{"id": "b", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-02T00:00:00Z", "expires_at": "2026-08-20T00:00:00Z"},
+			{"id": "c", "status": "consumed", "reset_type": "codex_rate_limits", "granted_at": "2026-07-01T00:00:00Z", "expires_at": "2026-08-25T00:00:00Z"},
+			{"id": "d", "status": "available", "reset_type": "other", "granted_at": "2026-07-01T00:00:00Z", "expires_at": "2026-08-10T00:00:00Z"}
+		]
+	}
+}`
+
+const usageWithoutCredits = `{
+	"plan_type": "pro",
+	"rate_limit": {"primary_window": {"used_percent": 45, "limit_window_seconds": 604800, "reset_after_seconds": 1200}}
+}`
+
+func TestFetchUsageReadsResetCreditsFromTheUsagePayload(t *testing.T) {
+	t.Parallel()
+
+	creditsCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/credits" {
+			creditsCalls++
+		}
+		_, _ = io.WriteString(writer, usageWithCredits)
+	}))
+	t.Cleanup(server.Close)
+
+	usage, err := New(Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits"}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	if creditsCalls != 0 {
+		t.Fatalf("credits endpoint called %d times, want none when the usage payload carries them", creditsCalls)
+	}
+	assertTwoAvailableCredits(t, usage)
+}
+
+func TestFetchUsageFallsBackToTheResetCreditsEndpoint(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/credits" {
+			_, _ = io.WriteString(writer, usageWithoutCredits)
+			return
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer access" {
+			t.Errorf("Authorization = %q, want the usage bearer", got)
+		}
+		if got := request.Header.Get("chatgpt-account-id"); got != "account" {
+			t.Errorf("chatgpt-account-id = %q, want account", got)
+		}
+		if got := request.Header.Get("OpenAI-Beta"); got != "codex-1" {
+			t.Errorf("OpenAI-Beta = %q, want codex-1", got)
+		}
+		if got := request.Header.Get("Originator"); got != "Codex Desktop" {
+			t.Errorf("Originator = %q, want Codex Desktop", got)
+		}
+		_, _ = io.WriteString(writer, `{
+			"available_count": 2,
+			"credits": [
+				{"id": "a", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-01T00:00:00Z", "expires_at": "2026-08-30T00:00:00Z"},
+				{"id": "b", "status": "available", "reset_type": "codex_rate_limits", "granted_at": "2026-08-02T00:00:00Z", "expires_at": "2026-08-20T00:00:00Z"}
+			]
+		}`)
+	}))
+	t.Cleanup(server.Close)
+
+	usage, err := New(Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits"}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+	if err != nil {
+		t.Fatalf("FetchUsage() error = %v", err)
+	}
+	assertTwoAvailableCredits(t, usage)
+}
+
+func TestFetchUsageSurvivesAFailedResetCreditsCall(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		credits http.HandlerFunc
+	}{
+		{name: "server error", credits: func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusInternalServerError) }},
+		{name: "malformed body", credits: func(writer http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(writer, "not json") }},
+		{name: "hangs past its timeout", credits: func(_ http.ResponseWriter, request *http.Request) { <-request.Context().Done() }},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/credits" {
+					testCase.credits(writer, request)
+					return
+				}
+				_, _ = io.WriteString(writer, usageWithoutCredits)
+			}))
+			t.Cleanup(server.Close)
+
+			usage, err := New(Config{UsageURL: server.URL + "/usage", ResetCreditsURL: server.URL + "/credits"}).FetchUsage(context.Background(), Credentials{AccessToken: "access", AccountID: "account"})
+			if err != nil {
+				t.Fatalf("FetchUsage() error = %v, want usage without credits", err)
+			}
+			if len(usage.Windows) != 1 {
+				t.Fatalf("Windows = %+v, want the weekly window kept", usage.Windows)
+			}
+			if usage.ResetCredits != nil {
+				t.Fatalf("ResetCredits = %+v, want unknown credits left nil rather than reported as zero", usage.ResetCredits)
+			}
+		})
+	}
+}
+
+func assertTwoAvailableCredits(t *testing.T, usage provider.Usage) {
+	t.Helper()
+	credits := usage.ResetCredits
+	if credits == nil || credits.Count != 2 || len(credits.Credits) != 2 {
+		t.Fatalf("ResetCredits = %+v, want count 2 with the two available codex credits", credits)
+	}
+	wantGranted := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	wantExpires := time.Date(2026, time.August, 30, 0, 0, 0, 0, time.UTC)
+	if !credits.Credits[0].GrantedAt.Equal(wantGranted) || !credits.Credits[0].ExpiresAt.Equal(wantExpires) {
+		t.Errorf("first credit = %+v, want granted %s expiring %s", credits.Credits[0], wantGranted, wantExpires)
+	}
+	soonest, ok := credits.SoonestExpiry()
+	if !ok || !soonest.Equal(time.Date(2026, time.August, 20, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("SoonestExpiry() = %s, %t, want the August 20 credit", soonest, ok)
+	}
+}
+
+func TestDurationLabelUsesTheLargestWholeUnit(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[int64]string{2_592_000: "30d", 86_400: "1d", 3_600: "1h", 5_400: "90m", 90: "90s"}
+	for seconds, want := range testCases {
+		if got := durationLabel(seconds); got != want {
+			t.Errorf("durationLabel(%d) = %q, want %q", seconds, got, want)
+		}
 	}
 }
 
@@ -186,4 +413,125 @@ func (store *memoryStore) Write(credentials Credentials) error {
 	store.credentials = credentials
 	store.writes++
 	return nil
+}
+
+func TestConsumeResetCreditSendsTheRedeemIDAsTheDesktopApp(t *testing.T) {
+	t.Parallel()
+
+	var gotPath, gotMethod, gotBody string
+	gotHeaders := http.Header{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		gotPath, gotMethod = request.URL.Path, request.Method
+		body, _ := io.ReadAll(request.Body)
+		gotBody = string(body)
+		gotHeaders = request.Header.Clone()
+		_, _ = io.WriteString(writer, `{}`)
+	}))
+	t.Cleanup(server.Close)
+
+	err := New(Config{ResetCreditsURL: server.URL + "/credits"}).ConsumeResetCredit(context.Background(), Credentials{AccessToken: "access", AccountID: "account"}, "11111111-2222-4333-8444-555555555555")
+	if err != nil {
+		t.Fatalf("ConsumeResetCredit() error = %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/credits/consume" {
+		t.Fatalf("request = %s %s, want POST /credits/consume", gotMethod, gotPath)
+	}
+	if gotBody != `{"redeem_request_id":"11111111-2222-4333-8444-555555555555"}` {
+		t.Fatalf("body = %s", gotBody)
+	}
+	for header, want := range map[string]string{
+		"Authorization":      "Bearer access",
+		"Chatgpt-Account-Id": "account",
+		"Openai-Beta":        "codex-1",
+		"Originator":         "Codex Desktop",
+		"Content-Type":       "application/json",
+	} {
+		if got := gotHeaders.Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestConsumeResetCreditExplainsRejections(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{name: "expired login", status: http.StatusUnauthorized, want: "hop login codex <account>"},
+		{name: "rate limited", status: http.StatusTooManyRequests, want: "wait and retry"},
+		{name: "outage", status: http.StatusBadGateway, want: "retry later"},
+		{name: "unexpected", status: http.StatusConflict, want: "check 'hop ls'"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(testCase.status)
+			}))
+			t.Cleanup(server.Close)
+
+			err := New(Config{ResetCreditsURL: server.URL}).ConsumeResetCredit(context.Background(), Credentials{AccessToken: "access", AccountID: "account"}, "id")
+			if !errors.Is(err, ErrReset) {
+				t.Fatalf("ConsumeResetCredit() error = %v, want ErrReset", err)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", testCase.status)) || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("ConsumeResetCredit() error = %v, want the status and %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestConsumeResetCreditReportsAnUnreachableEndpoint(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	server.Close()
+
+	err := New(Config{ResetCreditsURL: server.URL}).ConsumeResetCredit(context.Background(), Credentials{AccessToken: "access", AccountID: "account"}, "id")
+	if !errors.Is(err, ErrReset) || !strings.Contains(err.Error(), "reach the Codex reset endpoint") {
+		t.Fatalf("ConsumeResetCredit() error = %v, want an unreachable-endpoint ErrReset", err)
+	}
+}
+
+func TestCredentialsPlanReadsTheChatGPTPlanClaim(t *testing.T) {
+	t.Parallel()
+
+	encode := func(payload string) string {
+		return "header." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".signature"
+	}
+	testCases := []struct {
+		name    string
+		idToken string
+		want    string
+	}{
+		{name: "plan claim", idToken: encode(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"pro","chatgpt_account_id":"account"}}`), want: "pro"},
+		{name: "claim missing", idToken: encode(`{"email":"owner@example.com"}`), want: ""},
+		{name: "opaque token", idToken: "id", want: ""},
+		{name: "no token", idToken: "", want: ""},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := (Credentials{IDToken: testCase.idToken}).Plan(); got != testCase.want {
+				t.Errorf("Plan() = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestFetcherEnrollmentComesFromTheCredentials(t *testing.T) {
+	t.Parallel()
+
+	idToken := "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}`)) + ".signature"
+	fetcher := New(Config{}).Fetcher(Credentials{IDToken: idToken, AccessToken: "access", AccountID: "account", LastRefresh: "2026-08-08T05:00:00Z"})
+	enrollment := fetcher.Enrollment()
+	if enrollment.Plan != "plus" {
+		t.Errorf("Plan = %q, want plus from the ID token", enrollment.Plan)
+	}
+	if want := time.Date(2026, time.August, 8, 5, 0, 0, 0, time.UTC).Add(refreshTokenLifetime); !enrollment.RefreshTokenExpiresAt.Equal(want) {
+		t.Errorf("RefreshTokenExpiresAt = %s, want %s", enrollment.RefreshTokenExpiresAt, want)
+	}
 }

@@ -28,6 +28,15 @@ func WriteLiveCredentials(_ context.Context, credentials Credentials) error {
 	return (LiveFile{Path: path}).Write(credentials)
 }
 
+// ClearLiveCredentialsIfMatches removes only the file hop installed.
+func ClearLiveCredentialsIfMatches(_ context.Context, expected Credentials) error {
+	path, err := liveCredentialsPath()
+	if err != nil {
+		return err
+	}
+	return (LiveFile{Path: path}).ClearIfMatches(expected)
+}
+
 // LiveCredentialsTarget names where live Claude credentials are stored, for
 // switch-transaction fingerprints. It resolves CLAUDE_CONFIG_DIR so a
 // transaction recorded under one config directory is never restored into

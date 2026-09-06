@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -142,5 +143,39 @@ func TestLiveFileWriteRequiresExistingParentDirectory(t *testing.T) {
 	err := live.Write(Credentials{AccessToken: "access", RefreshToken: "refresh", AccountID: "account"})
 	if err == nil || !strings.Contains(err.Error(), "must already exist") {
 		t.Fatalf("Write() error = %v, want existing-directory requirement", err)
+	}
+}
+
+func TestLiveFileClearIfMatchesPreservesUnexpectedCredentials(t *testing.T) {
+	directory := t.TempDir()
+	live := LiveFile{Path: filepath.Join(directory, "auth.json")}
+	unexpected := Credentials{AccessToken: "new", RefreshToken: "new-refresh", AccountID: "new-account"}
+	if err := live.Write(unexpected); err != nil {
+		t.Fatal(err)
+	}
+
+	err := live.ClearIfMatches(Credentials{AccessToken: "old", RefreshToken: "old-refresh", AccountID: "old-account"})
+	if err == nil || !strings.Contains(err.Error(), "preserved the unexpected login") {
+		t.Fatalf("ClearIfMatches() error = %v, want unexpected-login refusal", err)
+	}
+	written, readErr := live.Read()
+	if readErr != nil || written.AccessToken != unexpected.AccessToken || written.RefreshToken != unexpected.RefreshToken || written.AccountID != unexpected.AccountID {
+		t.Fatalf("live credentials = %+v, %v; want unexpected credentials preserved", written, readErr)
+	}
+}
+
+func TestLiveFileClearIfMatchesRemovesExpectedCredentials(t *testing.T) {
+	directory := t.TempDir()
+	live := LiveFile{Path: filepath.Join(directory, "auth.json")}
+	expected := Credentials{AccessToken: "access", RefreshToken: "refresh", AccountID: "account"}
+	if err := live.Write(expected); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := live.ClearIfMatches(expected); err != nil {
+		t.Fatalf("ClearIfMatches() error = %v", err)
+	}
+	if _, err := os.Stat(live.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("live credentials still exist: %v", err)
 	}
 }

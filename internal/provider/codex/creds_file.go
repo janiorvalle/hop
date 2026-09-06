@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/janiorvalle/hop/internal/provider/livefile"
 )
 
 const recoveryPattern = ".auth-recovery-*.json"
@@ -80,6 +82,18 @@ func (live LiveFile) Write(credentials Credentials) error {
 		return fmt.Errorf("install live Codex credentials at %s: %w", live.Path, err)
 	}
 	return nil
+}
+
+// ClearIfMatches removes only the credential object hop previously installed.
+// A replacement written concurrently remains at the live path.
+func (live LiveFile) ClearIfMatches(expected Credentials) error {
+	return livefile.ClearIfMatches(live.Path, "live Codex credentials", func(quarantine string) (bool, error) {
+		actual, err := (LiveFile{Path: quarantine}).Read()
+		return actual.IDToken == expected.IDToken &&
+			actual.AccessToken == expected.AccessToken &&
+			actual.RefreshToken == expected.RefreshToken &&
+			actual.AccountID == expected.AccountID, err
+	})
 }
 
 // Read loads credentials without modifying the source file.
