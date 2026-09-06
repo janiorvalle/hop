@@ -75,9 +75,12 @@ type Options struct {
 // The glance answers "which account can I use right now": every percentage is
 // capacity LEFT (100 - used), the headline is the headroom at the tightest
 // binding limit, and accounts sort most-usable first with error rows last.
+// NoAccountsEnrolled is the whole output of any account listing before the first login.
+const NoAccountsEnrolled = "No accounts enrolled. Run 'hop login claude work' or 'hop login codex work'.\n"
+
 func Table(writer io.Writer, rows []Row, options Options) error {
 	if len(rows) == 0 {
-		_, err := io.WriteString(writer, "No accounts enrolled. Run 'hop login claude work' or 'hop login codex work'.\n")
+		_, err := io.WriteString(writer, NoAccountsEnrolled)
 		return err
 	}
 	if options.Width <= 0 {

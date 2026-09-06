@@ -128,6 +128,15 @@ func recoverDefaultSwitch(ctx context.Context, stdout io.Writer) error {
 }
 
 func showAccountsSafely(ctx context.Context, stdout, stderr io.Writer, asJSON bool) error {
+	return withRecoveredSwitch(ctx, stdout, stderr, func(ctx context.Context) error {
+		return showAccounts(ctx, stdout, asJSON)
+	})
+}
+
+// withRecoveredSwitch holds both provider locks and the state lock while run
+// reads the vault, after finishing any switch that was interrupted mid-flight,
+// so run never sees a slot whose tokens are also the live login.
+func withRecoveredSwitch(ctx context.Context, stdout, stderr io.Writer, run func(context.Context) error) error {
 	manager, err := defaultSwitchManager(stdout)
 	if err != nil {
 		return err
@@ -149,7 +158,7 @@ func showAccountsSafely(ctx context.Context, stdout, stderr io.Writer, asJSON bo
 	if recovered {
 		_, _ = io.WriteString(stderr, "hop: recovered an interrupted account switch before continuing\n")
 	}
-	return showAccounts(ctx, stdout, asJSON)
+	return run(ctx)
 }
 
 func defaultSwitchManager(stdout io.Writer) (switchManager, error) {
