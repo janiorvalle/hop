@@ -1,10 +1,14 @@
 package claude
 
 import (
+	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -174,5 +178,92 @@ func TestLiveFileClearIfMatchesRemovesExpectedCredentials(t *testing.T) {
 	}
 	if _, err := os.Stat(live.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("live credentials still exist: %v", err)
+	}
+}
+
+func TestFileStoreRoundTripKeepsMCPLoginsAndUnknownKeysBesideTheLogin(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "claude", "work", "credentials.json")
+	store := FileStore{Path: path}
+	want := Credentials{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+		MCPTokens: MCPTokens{
+			"linear-server|abc": json.RawMessage(`{"serverName":"linear-server","accessToken":"lin","expiresAt":1700000000000}`),
+		},
+		Unknown: map[string]json.RawMessage{"somethingNew": json.RawMessage(`{"keep":[1,2,3]}`)},
+	}
+	if err := store.Write(want); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	got, err := store.Read()
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	assertSameJSON(t, got.MCPTokens["linear-server|abc"], want.MCPTokens["linear-server|abc"])
+	assertSameJSON(t, got.Unknown["somethingNew"], want.Unknown["somethingNew"])
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &item); err != nil {
+		t.Fatalf("slot file is not a JSON object: %v", err)
+	}
+	for _, key := range []string{"claudeAiOauth", "mcpOAuth", "somethingNew"} {
+		if _, ok := item[key]; !ok {
+			t.Fatalf("slot file keys = %v, want %q at the top level", slices.Sorted(maps.Keys(item)), key)
+		}
+	}
+	var login map[string]json.RawMessage
+	if err := json.Unmarshal(item["claudeAiOauth"], &login); err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := login["mcpOAuth"]; leaked {
+		t.Fatalf("claudeAiOauth = %s, want the MCP logins outside the login object", item["claudeAiOauth"])
+	}
+}
+
+func TestParseCredentialsWithoutMCPLoginsLeavesThemEmpty(t *testing.T) {
+	t.Parallel()
+
+	credentials, err := parseCredentials([]byte(`{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh"}}`))
+	if err != nil {
+		t.Fatalf("parseCredentials() error = %v", err)
+	}
+	if len(credentials.MCPTokens) != 0 || len(credentials.Unknown) != 0 {
+		t.Fatalf("parseCredentials() = %+v, want no MCP logins and no unknown keys", credentials)
+	}
+	contents, err := encodeCredentials(credentials)
+	if err != nil {
+		t.Fatalf("encodeCredentials() error = %v", err)
+	}
+	if strings.Contains(string(contents), "mcpOAuth") {
+		t.Fatalf("encodeCredentials() = %s, want no empty mcpOAuth section", contents)
+	}
+}
+
+func TestParseCredentialsRejectsMCPLoginsThatAreNotKeyedByServer(t *testing.T) {
+	t.Parallel()
+
+	_, err := parseCredentials([]byte(`{"claudeAiOauth":{"accessToken":"access"},"mcpOAuth":["not","an","object"]}`))
+	if err == nil || !strings.Contains(err.Error(), "mcpOAuth") {
+		t.Fatalf("parseCredentials() error = %v, want the mcpOAuth shape named", err)
+	}
+}
+
+func assertSameJSON(t *testing.T, got, want json.RawMessage) {
+	t.Helper()
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("got %s is not JSON: %v", got, err)
+	}
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("want %s is not JSON: %v", want, err)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("got %s, want %s", got, want)
 	}
 }

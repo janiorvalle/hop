@@ -34,7 +34,16 @@ var (
 	ErrUsage       = errors.New("claude usage request failed")
 )
 
-// Credentials is the OAuth object stored below .claudeAiOauth.
+// MCPTokens is the mcpOAuth section of the credential item: the login Claude
+// Code holds with each MCP server, keyed the way Claude Code keys them. The
+// servers issue these to the Claude Code on this machine, not to the Anthropic
+// account, so a switch carries the live set along instead of swapping it out
+// with the login.
+type MCPTokens map[string]json.RawMessage
+
+// Credentials is the OAuth object stored below .claudeAiOauth, together with
+// the rest of the item it shares with Claude Code, so a copy of the login
+// never drops what sits beside it.
 type Credentials struct {
 	AccessToken           string   `json:"accessToken"`
 	RefreshToken          string   `json:"refreshToken"`
@@ -43,6 +52,12 @@ type Credentials struct {
 	SubscriptionType      string   `json:"subscriptionType,omitempty"`
 	RateLimitTier         string   `json:"rateLimitTier,omitempty"`
 	Scopes                []string `json:"scopes,omitempty"`
+	// MCPTokens is the item's mcpOAuth section, stored beside the login and
+	// never inside it.
+	MCPTokens MCPTokens `json:"-"`
+	// Unknown holds every other top-level key of the item unchanged, so a key
+	// hop has not heard of survives the trip through a slot.
+	Unknown map[string]json.RawMessage `json:"-"`
 }
 
 // Profile identifies the Claude account that owns an OAuth access token and

@@ -63,7 +63,10 @@ What hop touches:
   you set it, with private permissions.
 - **The live credential slot, in place.** Before installing the account you
   asked for, hop copies the current live credentials back to the account slot
-  they came from, so the login you're leaving is never lost.
+  they came from, so the login you're leaving is never lost. Claude Code keeps
+  its MCP server logins in that same item, and those ride with the machine,
+  not the account: every hop carries the live set along, so Linear and the
+  rest stay connected and a server you disconnect stays disconnected.
 - **Idle account tokens, before they die.** Every glance rotates a managed
   account's tokens when its access token is about to expire, or when its
   refresh token has less than seven days left, so an account you haven't

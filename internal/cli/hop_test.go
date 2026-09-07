@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1460,4 +1461,191 @@ func TestDefaultCodexSwitchStoreHonorsCodexHome(t *testing.T) {
 	if want := filepath.Join(codexHome, "auth.json"); target != want {
 		t.Fatalf("codex live target = %q, want %q", target, want)
 	}
+}
+
+// A Linear login connected on one account has to survive a hop away and a hop
+// back, through real slot files and a real live file, with nothing reconnected.
+func TestSwitchCarriesMCPLoginsBetweenClaudeAccounts(t *testing.T) {
+	hopHome := t.TempDir()
+	providerDirectory := filepath.Join(t.TempDir(), ".claude")
+	livePath := filepath.Join(providerDirectory, ".credentials.json")
+	t.Setenv("HOP_HOME", hopHome)
+	t.Setenv(claudeCredentialsFileOverride, livePath)
+	t.Setenv(claudeAccountEmailOverride, "owner@example.test")
+	if err := os.Mkdir(providerDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	accountVault, err := vault.New(hopHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSlot(t, accountVault, "personal", claudeCredentials("personal"))
+	writeClaudeSlot(t, accountVault, "work", claudeCredentials("work"))
+	activeState := state.New()
+	activeState.SetActive("claude", "personal")
+	if err := activeState.Save(hopHome); err != nil {
+		t.Fatal(err)
+	}
+	linear := json.RawMessage(`{"serverName":"linear-server","accessToken":"lin_oauth_fake","refreshToken":"lin_refresh_fake","expiresAt":1900000000000}`)
+	live := claudeCredentials("personal")
+	live.MCPTokens = claude.MCPTokens{"linear-server|Y2FsbGJhY2s=": linear}
+	if err := (claude.LiveFile{Path: livePath}).Write(live); err != nil {
+		t.Fatal(err)
+	}
+
+	runSwitch := func(accountName string) {
+		t.Helper()
+		var stderr bytes.Buffer
+		if exitCode := Run([]string{"claude", accountName}, io.Discard, &stderr); exitCode != 0 {
+			t.Fatalf("Run(claude %s) exit code = %d, want 0; stderr = %q", accountName, exitCode, stderr.String())
+		}
+	}
+	assertLinearLogin := func(what string, credentials claude.Credentials) {
+		t.Helper()
+		if got := credentials.MCPTokens["linear-server|Y2FsbGJhY2s="]; !sameJSON(t, got, linear) {
+			t.Fatalf("%s Linear login = %s, want %s", what, got, linear)
+		}
+	}
+
+	runSwitch("work")
+	written, err := (claude.LiveFile{Path: livePath}).Read()
+	if err != nil || written.AccessToken != "work-access" {
+		t.Fatalf("live Claude credentials = %+v, error = %v; want the work login", written, err)
+	}
+	assertLinearLogin("live after hopping to work", written)
+	assertLinearLogin("personal slot after hopping away", readClaudeSlot(t, accountVault, "personal"))
+
+	runSwitch("personal")
+	written, err = (claude.LiveFile{Path: livePath}).Read()
+	if err != nil || written.AccessToken != "personal-access" {
+		t.Fatalf("live Claude credentials = %+v, error = %v; want the personal login", written, err)
+	}
+	assertLinearLogin("live after hopping back", written)
+	assertLinearLogin("work slot after hopping away", readClaudeSlot(t, accountVault, "work"))
+}
+
+// The live machine refreshed Linear since the target slot last saw it, and
+// PostHog was disconnected on this machine after the target slot saved it: the
+// switch installs the live set, so Linear stays fresh and PostHog stays
+// disconnected.
+func TestSwitchInstallsTheLiveMCPLoginsOverTheSlotsCopy(t *testing.T) {
+	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+	staleLinear := json.RawMessage(`{"serverName":"linear-server","accessToken":"stale","expiresAt":100}`)
+	freshLinear := json.RawMessage(`{"serverName":"linear-server","accessToken":"fresh","expiresAt":200}`)
+	posthog := json.RawMessage(`{"serverName":"posthog","accessToken":"phx","expiresAt":150}`)
+	target := claudeCredentials("target")
+	target.MCPTokens = claude.MCPTokens{"linear-server": staleLinear, "posthog": posthog}
+	writeClaudeSlot(t, manager.vault, "old", claudeCredentials("slot-old"))
+	writeClaudeSlot(t, manager.vault, "work", target)
+	stateStore.value.SetActive("claude", "old")
+	claudeLive.credentials = claudeCredentials("live-rotated")
+	claudeLive.credentials.MCPTokens = claude.MCPTokens{"linear-server": freshLinear}
+
+	if err := manager.Switch(context.Background(), "claude", "work"); err != nil {
+		t.Fatalf("Switch() error = %v", err)
+	}
+
+	want := claude.MCPTokens{"linear-server": freshLinear}
+	assertMCPTokens(t, "live", claudeLive.credentials.MCPTokens, want)
+	assertMCPTokens(t, "outgoing slot", readClaudeSlot(t, manager.vault, "old").MCPTokens, want)
+	if len(claudeLive.writes) != 1 || claudeLive.writes[0].AccessToken != "target-access" {
+		t.Fatalf("live writes = %+v, want one install of the work login", claudeLive.writes)
+	}
+}
+
+// Claude signed out and took its Keychain item with it, so the machine has no
+// MCP logins; the slot's saved ones do not come back with the account.
+func TestSwitchFromAbsentLiveInstallsNoMCPLogins(t *testing.T) {
+	manager, _, claudeLive, _, _ := newSwitchTestManager(t)
+	target := claudeCredentials("work")
+	target.MCPTokens = claude.MCPTokens{"linear-server": json.RawMessage(`{"accessToken":"saved","expiresAt":100}`)}
+	writeClaudeSlot(t, manager.vault, "work", target)
+	claudeLive.readErr = os.ErrNotExist
+
+	if err := manager.Switch(context.Background(), "claude", "work"); err != nil {
+		t.Fatalf("Switch() error = %v", err)
+	}
+
+	if claudeLive.credentials.AccessToken != "work-access" {
+		t.Fatalf("live Claude access token = %q, want work-access", claudeLive.credentials.AccessToken)
+	}
+	if len(claudeLive.credentials.MCPTokens) != 0 {
+		t.Fatalf("live MCP logins = %v, want none after switching from absence", claudeLive.credentials.MCPTokens)
+	}
+}
+
+// hop installed the work login and crashed before committing, and Claude Code
+// refreshed Linear meanwhile: recovery restores the old login with the fresh
+// Linear login, not the copy the old slot saved at the start of the switch.
+func TestRecoverInterruptedClaudeSwitchKeepsTheLiveMCPLogins(t *testing.T) {
+	manager, stateStore, claudeLive, _, _ := newSwitchTestManager(t)
+	staleLinear := json.RawMessage(`{"serverName":"linear-server","accessToken":"stale","expiresAt":100}`)
+	freshLinear := json.RawMessage(`{"serverName":"linear-server","accessToken":"fresh","expiresAt":200}`)
+	old := claudeCredentials("old")
+	old.MCPTokens = claude.MCPTokens{"linear-server": staleLinear}
+	writeClaudeSlot(t, manager.vault, "old", old)
+	writeClaudeSlot(t, manager.vault, "work", claudeCredentials("work"))
+	claudeLive.credentials = claudeCredentials("work")
+	claudeLive.credentials.MCPTokens = claude.MCPTokens{"linear-server": freshLinear}
+	stateStore.value.SetActive("claude", "work")
+	transaction := switchTransaction{Steps: []switchTransactionStep{{
+		Provider:       "claude",
+		Previous:       "old",
+		Target:         "work",
+		HadActiveState: true,
+	}}}
+	if err := manager.writeSwitchTransaction(transaction); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := manager.recoverInterruptedSwitch(context.Background())
+	if err != nil || !recovered {
+		t.Fatalf("recoverInterruptedSwitch() = %t, %v; want true, nil", recovered, err)
+	}
+	if claudeLive.credentials.AccessToken != "old-access" {
+		t.Fatalf("live Claude access token = %q, want old-access", claudeLive.credentials.AccessToken)
+	}
+	assertMCPTokens(t, "live after recovery", claudeLive.credentials.MCPTokens, claude.MCPTokens{"linear-server": freshLinear})
+	if active, _ := stateStore.value.Active("claude"); active != "old" {
+		t.Fatalf("active Claude account = %q, want old", active)
+	}
+}
+
+func readClaudeSlot(t *testing.T, accountVault vault.Vault, accountName string) claude.Credentials {
+	t.Helper()
+	path, err := accountVault.CredentialsPath("claude", accountName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := (claude.FileStore{Path: path}).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return credentials
+}
+
+func assertMCPTokens(t *testing.T, what string, got, want claude.MCPTokens) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s MCP logins = %v, want %v", what, got, want)
+	}
+	for server, token := range want {
+		if !sameJSON(t, got[server], token) {
+			t.Fatalf("%s MCP login for %q = %s, want %s", what, server, got[server], token)
+		}
+	}
+}
+
+// Slot files are written indented, so a login read back compares as JSON,
+// not as bytes.
+func sameJSON(t *testing.T, got, want json.RawMessage) bool {
+	t.Helper()
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("want %s is not JSON: %v", want, err)
+	}
+	return reflect.DeepEqual(gotValue, wantValue)
 }

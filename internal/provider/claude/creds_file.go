@@ -14,9 +14,12 @@ import (
 
 const recoveryPattern = ".credentials-recovery-*.json"
 
-type credentialEnvelope struct {
-	OAuth Credentials `json:"claudeAiOauth"`
-}
+// The credential item Claude Code keeps is one JSON object: the login under
+// claudeAiOauth, the MCP logins under mcpOAuth, and whatever else it adds.
+const (
+	loginKey     = "claudeAiOauth"
+	mcpTokensKey = "mcpOAuth"
+)
 
 // FileStore persists Claude credentials in a hop-owned slot file.
 type FileStore struct {
@@ -266,11 +269,25 @@ func credentialCandidates(primaryPath string) ([]credentialCandidate, error) {
 }
 
 func encodeCredentials(credentials Credentials) ([]byte, error) {
-	contents, err := json.MarshalIndent(credentialEnvelope{OAuth: credentials}, "", "  ")
+	contents, err := json.MarshalIndent(credentialItem(credentials), "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("encode Claude credentials: %w", err)
 	}
 	return append(contents, '\n'), nil
+}
+
+// credentialItem lays the credentials out the way Claude Code stores them, so
+// what hop writes is what Claude Code reads.
+func credentialItem(credentials Credentials) map[string]any {
+	item := make(map[string]any, len(credentials.Unknown)+2)
+	for key, value := range credentials.Unknown {
+		item[key] = value
+	}
+	item[loginKey] = credentials
+	if len(credentials.MCPTokens) > 0 {
+		item[mcpTokensKey] = credentials.MCPTokens
+	}
+	return item
 }
 
 func removeSupersededRecoveryJournals(primaryPath string) error {
@@ -301,12 +318,28 @@ func removeSupersededRecoveryJournals(primaryPath string) error {
 }
 
 func parseCredentials(contents []byte) (Credentials, error) {
-	var envelope credentialEnvelope
-	if err := json.Unmarshal(contents, &envelope); err != nil {
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &item); err != nil {
 		return Credentials{}, fmt.Errorf("decode Claude credentials; expected .claudeAiOauth with accessToken and refreshToken: %w: %w", err, ErrCredentials)
 	}
-	if envelope.OAuth.AccessToken == "" {
+	var credentials Credentials
+	if login, ok := item[loginKey]; ok {
+		if err := json.Unmarshal(login, &credentials); err != nil {
+			return Credentials{}, fmt.Errorf("decode Claude credentials; expected .claudeAiOauth with accessToken and refreshToken: %w: %w", err, ErrCredentials)
+		}
+	}
+	if credentials.AccessToken == "" {
 		return Credentials{}, fmt.Errorf("claude credentials omit .claudeAiOauth.accessToken; run 'hop login claude <account>': %w", ErrCredentials)
 	}
-	return envelope.OAuth, nil
+	if mcpTokens, ok := item[mcpTokensKey]; ok {
+		if err := json.Unmarshal(mcpTokens, &credentials.MCPTokens); err != nil {
+			return Credentials{}, fmt.Errorf("decode the MCP logins in Claude credentials; expected .mcpOAuth to be an object keyed by server: %w: %w", err, ErrCredentials)
+		}
+	}
+	delete(item, loginKey)
+	delete(item, mcpTokensKey)
+	if len(item) > 0 {
+		credentials.Unknown = item
+	}
+	return credentials, nil
 }
