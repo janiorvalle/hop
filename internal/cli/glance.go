@@ -3,10 +3,12 @@ package cli
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/janiorvalle/hop/internal/provider"
+	"github.com/janiorvalle/hop/internal/render"
 )
 
 const listSchema = "hop.ls/v1"
@@ -155,6 +157,29 @@ var slotRenewalActions = map[provider.Name]string{
 	provider.Codex:  "Run 'hop login codex %[1]s' to renew it.",
 }
 
+// The same renewals as the prose above, as the commands the glance's
+// attention list prints. The prose stays as it is: hop.ls/v1 carries it.
+var liveRenewalCommands = map[provider.Name][]string{
+	provider.Claude: {"claude, then /login"},
+	provider.Codex:  {"codex login"},
+}
+
+var slotRenewalCommands = map[provider.Name][]string{
+	provider.Claude: {"hop rm claude %[1]s", "hop login claude %[1]s"},
+	provider.Codex:  {"hop login codex %[1]s"},
+}
+
+func renewalCommands(providerName provider.Name, accountName string, active bool) []string {
+	if active {
+		return liveRenewalCommands[providerName]
+	}
+	commands := make([]string, 0, len(slotRenewalCommands[providerName]))
+	for _, command := range slotRenewalCommands[providerName] {
+		commands = append(commands, fmt.Sprintf(command, accountName))
+	}
+	return commands
+}
+
 func refreshTokenExpiryFor(account account, expiresAt, now time.Time) *refreshTokenExpiry {
 	if expiresAt.IsZero() {
 		return nil
@@ -177,4 +202,31 @@ func usageProblem(failedAccount account, err error) *accountProblem {
 		Action:    strings.ReplaceAll(err.Error(), "<account>", failedAccount.Name),
 		Retryable: true,
 	}
+}
+
+// A quoted command counts only when it runs as written: 'hop ls', or a verb
+// with its provider and account. A bare 'hop login' in a repair hint does not.
+var (
+	httpStatusPattern = regexp.MustCompile(`HTTP (\d{3})`)
+	quotedHopCommand  = regexp.MustCompile(`'(hop ls|hop [a-z]+ (?:claude|codex) [^' ]+)'`)
+)
+
+// attentionProblem shortens a usage failure to the one line the glance
+// prints: the fact, with the HTTP status when the provider gave one, then
+// the hop commands the failure quotes. A failure that quotes no complete
+// command keeps its whole next step, since a line with no way forward is
+// worse than a long one.
+func attentionProblem(problem accountProblem) *render.Problem {
+	fact := "usage unavailable"
+	if match := httpStatusPattern.FindStringSubmatch(problem.Action); match != nil {
+		fact += " (HTTP " + match[1] + ")"
+	}
+	commands := make([]string, 0, 2)
+	for _, match := range quotedHopCommand.FindAllStringSubmatch(problem.Action, -1) {
+		commands = append(commands, match[1])
+	}
+	if len(commands) == 0 {
+		commands = append(commands, problem.Action)
+	}
+	return &render.Problem{Fact: fact, Commands: commands}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -448,5 +449,102 @@ func TestFetchGlancePrefersThePlanTheUsageResponseNames(t *testing.T) {
 	}
 	if document.Accounts[0].Plan != "pro" {
 		t.Fatalf("plan = %q, want the usage response's pro over the login-time plus", document.Accounts[0].Plan)
+	}
+}
+
+func TestAttentionProblemKeepsTheStatusAndTheQuotedCommands(t *testing.T) {
+	t.Parallel()
+
+	for _, scenario := range []struct {
+		name         string
+		action       string
+		wantFact     string
+		wantCommands []string
+	}{
+		{
+			name:         "refresh failure names the login",
+			action:       "claude token endpoint returned HTTP 400; the slot was not changed, run 'hop login claude work2': claude token refresh failed",
+			wantFact:     "usage unavailable (HTTP 400)",
+			wantCommands: []string{"hop login claude work2"},
+		},
+		{
+			name:         "rate limit names the retry",
+			action:       "codex usage returned HTTP 429; the provider rate-limited the request, wait and retry 'hop ls': codex usage request failed",
+			wantFact:     "usage unavailable (HTTP 429)",
+			wantCommands: []string{"hop ls"},
+		},
+		{
+			name:         "a bare hop login is a hint, not a command",
+			action:       "read slot metadata from /tmp/hop/claude/work/slot.json; expected {\"refresh_policy\":\"managed\"}, fix the file or run 'hop login' again: unexpected end of JSON input",
+			wantFact:     "usage unavailable",
+			wantCommands: []string{"read slot metadata from /tmp/hop/claude/work/slot.json; expected {\"refresh_policy\":\"managed\"}, fix the file or run 'hop login' again: unexpected end of JSON input"},
+		},
+		{
+			name:         "no quoted command keeps the whole next step",
+			action:       "decode Claude session limit; resets_at may be null only while percent is zero, update hop before retrying: claude usage request failed",
+			wantFact:     "usage unavailable",
+			wantCommands: []string{"decode Claude session limit; resets_at may be null only while percent is zero, update hop before retrying: claude usage request failed"},
+		},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			got := attentionProblem(accountProblem{Code: "USAGE_UNAVAILABLE", Action: scenario.action})
+			if got.Fact != scenario.wantFact || !reflect.DeepEqual(got.Commands, scenario.wantCommands) {
+				t.Fatalf("attentionProblem() = %+v, want fact %q and commands %q", got, scenario.wantFact, scenario.wantCommands)
+			}
+		})
+	}
+}
+
+func TestRenewalCommandsMatchTheProseActions(t *testing.T) {
+	t.Parallel()
+
+	for _, scenario := range []struct {
+		name     string
+		provider provider.Name
+		active   bool
+		want     []string
+	}{
+		{name: "claude slot", provider: provider.Claude, want: []string{"hop rm claude work", "hop login claude work"}},
+		{name: "codex slot", provider: provider.Codex, want: []string{"hop login codex work"}},
+		{name: "live claude", provider: provider.Claude, active: true, want: []string{"claude, then /login"}},
+		{name: "live codex", provider: provider.Codex, active: true, want: []string{"codex login"}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			if got := renewalCommands(scenario.provider, "work", scenario.active); !reflect.DeepEqual(got, scenario.want) {
+				t.Fatalf("renewalCommands() = %q, want %q", got, scenario.want)
+			}
+		})
+	}
+}
+
+func TestShowAccountsTableListsTheFailureUnderTheRows(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	catalog := staticCatalog{
+		{Provider: provider.Claude, Name: "work", Source: fetchFunc(func(context.Context) (provider.Usage, error) {
+			return provider.Usage{Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 40, ResetsAt: now.Add(2 * time.Hour)}}}, nil
+		})},
+		{Provider: provider.Claude, Name: "stale", Source: fetchFunc(func(context.Context) (provider.Usage, error) {
+			return provider.Usage{}, errors.New("claude token endpoint returned HTTP 400; the slot was not changed, run 'hop login claude <account>': claude token refresh failed")
+		})},
+	}
+	var output bytes.Buffer
+	if err := showAccountsFrom(context.Background(), &output, false, catalog, now); err != nil {
+		t.Fatalf("showAccountsFrom() error = %v", err)
+	}
+	want := "CLAUDE\n" +
+		"    ACCOUNT   HEADROOM                      RESET\n" +
+		"  + work    ############........    60%   2h00m\n" +
+		"  ! stale                         ERROR\n" +
+		"\n" +
+		"attention\n" +
+		" 1. claude/stale: usage unavailable (HTTP 400); hop login claude stale\n" +
+		"\n" +
+		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n"
+	if got := output.String(); got != want {
+		t.Fatalf("showAccountsFrom() table mismatch\n got:\n%s\nwant:\n%s", got, want)
 	}
 }
