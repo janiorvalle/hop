@@ -196,15 +196,29 @@ func (resetter codexResetter) startReset(ctx context.Context, stdin io.Reader, a
 // nonzero exit here would invite an automated retry that mints a new request
 // id and spends a second one.
 func (resetter codexResetter) reportSpentCredit(ctx context.Context, accountName string, credentials codex.Credentials, isActive bool) {
-	_, _ = fmt.Fprintf(resetter.stdout, "Spent 1 manual reset on codex account %q.\n", accountName)
 	refreshed, err := resetter.fetchUsage(ctx, credentials)
 	if err != nil {
+		_, _ = fmt.Fprintf(resetter.stdout, "Spent 1 manual reset on codex account %q.\n", accountName)
 		_, _ = fmt.Fprintf(resetter.stderr, "hop: the refreshed usage for codex account %q could not be read: %s. Run 'hop ls' to see it.\n", accountName, strings.ReplaceAll(err.Error(), "<account>", accountName))
 		return
 	}
+	_, _ = fmt.Fprintf(resetter.stdout, "Spent 1 manual reset on codex account %q%s.\n", accountName, creditsLeft(refreshed.ResetCredits))
 	row := newAccountResult(account{Provider: provider.Codex, Name: accountName, Active: isActive})
 	row.recordUsage(refreshed)
 	_ = writeTable(resetter.stdout, glanceDocument{Schema: listSchema, Accounts: []accountResult{row}}, terminalOptions(resetter.stdout, resetter.now()))
+}
+
+// creditsLeft says what a spent reset left behind, since the glance no
+// longer prints the count on the row.
+func creditsLeft(credits *provider.ResetCredits) string {
+	switch {
+	case credits == nil:
+		return ""
+	case credits.Count == 1:
+		return ", 1 reset left"
+	default:
+		return fmt.Sprintf(", %d resets left", credits.Count)
+	}
 }
 
 func (resetter codexResetter) liveCredentials(accountName string, slot codex.FileStore) (codex.Credentials, error) {

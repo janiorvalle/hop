@@ -164,7 +164,7 @@ func TestResetCodexSpendsOneCreditAndPrintsTheRefreshedRow(t *testing.T) {
 		t.Fatalf("pending reset record survived a successful reset")
 	}
 	got := fixture.stdout.String()
-	for _, want := range []string{`Spent 1 manual reset on codex account "work".`, "CODEX", "work", "1 reset"} {
+	for _, want := range []string{`Spent 1 manual reset on codex account "work", 1 reset left.`, "CODEX", "work"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout = %q, want it to contain %q", got, want)
 		}

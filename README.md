@@ -10,10 +10,38 @@ limit" of the day, the question is always the same: which account still has
 room? Logging into each one to check — MFA and all — is nobody's idea of a
 good time.
 
-`hop` answers it in one command. Type `hop` and every account lines up in one
-table — 5-hour and weekly usage, live from the same endpoints the CLIs use.
-Type `hop work` and that account becomes the live login for every provider
-that has one. Character select, for your accounts.
+`hop` answers it in one command. Type `hop` and every account gets one line:
+a headroom bar, the number, and when the limit behind it resets, live from the
+same endpoints the CLIs use. Most room sorts first. Type `hop work` and that
+account becomes the live login for every provider that has one. Character
+select, for your accounts.
+
+```
+CLAUDE
+    ACCOUNT    HEADROOM                      RESET
+  ● personal   █████████████████░░░    83%   6d18h
+> ◐ work       ██████████░░░░░░░░░░    49%   4d17h
+  ! old                              ERROR
+
+CODEX
+    ACCOUNT    HEADROOM                      RESET
+> ● work       ███████████████████░    95%   6d20h
+  ○ personal   ██░░░░░░░░░░░░░░░░░░     8%   11h07m
+
+attention
+ 1. claude/personal: token expires 1d13h; hop rm claude personal; hop login claude personal
+ 2. claude/old: usage unavailable (HTTP 400); hop login claude old
+
+● 50-100 plenty   ◐ 10-49 tight   ○ 0-9 nearly/full   ! error   > active
+```
+
+Headroom is what's left at the tightest limit on the account, and the reset
+is that limit's. Anything that needs a hand, a token about to expire or a
+fetch that failed, waits in the numbered attention list under the tables with
+the command that fixes it, so the rows stay clean. The 5-hour and weekly
+meters, every model-scoped limit, the plan, and the manual resets left are in
+`hop ls --json`. With `NO_COLOR` set or a pipe on stdout the bars are `#` and
+`.` and the glyphs carry the state.
 
 The switch is careful on purpose: before installing the account you asked
 for, hop copies the current live credentials back to the slot they came from,
@@ -30,9 +58,9 @@ whole time, so there is nothing to re-enroll.
 
 ## Spending a Codex manual reset
 
-OpenAI grants some Codex plans a few manual quota resets. `hop` shows them on
-the account row, and `hop reset codex work` spends one without opening the
-ChatGPT app. It asks first, since a reset is gone once spent:
+OpenAI grants some Codex plans a few manual quota resets. `hop ls --json`
+reports them as `reset_credits`, and `hop reset codex work` spends one without
+opening the ChatGPT app. It asks first, since a reset is gone once spent:
 
 ```
 This spends 1 of 2 manual resets on codex account "work". Continue? [y/N]
@@ -74,11 +102,12 @@ What hop touches:
   when its refresh token expires. Codex doesn't, so hop treats a Codex refresh
   token as good for fifteen days after its `last_refresh`, which rotates it at
   eight days, the same age the Codex CLI itself renews at. Any account, managed
-  or not, gets a warning on its row inside seven days and a red one inside two,
-  with the command that renews it: `hop login codex <name>` signs a Codex
-  account in again in place, and a Claude account needs `hop rm` before
-  `hop login`. `hop ls --json` carries the same thing as `refresh_token_expiry`. `hop refresh` does the same rotation
-  without fetching usage, so a scheduler can run it for you.
+  or not, gets a line in the attention list under the glance inside seven
+  days, red inside two, with the commands that renew it: `hop login codex
+  <name>` signs a Codex account in again in place, and a Claude account needs
+  `hop rm` before `hop login`. `hop ls --json` carries the same thing as
+  `refresh_token_expiry`. `hop refresh` does the same rotation without
+  fetching usage, so a scheduler can run it for you.
 
 What hop never does:
 
