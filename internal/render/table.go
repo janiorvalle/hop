@@ -2,6 +2,7 @@
 package render
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -15,16 +16,28 @@ import (
 )
 
 const (
-	maxNameRunes = 18
-	barCells     = 20 // one cell per five percent of headroom
-	numberWidth  = 4  // fits "100%"
-	columnGap    = "   "
-	rowPrefixLen = 4 // marker, space, glyph, space
+	maxNameRunes   = 18
+	barCells       = 20 // one cell per five percent of headroom
+	numberWidth    = 4  // fits "100%"
+	countdownWidth = 6  // fits "13h56m"
+	columnGap      = "   "
+	rowPrefixLen   = 4 // marker, space, glyph, space
 )
 
 // statusWidth is the bar, the gap, and the number together, so ERROR and
 // disabled end on the same column the number does.
 const statusWidth = barCells + len(columnGap) + numberWidth
+
+// meterWidth is one window column: the percent left, the gap, and the
+// countdown to its reset.
+const meterWidth = numberWidth + len(columnGap) + countdownWidth
+
+// Claude's usage endpoint reports the Fable model's weekly cap as a
+// weekly_scoped limit whose scope names the model.
+const (
+	scopedWeeklyLimit = "weekly_scoped"
+	fableModel        = "Fable"
+)
 
 const (
 	styleReset = "\x1b[0m"
@@ -54,12 +67,15 @@ var expiryStyles = map[string]string{"warning": styleAmber, "critical": styleRed
 
 // Row is one account in the rendered glance.
 type Row struct {
-	Provider           provider.Name
-	Account            string
-	Active             bool
-	Disabled           bool
-	Windows            []provider.Window
-	Limits             []provider.Limit
+	Provider provider.Name
+	Account  string
+	Active   bool
+	Disabled bool
+	Windows  []provider.Window
+	Limits   []provider.Limit
+	// ResetCredits is the manual resets the account can spend, zero when it
+	// has none or the provider never said.
+	ResetCredits       int
 	Problem            *Problem
 	RefreshTokenExpiry *TokenExpiry
 }
@@ -78,10 +94,11 @@ const NoAccountsEnrolled = "No accounts enrolled. Run 'hop login claude work' or
 // Table writes one provider section per provider, one line per account.
 //
 // The glance answers "which account can I use right now": every line is the
-// headroom left at the binding limit, as a bar and a number, with that
-// limit's reset. Accounts sort most room first, errors after them, parked
-// accounts last. Whatever needs a hand goes in the attention list below the
-// tables, one numbered line each, so the rows stay clean.
+// headroom left at the binding limit, as a bar and a number, then each
+// window on its own with its reset: the week, the five hours, and the one
+// meter the provider adds. Accounts sort most room first, errors after them,
+// parked accounts last. Whatever needs a hand goes in the attention list
+// below the tables, one numbered line each, so the rows stay clean.
 func Table(writer io.Writer, rows []Row, options Options) error {
 	if len(rows) == 0 {
 		_, err := io.WriteString(writer, NoAccountsEnrolled)
@@ -161,10 +178,16 @@ func widestName(rows []Row, options Options) int {
 }
 
 func writeSection(out *strings.Builder, rows []Row, nameWidth int, options Options) {
-	out.WriteString(paint(strings.ToUpper(string(rows[0].Provider)), styleBold, options) + "\n")
+	providerName := rows[0].Provider
+	out.WriteString(paint(strings.ToUpper(string(providerName)), styleBold, options) + "\n")
 
-	header := strings.Repeat(" ", rowPrefixLen) + padCell("ACCOUNT", nameWidth, false) +
-		columnGap + padCell("HEADROOM", statusWidth, false) + columnGap + "RESET"
+	header := strings.Join([]string{
+		strings.Repeat(" ", rowPrefixLen) + padCell("ACCOUNT", nameWidth, false),
+		padCell("HEADROOM", statusWidth, false),
+		padCell("WEEK", meterWidth, false),
+		padCell("5 HOUR", meterWidth, false),
+		providerColumns[providerName].header,
+	}, columnGap)
 	out.WriteString(paint(strings.TrimRight(header, " "), styleDim, options) + "\n")
 
 	for _, row := range rows {
@@ -174,11 +197,97 @@ func writeSection(out *strings.Builder, rows []Row, nameWidth int, options Optio
 
 func line(row Row, nameWidth int, options Options) string {
 	name := padCell(shorten(row.Account, maxNameRunes, options.Plain), nameWidth, false)
-	text := rowPrefix(row, options) + paint(name, nameStyle(row), options) + columnGap + status(row, options)
-	if reset, ok := bindingReset(row); ok {
-		text += columnGap + paint(Countdown(options.Now, reset), styleDim, options)
+	cells := []string{rowPrefix(row, options) + paint(name, nameStyle(row), options), status(row, options)}
+	cells = append(cells, meterCells(row, options)...)
+	return strings.TrimRight(strings.Join(cells, columnGap), " ") + "\n"
+}
+
+// providerColumn is the column after the two windows: the one meter each
+// provider has that the other doesn't.
+type providerColumn struct {
+	header string
+	cell   func(Row, Options) string
+}
+
+var providerColumns = map[provider.Name]providerColumn{
+	provider.Claude: {header: "FABLE", cell: fableCell},
+	provider.Codex:  {header: "RESETS", cell: resetCreditsCell},
+}
+
+// meterCells are the columns after the number, and nothing on a row with no
+// usage to show.
+func meterCells(row Row, options Options) []string {
+	if row.Disabled || row.Problem != nil {
+		return nil
 	}
-	return strings.TrimRight(text, " ") + "\n"
+	return []string{
+		windowCell(row, provider.Weekly, options),
+		windowCell(row, provider.FiveHour, options),
+		providerColumns[row.Provider].cell(row, options),
+	}
+}
+
+func windowCell(row Row, kind provider.WindowKind, options Options) string {
+	for _, window := range row.Windows {
+		if window.Kind == kind {
+			return meterCell(window.UsedPercent, window.ResetsAt, options)
+		}
+	}
+	return strings.Repeat(" ", meterWidth)
+}
+
+func fableCell(row Row, options Options) string {
+	for _, limit := range row.Limits {
+		if limit.Kind == scopedWeeklyLimit && scopedModel(limit.Scope) == fableModel {
+			return meterCell(limit.UsedPercent, limit.ResetsAt, options)
+		}
+	}
+	return strings.Repeat(" ", meterWidth)
+}
+
+// scopedModel reads the model a Claude limit is scoped to out of the scope
+// hop.ls/v1 carries verbatim: {"model":{"display_name":"Fable",...},...}.
+func scopedModel(scope string) string {
+	var parsed struct {
+		Model struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+	}
+	if err := json.Unmarshal([]byte(scope), &parsed); err != nil {
+		return ""
+	}
+	return parsed.Model.DisplayName
+}
+
+// resetCreditsCell is blank until the account has a manual reset to spend.
+func resetCreditsCell(row Row, options Options) string {
+	if row.ResetCredits == 0 {
+		return ""
+	}
+	return paint(strconv.Itoa(row.ResetCredits), styleDim, options)
+}
+
+func meterCell(usedPercent float64, resetsAt time.Time, options Options) string {
+	return percentCell(leftPercent(usedPercent), options) + columnGap +
+		cell(countdown(resetsAt, options), countdownWidth, styleDim, options)
+}
+
+func percentCell(left int, options Options) string {
+	return cell(fmt.Sprintf("%3d%%", left), numberWidth, severityStyle(left), options)
+}
+
+// countdown is blank while no reset is known: an idle Claude window has none.
+func countdown(resetsAt time.Time, options Options) string {
+	if resetsAt.IsZero() {
+		return ""
+	}
+	return Countdown(options.Now, resetsAt)
+}
+
+// cell paints the text and pads after it, so the padding carries no style
+// and the end of a line trims clean.
+func cell(text string, width int, style string, options Options) string {
+	return paint(text, style, options) + strings.Repeat(" ", max(0, width-utf8.RuneCountInString(text)))
 }
 
 func rowPrefix(row Row, options Options) string {
@@ -213,7 +322,7 @@ func status(row Row, options Options) string {
 		return paint(padCell("ERROR", statusWidth, true), styleRed, options)
 	}
 	left := headroomPercent(row)
-	return bar(left, options) + columnGap + paint(fmt.Sprintf("%3d%%", left), severityStyle(left), options)
+	return bar(left, options) + columnGap + percentCell(left, options)
 }
 
 func bar(left int, options Options) string {
@@ -311,39 +420,20 @@ func writeLegend(out *strings.Builder, options Options) {
 	out.WriteString("\n" + paint(legend, styleDim, options) + "\n")
 }
 
-// bindingMeter is the tightest meter on the row: every window, and every
-// active limit whether scoped to a model or not, since a scope-less
-// account-level cap still stops the account. Between meters equally tight,
-// the one that resets last binds, because headroom doesn't move until it does.
-func bindingMeter(row Row) (usedPercent float64, resetsAt time.Time) {
-	usedPercent = -1
-	consider := func(used float64, resets time.Time) {
-		if used > usedPercent || (used == usedPercent && resets.After(resetsAt)) {
-			usedPercent, resetsAt = used, resets
-		}
-	}
+// headroomPercent is what is left at the tightest meter on the row: every
+// window, and every active limit whether scoped to a model or not, since a
+// scope-less account-level cap still stops the account.
+func headroomPercent(row Row) int {
+	usedPercent := -1.0
 	for _, window := range row.Windows {
-		consider(window.UsedPercent, window.ResetsAt)
+		usedPercent = math.Max(usedPercent, window.UsedPercent)
 	}
 	for _, limit := range row.Limits {
 		if limit.Active {
-			consider(limit.UsedPercent, limit.ResetsAt)
+			usedPercent = math.Max(usedPercent, limit.UsedPercent)
 		}
 	}
-	return usedPercent, resetsAt
-}
-
-func headroomPercent(row Row) int {
-	usedPercent, _ := bindingMeter(row)
 	return leftPercent(usedPercent)
-}
-
-func bindingReset(row Row) (time.Time, bool) {
-	if row.Disabled || row.Problem != nil {
-		return time.Time{}, false
-	}
-	_, resetsAt := bindingMeter(row)
-	return resetsAt, !resetsAt.IsZero()
 }
 
 func leftPercent(usedPercent float64) int {
@@ -383,7 +473,7 @@ func severityStyle(left int) string {
 }
 
 func paint(text, style string, options Options) string {
-	if !options.Color || style == "" {
+	if !options.Color || style == "" || text == "" {
 		return text
 	}
 	return style + text + styleReset

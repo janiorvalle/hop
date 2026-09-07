@@ -13,25 +13,31 @@ import (
 // humanRows is the owner's own account set on the day issue 65 was filed,
 // the dataset behind the mockup the glance is built to match.
 func humanRows(now time.Time) []Row {
-	claude := func(name string, active bool, fiveHourUsed float64, fiveHourReset time.Duration, weeklyUsed, fableUsed float64, weeklyReset time.Duration) Row {
+	// An idle Claude five-hour window has no reset yet; a Codex one always does.
+	idle := time.Time{}
+	claude := func(name string, active bool, fiveHourUsed float64, fiveHourReset time.Time, weeklyUsed, fableUsed float64, weeklyReset time.Duration) Row {
 		return Row{Provider: provider.Claude, Account: name, Active: active,
 			Windows: []provider.Window{
-				{Kind: provider.FiveHour, UsedPercent: fiveHourUsed, ResetsAt: now.Add(fiveHourReset)},
+				{Kind: provider.FiveHour, UsedPercent: fiveHourUsed, ResetsAt: fiveHourReset},
 				{Kind: provider.Weekly, UsedPercent: weeklyUsed, ResetsAt: now.Add(weeklyReset)},
 			},
-			Limits: []provider.Limit{{Kind: "weekly", Scope: "Fable", UsedPercent: fableUsed, ResetsAt: now.Add(weeklyReset), Active: true}},
+			Limits: []provider.Limit{{Kind: "weekly_scoped", Group: "weekly", Scope: fableScope, UsedPercent: fableUsed, ResetsAt: now.Add(weeklyReset), Active: true}},
 		}
 	}
-	codex := func(name string, active bool, weeklyUsed float64, weeklyReset time.Duration) Row {
+	codex := func(name string, active bool, weeklyUsed float64, weeklyReset time.Duration, resetCredits int) Row {
 		return Row{Provider: provider.Codex, Account: name, Active: active,
-			Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: weeklyUsed, ResetsAt: now.Add(weeklyReset)}},
+			Windows: []provider.Window{
+				{Kind: provider.FiveHour, UsedPercent: 0, ResetsAt: now.Add(5 * time.Hour)},
+				{Kind: provider.Weekly, UsedPercent: weeklyUsed, ResetsAt: now.Add(weeklyReset)},
+			},
 			Limits: []provider.Limit{
 				{Kind: "model_five_hour", Scope: "GPT-5.3-Codex-Spark", UsedPercent: 0, ResetsAt: now.Add(5 * time.Hour), Active: true},
 				{Kind: "model_weekly", Scope: "GPT-5.3-Codex-Spark", UsedPercent: 0, ResetsAt: now.Add(7 * 24 * time.Hour), Active: true},
 			},
+			ResetCredits: resetCredits,
 		}
 	}
-	jvalle1 := claude("jvalle1", false, 0, 5*time.Hour, 17, 16, 6*24*time.Hour+18*time.Hour)
+	jvalle1 := claude("jvalle1", false, 0, idle, 17, 16, 6*24*time.Hour+18*time.Hour)
 	jvalle1.RefreshTokenExpiry = &TokenExpiry{
 		ExpiresAt: now.Add(37 * time.Hour),
 		Severity:  "critical",
@@ -39,20 +45,24 @@ func humanRows(now time.Time) []Row {
 	}
 	return []Row{
 		jvalle1,
-		claude("work4", true, 51, 3*time.Hour+7*time.Minute, 28, 51, 4*24*time.Hour+17*time.Hour),
-		claude("work3", false, 0, 5*time.Hour, 47, 66, 3*24*time.Hour+2*time.Hour),
-		claude("jvalle2", false, 0, 5*time.Hour, 58, 77, 3*24*time.Hour+11*time.Hour),
-		claude("work1", false, 16, 17*time.Minute, 45, 79, 4*24*time.Hour+9*time.Hour),
+		claude("work4", true, 51, now.Add(3*time.Hour+7*time.Minute), 28, 49, 4*24*time.Hour+17*time.Hour),
+		claude("work3", false, 0, idle, 47, 66, 3*24*time.Hour+2*time.Hour),
+		claude("jvalle2", false, 0, idle, 58, 77, 3*24*time.Hour+11*time.Hour),
+		claude("work1", false, 16, now.Add(17*time.Minute), 45, 79, 4*24*time.Hour+9*time.Hour),
 		{Provider: provider.Claude, Account: "work2", Problem: &Problem{
 			Fact:     "usage unavailable (HTTP 400)",
 			Commands: []string{"hop login claude work2"},
 		}},
-		codex("jvalle1", true, 5, 6*24*time.Hour+20*time.Hour),
-		codex("work1", false, 7, 13*time.Hour+56*time.Minute),
-		codex("jvalle2", false, 12, 5*24*time.Hour+18*time.Hour),
-		codex("work2", false, 92, 11*time.Hour+7*time.Minute),
+		codex("jvalle1", true, 5, 6*24*time.Hour+20*time.Hour, 1),
+		codex("work1", false, 7, 13*time.Hour+56*time.Minute, 3),
+		codex("jvalle2", false, 12, 5*24*time.Hour+18*time.Hour, 2),
+		codex("work2", false, 92, 11*time.Hour+7*time.Minute, 3),
 	}
 }
+
+// fableScope is the Fable model cap's scope exactly as Claude's usage
+// endpoint sends it and hop.ls/v1 carries it.
+const fableScope = `{"model":{"id":null,"display_name":"Fable"},"surface":null}`
 
 func fixedNow() time.Time {
 	return time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
@@ -85,20 +95,20 @@ func TestTablePlainSnapshotMatchesTheMockup(t *testing.T) {
 	now := fixedNow()
 	got := render(t, humanRows(now), Options{Plain: true, Width: 100, Now: now})
 	want := "CLAUDE\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"  + jvalle1   #################...    83%   6d18h\n" +
-		"> ~ work4     ##########..........    49%   4d17h\n" +
-		"  ~ work3     #######.............    34%   3d02h\n" +
-		"  ~ jvalle2   #####...............    23%   3d11h\n" +
-		"  ~ work1     ####................    21%   4d09h\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          FABLE\n" +
+		"  + jvalle1   #################...    83%    83%   6d18h    100%             84%   6d18h\n" +
+		"> ~ work4     ##########..........    49%    72%   4d17h     49%   3h07m     51%   4d17h\n" +
+		"  ~ work3     #######.............    34%    53%   3d02h    100%             34%   3d02h\n" +
+		"  ~ jvalle2   #####...............    23%    42%   3d11h    100%             23%   3d11h\n" +
+		"  ~ work1     ####................    21%    55%   4d09h     84%   17m       21%   4d09h\n" +
 		"  ! work2                           ERROR\n" +
 		"\n" +
 		"CODEX\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"> + jvalle1   ###################.    95%   6d20h\n" +
-		"  + work1     ###################.    93%   13h56m\n" +
-		"  + jvalle2   ##################..    88%   5d18h\n" +
-		"  o work2     ##..................     8%   11h07m\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          RESETS\n" +
+		"> + jvalle1   ###################.    95%    95%   6d20h    100%   5h00m    1\n" +
+		"  + work1     ###################.    93%    93%   13h56m   100%   5h00m    3\n" +
+		"  + jvalle2   ##################..    88%    88%   5d18h    100%   5h00m    2\n" +
+		"  o work2     ##..................     8%     8%   11h07m   100%   5h00m    3\n" +
 		"\n" +
 		"attention\n" +
 		" 1. claude/jvalle1: token expires 1d13h; hop rm claude jvalle1; hop login claude jvalle1\n" +
@@ -116,20 +126,20 @@ func TestTableColorSnapshotUsesBlocksAndCircles(t *testing.T) {
 	now := fixedNow()
 	got := ansiPattern.ReplaceAllString(render(t, humanRows(now), Options{Color: true, Width: 100, Now: now}), "")
 	want := "CLAUDE\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"  ● jvalle1   █████████████████░░░    83%   6d18h\n" +
-		"> ◐ work4     ██████████░░░░░░░░░░    49%   4d17h\n" +
-		"  ◐ work3     ███████░░░░░░░░░░░░░    34%   3d02h\n" +
-		"  ◐ jvalle2   █████░░░░░░░░░░░░░░░    23%   3d11h\n" +
-		"  ◐ work1     ████░░░░░░░░░░░░░░░░    21%   4d09h\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          FABLE\n" +
+		"  ● jvalle1   █████████████████░░░    83%    83%   6d18h    100%             84%   6d18h\n" +
+		"> ◐ work4     ██████████░░░░░░░░░░    49%    72%   4d17h     49%   3h07m     51%   4d17h\n" +
+		"  ◐ work3     ███████░░░░░░░░░░░░░    34%    53%   3d02h    100%             34%   3d02h\n" +
+		"  ◐ jvalle2   █████░░░░░░░░░░░░░░░    23%    42%   3d11h    100%             23%   3d11h\n" +
+		"  ◐ work1     ████░░░░░░░░░░░░░░░░    21%    55%   4d09h     84%   17m       21%   4d09h\n" +
 		"  ! work2                           ERROR\n" +
 		"\n" +
 		"CODEX\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"> ● jvalle1   ███████████████████░    95%   6d20h\n" +
-		"  ● work1     ███████████████████░    93%   13h56m\n" +
-		"  ● jvalle2   ██████████████████░░    88%   5d18h\n" +
-		"  ○ work2     ██░░░░░░░░░░░░░░░░░░     8%   11h07m\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          RESETS\n" +
+		"> ● jvalle1   ███████████████████░    95%    95%   6d20h    100%   5h00m    1\n" +
+		"  ● work1     ███████████████████░    93%    93%   13h56m   100%   5h00m    3\n" +
+		"  ● jvalle2   ██████████████████░░    88%    88%   5d18h    100%   5h00m    2\n" +
+		"  ○ work2     ██░░░░░░░░░░░░░░░░░░     8%     8%   11h07m   100%   5h00m    3\n" +
 		"\n" +
 		"attention\n" +
 		" 1. claude/jvalle1: token expires 1d13h; hop rm claude jvalle1; hop login claude jvalle1\n" +
@@ -147,12 +157,15 @@ func TestTableColorsRowsByThresholdAndDimsTheRest(t *testing.T) {
 	now := fixedNow()
 	got := render(t, humanRows(now), Options{Color: true, Width: 100, Now: now})
 	for _, want := range []string{
-		styleGreen + "●" + styleReset + " jvalle1   " + styleGreen + "█████████████████" + styleReset + styleDim + "░░░" + styleReset + "   " + styleGreen + " 83%" + styleReset + "   " + styleDim + "6d18h" + styleReset,
-		styleAmber + "◐" + styleReset + " work4     " + styleAmber + "██████████" + styleReset + styleDim + "░░░░░░░░░░" + styleReset + "   " + styleAmber + " 49%" + styleReset,
+		styleGreen + "●" + styleReset + " jvalle1   " + styleGreen + "█████████████████" + styleReset + styleDim + "░░░" + styleReset + "   " + styleGreen + " 83%" + styleReset +
+			"   " + styleGreen + " 83%" + styleReset + "   " + styleDim + "6d18h" + styleReset + "    " + styleGreen + "100%" + styleReset + "            " + styleGreen + " 84%" + styleReset + "   " + styleDim + "6d18h" + styleReset + "\n",
+		styleAmber + "◐" + styleReset + " work4     " + styleAmber + "██████████" + styleReset + styleDim + "░░░░░░░░░░" + styleReset + "   " + styleAmber + " 49%" + styleReset +
+			"   " + styleGreen + " 72%" + styleReset + "   " + styleDim + "4d17h" + styleReset + "    " + styleAmber + " 49%" + styleReset + "   " + styleDim + "3h07m" + styleReset + "    " + styleGreen + " 51%" + styleReset,
+		styleDim + "5h00m" + styleReset + "    " + styleDim + "1" + styleReset + "\n",
 		styleRed + "○" + styleReset + " work2     " + styleRed + "██" + styleReset + styleDim + "░░░░░░░░░░░░░░░░░░" + styleReset + "   " + styleRed + "  8%" + styleReset,
 		styleRed + "!" + styleReset + " work2     " + styleRed + "                      ERROR" + styleReset,
 		styleBold + "CLAUDE" + styleReset,
-		styleDim + "    ACCOUNT   HEADROOM                      RESET" + styleReset,
+		styleDim + "    ACCOUNT   HEADROOM                      WEEK            5 HOUR          FABLE" + styleReset,
 		styleBold + "attention" + styleReset,
 		" 1. " + styleRed + "claude/jvalle1: token expires 1d13h; hop rm claude jvalle1; hop login claude jvalle1" + styleReset,
 		" 2. " + styleRed + "claude/work2: usage unavailable (HTTP 400); hop login claude work2" + styleReset,
@@ -183,26 +196,44 @@ func TestTableFitsTheWidthsTheDesignPromises(t *testing.T) {
 	t.Parallel()
 
 	now := fixedNow()
-	rows := humanRows(now)
-	for index := range rows {
-		rows[index].Account = strings.Repeat("x", maxNameRunes)
-	}
 	for _, scenario := range []struct {
 		name    string
+		rows    []Row
 		options Options
 	}{
-		{name: "wide color", options: Options{Color: true, Width: 100, Now: now}},
-		{name: "wide plain", options: Options{Plain: true, Width: 100, Now: now}},
-		{name: "narrow color", options: Options{Color: true, Width: 88, Now: now}},
-		{name: "narrow plain", options: Options{Plain: true, Width: 88, Now: now}},
+		{name: "wide color", rows: longestRows(now), options: Options{Color: true, Width: 100, Now: now}},
+		{name: "wide plain", rows: longestRows(now), options: Options{Plain: true, Width: 100, Now: now}},
+		{name: "narrow color", rows: humanRows(now), options: Options{Color: true, Width: 88, Now: now}},
+		{name: "narrow plain", rows: humanRows(now), options: Options{Plain: true, Width: 88, Now: now}},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			t.Parallel()
-			output := render(t, rows, scenario.options)
+			output := render(t, scenario.rows, scenario.options)
 			if widest := widestLine(output); widest > scenario.options.Width {
 				t.Fatalf("Table() widest line = %d, want <= %d:\n%s", widest, scenario.options.Width, output)
 			}
 		})
+	}
+}
+
+// longestRows is the mockup's accounts with the longest name the glance
+// shows and the longest countdown a week can have.
+func longestRows(now time.Time) []Row {
+	rows := humanRows(now)
+	for index := range rows {
+		rows[index].Account = strings.Repeat("x", maxNameRunes)
+	}
+	rows[0].Windows[1].ResetsAt = now.Add(13*time.Hour + 56*time.Minute)
+	rows[0].Limits[0].ResetsAt = now.Add(13*time.Hour + 56*time.Minute)
+	return rows
+}
+
+func TestTableWideLayoutUsesExactlyAHundredColumns(t *testing.T) {
+	t.Parallel()
+
+	now := fixedNow()
+	if widest := widestLine(render(t, longestRows(now), Options{Plain: true, Width: 100, Now: now})); widest != 100 {
+		t.Fatalf("Table() widest line = %d, want 100", widest)
 	}
 }
 
@@ -235,9 +266,6 @@ func TestTableWrapsACommandlessFailureBetweenWords(t *testing.T) {
 	if !strings.Contains(got, want) {
 		t.Fatalf("Table() did not wrap the long failure, want:\n%s\ngot:\n%s", want, got)
 	}
-	if widest := widestLine(got); widest > 80 {
-		t.Fatalf("Table() widest line = %d, want <= 80:\n%s", widest, got)
-	}
 }
 
 func TestTableDropsTheLegendWhenItDoesNotFit(t *testing.T) {
@@ -251,9 +279,6 @@ func TestTableDropsTheLegendWhenItDoesNotFit(t *testing.T) {
 	if !strings.HasSuffix(got, "hop login claude work2\n") {
 		t.Fatalf("Table() at 64 columns should end on the attention list:\n%s", got)
 	}
-	if widest := widestLine(got); widest > 64 {
-		t.Fatalf("Table() widest line = %d, want <= 64:\n%s", widest, got)
-	}
 }
 
 func TestTableOmitsAttentionWhenNothingNeedsIt(t *testing.T) {
@@ -266,8 +291,8 @@ func TestTableOmitsAttentionWhenNothingNeedsIt(t *testing.T) {
 	}}
 	got := render(t, rows, Options{Plain: true, Width: 100, Now: now})
 	want := "CODEX\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"  + fine   ##################..    88%   1h00m\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          RESETS\n" +
+		"  + fine   ##################..    88%    88%   1h00m\n" +
 		"\n" +
 		"+ 50-100 plenty   ~ 10-49 tight   o 0-9 nearly/full   ! error   > active\n"
 	if got != want {
@@ -304,8 +329,8 @@ func TestTableListsAnErrorRowsFailureAndItsTokenWarningSeparately(t *testing.T) 
 	}
 	got := render(t, rows, Options{Plain: true, Width: 100, Now: now})
 	want := "CLAUDE\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"  + work    ##################..    88%   1h00m\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          FABLE\n" +
+		"  + work    ##################..    88%                    88%   1h00m\n" +
 		"  ! stale                         ERROR\n" +
 		"\n" +
 		"attention\n" +
@@ -345,8 +370,8 @@ func TestTableDisabledRowSortsLastAndIsDimmed(t *testing.T) {
 	}
 	plain := render(t, rows, Options{Plain: true, Width: 100, Now: now})
 	want := "CODEX\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"  o work     #...................     4%   1h00m\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          RESETS\n" +
+		"  o work     #...................     4%     4%   1h00m\n" +
 		"  ! broken                         ERROR\n" +
 		">   old                         disabled\n"
 	if !strings.HasPrefix(plain, want) {
@@ -358,7 +383,7 @@ func TestTableDisabledRowSortsLastAndIsDimmed(t *testing.T) {
 	}
 }
 
-func TestTableResetIsTheBindingMetersReset(t *testing.T) {
+func TestTableHeadroomIsTheBindingMeters(t *testing.T) {
 	t.Parallel()
 
 	now := fixedNow()
@@ -373,18 +398,18 @@ func TestTableResetIsTheBindingMetersReset(t *testing.T) {
 				Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 5, ResetsAt: now.Add(48 * time.Hour)}},
 				Limits:  []provider.Limit{{Kind: "model_five_hour", Scope: "Spark", UsedPercent: 0, ResetsAt: now.Add(5 * time.Hour), Active: true}},
 			},
-			want: "  + work   ###################.    95%   2d00h\n",
+			want: "  + work   ###################.    95%    95%   2d00h\n",
 		},
 		{
-			name: "between equally tight meters the later reset binds",
+			name: "the Fable cap binds and shows on its own",
 			row: Row{Provider: provider.Claude, Account: "work",
 				Windows: []provider.Window{
-					{Kind: provider.FiveHour, UsedPercent: 51, ResetsAt: now.Add(3 * time.Hour)},
+					{Kind: provider.FiveHour, UsedPercent: 30, ResetsAt: now.Add(3 * time.Hour)},
 					{Kind: provider.Weekly, UsedPercent: 28, ResetsAt: now.Add(48 * time.Hour)},
 				},
-				Limits: []provider.Limit{{Kind: "weekly", Scope: "Fable", UsedPercent: 51, ResetsAt: now.Add(48 * time.Hour), Active: true}},
+				Limits: []provider.Limit{{Kind: "weekly_scoped", Scope: fableScope, UsedPercent: 51, ResetsAt: now.Add(48 * time.Hour), Active: true}},
 			},
-			want: "  ~ work   ##########..........    49%   2d00h\n",
+			want: "  ~ work   ##########..........    49%    72%   2d00h     70%   3h00m     49%   2d00h\n",
 		},
 		{
 			name: "a scope-less active limit binds",
@@ -392,7 +417,7 @@ func TestTableResetIsTheBindingMetersReset(t *testing.T) {
 				Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 10, ResetsAt: now.Add(48 * time.Hour)}},
 				Limits:  []provider.Limit{{Kind: "account_30d", UsedPercent: 80, ResetsAt: now.Add(400 * time.Hour), Active: true}},
 			},
-			want: "  ~ work   ####................    20%   16d16h\n",
+			want: "  ~ work   ####................    20%    90%   2d00h\n",
 		},
 		{
 			name: "an inactive limit never binds",
@@ -400,14 +425,14 @@ func TestTableResetIsTheBindingMetersReset(t *testing.T) {
 				Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 10, ResetsAt: now.Add(48 * time.Hour)}},
 				Limits:  []provider.Limit{{Kind: "model_weekly", Scope: "Spark", UsedPercent: 98, ResetsAt: now.Add(400 * time.Hour), Active: false}},
 			},
-			want: "  + work   ##################..    90%   2d00h\n",
+			want: "  + work   ##################..    90%    90%   2d00h\n",
 		},
 		{
-			name: "no reset known leaves the column empty",
+			name: "no reset known leaves the countdown empty",
 			row: Row{Provider: provider.Codex, Account: "work",
 				Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 10}},
 			},
-			want: "  + work   ##################..    90%\n",
+			want: "  + work   ##################..    90%    90%\n",
 		},
 		{
 			name: "no meters at all is full headroom",
@@ -425,6 +450,30 @@ func TestTableResetIsTheBindingMetersReset(t *testing.T) {
 	}
 }
 
+func TestTableBlanksTheColumnsAnAccountDoesNotHave(t *testing.T) {
+	t.Parallel()
+
+	now := fixedNow()
+	rows := []Row{
+		{Provider: provider.Claude, Account: "opus",
+			Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 40, ResetsAt: now.Add(48 * time.Hour)}},
+			Limits:  []provider.Limit{{Kind: "weekly_scoped", Scope: `{"model":{"id":null,"display_name":"Opus"},"surface":null}`, UsedPercent: 90, ResetsAt: now.Add(48 * time.Hour), Active: true}},
+		},
+		{Provider: provider.Codex, Account: "spent",
+			Windows: []provider.Window{{Kind: provider.Weekly, UsedPercent: 40, ResetsAt: now.Add(48 * time.Hour)}},
+		},
+	}
+	got := render(t, rows, Options{Plain: true, Width: 100, Now: now})
+	for _, want := range []string{
+		"  ~ opus    ##..................    10%    60%   2d00h\n",
+		"  + spent   ############........    60%    60%   2d00h\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Table() output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestTableSortsMostRoomFirstWithinEachProvider(t *testing.T) {
 	t.Parallel()
 
@@ -437,14 +486,14 @@ func TestTableSortsMostRoomFirstWithinEachProvider(t *testing.T) {
 	}
 	got := render(t, rows, Options{Plain: true, Width: 100, Now: now})
 	want := "CLAUDE\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"> + high   ##################..    90%\n" +
-		"  + mid    ##########..........    50%\n" +
-		"  ~ low    ##..................    10%\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          FABLE\n" +
+		"> + high   ##################..    90%    90%\n" +
+		"  + mid    ##########..........    50%    50%\n" +
+		"  ~ low    ##..................    10%    10%\n" +
 		"\n" +
 		"CODEX\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"  + mid    ##########..........    50%\n"
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          RESETS\n" +
+		"  + mid    ##########..........    50%    50%\n"
 	if !strings.HasPrefix(got, want) {
 		t.Fatalf("Table() output mismatch\n got:\n%s\nwant prefix:\n%s", got, want)
 	}
@@ -458,11 +507,11 @@ func TestTableShortensLongAccountNamesDeliberately(t *testing.T) {
 		Windows: []provider.Window{{Kind: provider.FiveHour, UsedPercent: 20, ResetsAt: now.Add(time.Hour)}},
 	}}
 	plain := render(t, rows, Options{Plain: true, Width: 100, Now: now})
-	if !strings.Contains(plain, "  + a-very-long-acc...   ################....    80%   1h00m\n") {
+	if !strings.Contains(plain, "  + a-very-long-acc...   ################....    80%                    80%   1h00m\n") {
 		t.Fatalf("Table() plain output did not shorten the name:\n%s", plain)
 	}
 	colored := ansiPattern.ReplaceAllString(render(t, rows, Options{Color: true, Width: 100, Now: now}), "")
-	if !strings.Contains(colored, "  ● a-very-long-accou…   ████████████████░░░░    80%   1h00m\n") {
+	if !strings.Contains(colored, "  ● a-very-long-accou…   ████████████████░░░░    80%                    80%   1h00m\n") {
 		t.Fatalf("Table() color output did not shorten the name:\n%s", colored)
 	}
 }

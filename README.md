@@ -11,22 +11,22 @@ room? Logging into each one to check — MFA and all — is nobody's idea of a
 good time.
 
 `hop` answers it in one command. Type `hop` and every account gets one line:
-a headroom bar, the number, and when the limit behind it resets, live from the
-same endpoints the CLIs use. Most room sorts first. Type `hop work` and that
-account becomes the live login for every provider that has one. Character
-select, for your accounts.
+a headroom bar, the number, then the week and the five-hour window with what
+is left and when each resets, live from the same endpoints the CLIs use. Most
+room sorts first. Type `hop work` and that account becomes the live login for
+every provider that has one. Character select, for your accounts.
 
 ```
 CLAUDE
-    ACCOUNT    HEADROOM                      RESET
-  ● personal   █████████████████░░░    83%   6d18h
-> ◐ work       ██████████░░░░░░░░░░    49%   4d17h
+    ACCOUNT    HEADROOM                      WEEK            5 HOUR          FABLE
+  ● personal   █████████████████░░░    83%    83%   6d18h    100%             84%   6d18h
+> ◐ work       ██████████░░░░░░░░░░    49%    72%   4d17h     49%   3h07m     51%   4d17h
   ! old                              ERROR
 
 CODEX
-    ACCOUNT    HEADROOM                      RESET
-> ● work       ███████████████████░    95%   6d20h
-  ○ personal   ██░░░░░░░░░░░░░░░░░░     8%   11h07m
+    ACCOUNT    HEADROOM                      WEEK            5 HOUR          RESETS
+> ● work       ███████████████████░    95%    95%   6d20h    100%   5h00m    1
+  ○ personal   ██░░░░░░░░░░░░░░░░░░     8%     8%   11h07m   100%   5h00m    3
 
 attention
  1. claude/personal: token expires 1d13h; hop rm claude personal; hop login claude personal
@@ -35,13 +35,16 @@ attention
 ● 50-100 plenty   ◐ 10-49 tight   ○ 0-9 nearly/full   ! error   > active
 ```
 
-Headroom is what's left at the tightest limit on the account, and the reset
-is that limit's. Anything that needs a hand, a token about to expire or a
-fetch that failed, waits in the numbered attention list under the tables with
-the command that fixes it, so the rows stay clean. The 5-hour and weekly
-meters, every model-scoped limit, the plan, and the manual resets left are in
-`hop ls --json`. With `NO_COLOR` set or a pipe on stdout the bars are `#` and
-`.` and the glyphs carry the state.
+Headroom is what's left at the tightest limit on the account. WEEK and 5 HOUR
+are the account's own windows, each with the time to its reset; a five-hour
+window nobody has touched shows 100% and no reset. Claude adds FABLE, the
+weekly cap on the Fable model, and Codex adds RESETS, the manual resets left
+to spend. Anything that needs a hand, a token about to expire or a fetch that
+failed, waits in the numbered attention list under the tables with the
+command that fixes it, so the rows stay clean. The whole glance fits in 100
+columns. Every model-scoped limit, the plan, and when each manual reset
+expires are in `hop ls --json`. With `NO_COLOR` set or a pipe on stdout the
+bars are `#` and `.` and the glyphs carry the state.
 
 The switch is careful on purpose: before installing the account you asked
 for, hop copies the current live credentials back to the slot they came from,

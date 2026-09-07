@@ -536,8 +536,8 @@ func TestShowAccountsTableListsTheFailureUnderTheRows(t *testing.T) {
 		t.Fatalf("showAccountsFrom() error = %v", err)
 	}
 	want := "CLAUDE\n" +
-		"    ACCOUNT   HEADROOM                      RESET\n" +
-		"  + work    ############........    60%   2h00m\n" +
+		"    ACCOUNT   HEADROOM                      WEEK            5 HOUR          FABLE\n" +
+		"  + work    ############........    60%    60%   2h00m\n" +
 		"  ! stale                         ERROR\n" +
 		"\n" +
 		"attention\n" +
