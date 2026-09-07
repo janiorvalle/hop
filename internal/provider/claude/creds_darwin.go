@@ -18,9 +18,9 @@ import (
 const keychainService = "Claude Code-credentials"
 
 // security(1) reads each interactive command into a 4096-character buffer and
-// runs whatever overflows as the next command, which would store a truncated
-// secret without failing. Refusing to build a longer command keeps that silent
-// corruption impossible.
+// runs whatever overflows as the next command. An item that does not fit on
+// one line goes to security(1) as an argument instead, the way the Claude CLI
+// stores the same item once its MCP logins outgrow the line.
 const securityCommandLimit = 4096
 
 // security(1) exits with 44 when no Keychain item matches the search.
@@ -86,7 +86,7 @@ func readLiveCredentials(ctx context.Context, security securityCommander) (Crede
 }
 
 func writeLiveCredentials(ctx context.Context, security securityCommander, credentials Credentials) error {
-	contents, err := json.Marshal(credentialEnvelope{OAuth: credentials})
+	contents, err := json.Marshal(credentialItem(credentials))
 	if err != nil {
 		return err
 	}
@@ -98,11 +98,8 @@ func writeLiveCredentials(ctx context.Context, security securityCommander, crede
 	if err != nil {
 		return err
 	}
-	command, err := keychainWriteCommand(keychainService, currentUser.Username, claudePath, string(contents))
-	if err != nil {
-		return err
-	}
-	if _, err := security.Run(ctx, command, "-i"); err != nil {
+	item := keychainItem{service: keychainService, account: currentUser.Username, trustedApplication: claudePath, contents: string(contents)}
+	if err := storeKeychainItem(ctx, security, item); err != nil {
 		return fmt.Errorf("write the %q Keychain item; unlock Keychain and retry: %w", keychainService, err)
 	}
 	written, err := readLiveCredentials(ctx, security)
@@ -115,29 +112,47 @@ func writeLiveCredentials(ctx context.Context, security securityCommander, crede
 	return verifyClaudeAcceptsLogin(ctx, claudePath)
 }
 
-// keychainWriteCommand builds the security(1) interactive-mode command that
-// stores contents as the item's password. Interactive mode reads its commands
-// from stdin, so the secret never reaches the process arguments that every
-// other program on the machine can read.
-func keychainWriteCommand(service, account, trustedApplication, contents string) (string, error) {
-	command := strings.Join([]string{
-		"add-generic-password", "-U",
-		"-a", quoteSecurityArgument(account),
-		"-s", quoteSecurityArgument(service),
-		"-T", quoteSecurityArgument(trustedApplication),
-		"-w", quoteSecurityArgument(contents),
-	}, " ")
-	return terminateSecurityCommand(command, service)
+// keychainItem is one generic password the way security(1) addresses it.
+type keychainItem struct {
+	service            string
+	account            string
+	trustedApplication string
+	contents           string
 }
 
-func terminateSecurityCommand(command, service string) (string, error) {
-	if strings.ContainsAny(command, "\n\r") {
-		return "", fmt.Errorf("build the security command for the %q Keychain item; a line break in the macOS account name, the Claude CLI path, or the credential would split the command, so fix that value and retry", service)
+// storeKeychainItem hands the item to security(1) on stdin, where no other
+// process can read it, and as an argument only when interactive mode cannot
+// take it on one line.
+func storeKeychainItem(ctx context.Context, security securityCommander, item keychainItem) error {
+	arguments := keychainWriteArguments(item)
+	line := interactiveSecurityLine(arguments)
+	if strings.ContainsAny(line, "\n\r") || len(line)+1 > securityCommandLimit {
+		_, err := security.Run(ctx, "", arguments...)
+		return err
 	}
-	if len(command) > securityCommandLimit {
-		return "", fmt.Errorf("build the security command for the %q Keychain item; it is %d characters over the %d security(1) accepts on one line, so report this credential size to hop rather than storing a truncated login", service, len(command)-securityCommandLimit, securityCommandLimit)
+	_, err := security.Run(ctx, line+"\n", "-i")
+	return err
+}
+
+func keychainWriteArguments(item keychainItem) []string {
+	return []string{
+		"add-generic-password", "-U",
+		"-a", item.account,
+		"-s", item.service,
+		"-T", item.trustedApplication,
+		"-w", item.contents,
 	}
-	return command + "\n", nil
+}
+
+// interactiveSecurityLine writes the arguments the way security(1)'s
+// interactive mode tokenizes a line read from stdin, without the line break
+// that ends the command.
+func interactiveSecurityLine(arguments []string) string {
+	quoted := make([]string, len(arguments))
+	for index, argument := range arguments {
+		quoted[index] = quoteSecurityArgument(argument)
+	}
+	return strings.Join(quoted, " ")
 }
 
 // quoteSecurityArgument wraps value as one argument for security(1)'s

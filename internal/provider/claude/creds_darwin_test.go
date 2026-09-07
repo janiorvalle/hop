@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -51,19 +52,26 @@ func exitStatus(t *testing.T, code int) error {
 	return err
 }
 
-func TestKeychainWriteCommandCarriesTheSecretThroughStdin(t *testing.T) {
+func TestStoreKeychainItemCarriesTheSecretThroughStdin(t *testing.T) {
 	t.Parallel()
 
 	contents := `{"claudeAiOauth":{"accessToken":"sk\"quote\\slash","refreshToken":"r"}}`
-	command, err := keychainWriteCommand("Claude Code-credentials", "owner", "/usr/local/bin/claude", contents)
-	if err != nil {
-		t.Fatalf("keychainWriteCommand() error = %v", err)
+	security := &fakeSecurity{}
+	if err := storeKeychainItem(context.Background(), security, testKeychainItem(contents)); err != nil {
+		t.Fatalf("storeKeychainItem() error = %v", err)
 	}
-	want := `add-generic-password -U -a "owner" -s "Claude Code-credentials" -T "/usr/local/bin/claude" ` +
-		`-w "{\"claudeAiOauth\":{\"accessToken\":\"sk\\\"quote\\\\slash\",\"refreshToken\":\"r\"}}"` + "\n"
-	if command != want {
-		t.Fatalf("keychainWriteCommand() =\n%q\nwant\n%q", command, want)
+	want := `"add-generic-password" "-U" "-a" "owner" "-s" "Claude Code-credentials" "-T" "/usr/local/bin/claude" ` +
+		`"-w" "{\"claudeAiOauth\":{\"accessToken\":\"sk\\\"quote\\\\slash\",\"refreshToken\":\"r\"}}"` + "\n"
+	if len(security.calls) != 1 || strings.Join(security.calls[0].args, " ") != "-i" {
+		t.Fatalf("security calls = %+v, want one interactive-mode call", security.calls)
 	}
+	if security.calls[0].input != want {
+		t.Fatalf("security input =\n%q\nwant\n%q", security.calls[0].input, want)
+	}
+}
+
+func testKeychainItem(contents string) keychainItem {
+	return keychainItem{service: "Claude Code-credentials", account: "owner", trustedApplication: "/usr/local/bin/claude", contents: contents}
 }
 
 // security(1)'s interactive tokenizer strips one layer of double quotes and
@@ -110,22 +118,69 @@ func untokenizeSecurityArgument(t *testing.T, quoted string) string {
 	return value.String()
 }
 
-func TestKeychainWriteCommandRefusesCredentialsSecurityWouldTruncate(t *testing.T) {
+// An item longer than security(1)'s interactive line goes as an argument, so a
+// Keychain full of MCP logins is stored whole instead of split into a bogus
+// second command.
+func TestStoreKeychainItemPassesAnOversizedItemAsAnArgument(t *testing.T) {
 	t.Parallel()
 
 	oversized := strings.Repeat("A", securityCommandLimit)
-	_, err := keychainWriteCommand("Claude Code-credentials", "owner", "/usr/local/bin/claude", oversized)
-	if err == nil || !strings.Contains(err.Error(), "truncated login") {
-		t.Fatalf("keychainWriteCommand() error = %v, want a refusal that names the truncation risk", err)
+	security := &fakeSecurity{}
+	if err := storeKeychainItem(context.Background(), security, testKeychainItem(oversized)); err != nil {
+		t.Fatalf("storeKeychainItem() error = %v", err)
+	}
+	assertArgumentWrite(t, security, oversized)
+}
+
+func TestStoreKeychainItemPassesAnItemWithALineBreakAsAnArgument(t *testing.T) {
+	t.Parallel()
+
+	split := "first\ndelete-generic-password -s x"
+	security := &fakeSecurity{}
+	if err := storeKeychainItem(context.Background(), security, testKeychainItem(split)); err != nil {
+		t.Fatalf("storeKeychainItem() error = %v", err)
+	}
+	assertArgumentWrite(t, security, split)
+}
+
+func assertArgumentWrite(t *testing.T, security *fakeSecurity, contents string) {
+	t.Helper()
+	want := []string{"add-generic-password", "-U", "-a", "owner", "-s", "Claude Code-credentials", "-T", "/usr/local/bin/claude", "-w", contents}
+	if len(security.calls) != 1 || !slices.Equal(security.calls[0].args, want) {
+		t.Fatalf("security calls = %+v, want one argument write %v", security.calls, want)
+	}
+	if security.calls[0].input != "" {
+		t.Fatalf("security input = %q, want nothing on stdin for an argument write", security.calls[0].input)
 	}
 }
 
-func TestKeychainWriteCommandRefusesValuesThatWouldSplitTheCommand(t *testing.T) {
+// Five MCP logins the size Claude Code stores put the item well past the
+// interactive line; the argument write must carry every one of them intact.
+func TestStoreKeychainItemKeepsEveryMCPLoginOfAnOversizedItem(t *testing.T) {
 	t.Parallel()
 
-	_, err := keychainWriteCommand("Claude Code-credentials", "owner", "/usr/local/bin/claude", "first\ndelete-generic-password -s x")
-	if err == nil || !strings.Contains(err.Error(), "line break") {
-		t.Fatalf("keychainWriteCommand() error = %v, want a refusal that names the line break", err)
+	credentials := Credentials{AccessToken: "access", RefreshToken: "refresh", MCPTokens: MCPTokens{}}
+	for _, server := range []string{"linear-server", "streamlyne-research", "plugin:posthog:posthog", "plugin:atlassian:atlassian", "plugin:datadog:mcp"} {
+		credentials.MCPTokens[server+"|callback"] = json.RawMessage(fmt.Sprintf(`{"serverName":%q,"accessToken":%q,"refreshToken":%q,"expiresAt":1700000000000}`, server, strings.Repeat("a", 900), strings.Repeat("r", 300)))
+	}
+	contents, err := json.Marshal(credentialItem(credentials))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contents) <= securityCommandLimit {
+		t.Fatalf("item is %d bytes, want one past the %d-character interactive line", len(contents), securityCommandLimit)
+	}
+	security := &fakeSecurity{}
+	if err := storeKeychainItem(context.Background(), security, testKeychainItem(string(contents))); err != nil {
+		t.Fatalf("storeKeychainItem() error = %v", err)
+	}
+	assertArgumentWrite(t, security, string(contents))
+	stored, err := parseCredentials([]byte(security.calls[0].args[len(security.calls[0].args)-1]))
+	if err != nil {
+		t.Fatalf("parseCredentials() error = %v", err)
+	}
+	if len(stored.MCPTokens) != len(credentials.MCPTokens) {
+		t.Fatalf("stored MCP logins = %d, want %d", len(stored.MCPTokens), len(credentials.MCPTokens))
 	}
 }
 
@@ -155,7 +210,7 @@ func TestReadLiveCredentialsReportsMissingKeychainItemAsAbsent(t *testing.T) {
 
 func TestClearLiveCredentialsIfMatchesRefusesNonConditionalKeychainDelete(t *testing.T) {
 	credentials := Credentials{AccessToken: "access", RefreshToken: "refresh"}
-	contents, err := json.Marshal(credentialEnvelope{OAuth: credentials})
+	contents, err := json.Marshal(credentialItem(credentials))
 	if err != nil {
 		t.Fatal(err)
 	}

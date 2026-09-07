@@ -487,6 +487,9 @@ func (manager switchManager) prepareClaudeStep(ctx context.Context, current, tar
 			if err := manager.requireProviderDirectory("claude"); err != nil {
 				return switchStep{}, err
 			}
+			// No live item means no MCP logins on this machine, whatever the
+			// slot saved before Claude signed out.
+			targetCredentials.MCPTokens = nil
 			return switchStep{
 				provider:       "claude",
 				previous:       current,
@@ -509,6 +512,9 @@ func (manager switchManager) prepareClaudeStep(ctx context.Context, current, tar
 	if current == target {
 		targetCredentials = liveCredentials
 	}
+	// MCP logins belong to this machine, not to either account: the incoming
+	// login takes the live set along, whatever its slot saved last time.
+	targetCredentials.MCPTokens = liveCredentials.MCPTokens
 	copyBack := func() error { return nil }
 	if current != "" {
 		currentPath, err := manager.vault.CredentialsPath("claude", current)
@@ -809,7 +815,7 @@ func (manager switchManager) recoverInterruptedSwitch(ctx context.Context) (bool
 		case "claude":
 			credentials, err := (claude.FileStore{Path: credentialsPath}).Read()
 			if err == nil && !preserveLive {
-				err = manager.claudeLive.Write(ctx, credentials)
+				err = manager.restoreClaudeLive(ctx, credentials)
 			}
 			if err != nil {
 				return false, fmt.Errorf("recover the interrupted Claude switch by restoring account %q; stop using Claude, repair its slot, and retry hop: %w", step.Previous, err)
@@ -842,6 +848,18 @@ func (manager switchManager) recoverInterruptedSwitch(ctx context.Context) (bool
 		return false, fmt.Errorf("finish recovery of the interrupted account switch; remove %s and retry: %w", manager.transactionPath(), err)
 	}
 	return true, nil
+}
+
+// restoreClaudeLive puts a slot's login back over an interrupted switch the way
+// a switch installs one: the login comes from the slot, the MCP logins stay
+// the machine's, so a login Claude Code refreshed since the crash survives.
+func (manager switchManager) restoreClaudeLive(ctx context.Context, credentials claude.Credentials) error {
+	live, err := manager.claudeLive.Read(ctx)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read the live Claude credentials before restoring them; unlock Keychain and retry: %w", err)
+	}
+	credentials.MCPTokens = live.MCPTokens
+	return manager.claudeLive.Write(ctx, credentials)
 }
 
 func (manager switchManager) restoreAbsentLiveCredentials(ctx context.Context, step switchTransactionStep) error {

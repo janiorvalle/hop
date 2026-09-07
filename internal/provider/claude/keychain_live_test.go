@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,34 +35,81 @@ func TestKeychainRoundTripThroughSecurityInteractiveMode(t *testing.T) {
 	defer cancel()
 	keychainPath := createThrowawayKeychain(ctx, t)
 
-	credentials := Credentials{
+	credentials := roundTripCredentials()
+	contents := roundTripContents(t, credentials)
+	arguments := append(keychainWriteArguments(roundTripItem(contents)), keychainPath)
+	if output, err := runSecurity(ctx, t, interactiveSecurityLine(arguments)+"\n"); err != nil {
+		t.Fatalf("store the round-trip item: %v: %s", err, output)
+	}
+	assertKeychainHolds(ctx, t, keychainPath, credentials, contents)
+}
+
+// TestKeychainRoundTripOfAnItemPastTheInteractiveLine proves the other write
+// path the fakes assume: an item with more MCP logins than fit on security(1)'s
+// interactive line is stored whole when passed as an argument. Same opt-in.
+func TestKeychainRoundTripOfAnItemPastTheInteractiveLine(t *testing.T) {
+	if os.Getenv("HOP_CLAUDE_KEYCHAIN_TEST") != "1" {
+		t.Skip("set HOP_CLAUDE_KEYCHAIN_TEST=1 to round-trip a throwaway keychain through security(1)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	keychainPath := createThrowawayKeychain(ctx, t)
+
+	credentials := roundTripCredentials()
+	credentials.MCPTokens = MCPTokens{}
+	for _, server := range []string{"linear-server", "streamlyne-research", "plugin:posthog:posthog", "plugin:atlassian:atlassian", "plugin:datadog:mcp"} {
+		credentials.MCPTokens[server+"|Y2FsbGJhY2s="] = json.RawMessage(fmt.Sprintf(`{"serverName":%q,"accessToken":%q,"refreshToken":%q,"expiresAt":1700000000000}`, server, strings.Repeat("a", 900), strings.Repeat("r", 300)))
+	}
+	contents := roundTripContents(t, credentials)
+	if len(contents) <= securityCommandLimit {
+		t.Fatalf("item is %d bytes, want one past the %d-character interactive line", len(contents), securityCommandLimit)
+	}
+	arguments := append(keychainWriteArguments(roundTripItem(contents)), keychainPath)
+	if output, err := (systemSecurity{}).Run(ctx, "", arguments...); err != nil {
+		t.Fatalf("store the oversized round-trip item: %v: %s", err, output)
+	}
+	restored := assertKeychainHolds(ctx, t, keychainPath, credentials, contents)
+	if len(restored.MCPTokens) != len(credentials.MCPTokens) {
+		t.Fatalf("restored MCP logins = %d, want %d", len(restored.MCPTokens), len(credentials.MCPTokens))
+	}
+}
+
+func roundTripCredentials() Credentials {
+	return Credentials{
 		AccessToken:  `sk-ant-oat01-A"quote\slash/plus+equals=`,
 		RefreshToken: "sk-ant-ort01-with spaces and `backticks` $HOME",
 		ExpiresAt:    1234567890123,
 	}
-	contents, err := json.Marshal(credentialEnvelope{OAuth: credentials})
+}
+
+func roundTripContents(t *testing.T, credentials Credentials) string {
+	t.Helper()
+	contents, err := json.Marshal(credentialItem(credentials))
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
-	writeCommand, err := keychainWriteCommand(roundTripService, "hop-round-trip", "/usr/bin/security", string(contents))
-	if err != nil {
-		t.Fatalf("keychainWriteCommand() error = %v", err)
-	}
-	if output, err := runSecurity(ctx, t, withKeychain(writeCommand, keychainPath)); err != nil {
-		t.Fatalf("store the round-trip item: %v: %s", err, output)
-	}
+	return string(contents)
+}
 
+func roundTripItem(contents string) keychainItem {
+	return keychainItem{service: roundTripService, account: "hop-round-trip", trustedApplication: "/usr/bin/security", contents: contents}
+}
+
+func assertKeychainHolds(ctx context.Context, t *testing.T, keychainPath string, credentials Credentials, contents string) Credentials {
+	t.Helper()
 	readBack, err := exec.CommandContext(ctx, "security", "find-generic-password", "-s", roundTripService, "-w", keychainPath).Output()
 	if err != nil {
 		t.Fatalf("read the round-trip item back: %v", err)
 	}
-	if stored := strings.TrimSpace(string(readBack)); stored != string(contents) {
+	if stored := strings.TrimSpace(string(readBack)); stored != contents {
 		t.Fatalf("stored credential =\n%s\nwant\n%s", stored, contents)
 	}
 	restored, err := parseCredentials(readBack)
 	if err != nil || restored.AccessToken != credentials.AccessToken || restored.RefreshToken != credentials.RefreshToken {
 		t.Fatalf("restored credentials = %+v, error = %v; want %+v", restored, err, credentials)
 	}
+	return restored
 }
 
 func createThrowawayKeychain(ctx context.Context, t *testing.T) string {
@@ -81,10 +129,6 @@ func createThrowawayKeychain(ctx context.Context, t *testing.T) string {
 		}
 	})
 	return keychainPath
-}
-
-func withKeychain(command, keychainPath string) string {
-	return strings.TrimSuffix(command, "\n") + " " + quoteSecurityArgument(keychainPath) + "\n"
 }
 
 func runSecurity(ctx context.Context, t *testing.T, command string) ([]byte, error) {
